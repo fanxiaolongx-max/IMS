@@ -1,10 +1,11 @@
 {
-  "server_ip": "192.168.100.8",
+  "server_ip": "113.44.149.111",
   "server_port": 5060,
   "username": "0000",
   "password": "0000",
-  "local_ip": "192.168.100.8",
-  "local_port": 10000,
+  "local_ip": "0.0.0.0",
+  "local_port": 20000,
+  "sdp_ip": "113.44.149.111",
   "media_dir": "media",
   "media_file": "media/default.wav"
 }

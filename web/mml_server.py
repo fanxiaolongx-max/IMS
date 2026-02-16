@@ -29,6 +29,22 @@ except ImportError:
     print("[WARNING] websockets not installed, real-time logs disabled")
     print("Install: pip install websockets")
 
+# 导入认证模块
+try:
+    from web.web_auth import get_auth_manager, AuthManager
+    AUTH_AVAILABLE = True
+except ImportError:
+    AUTH_AVAILABLE = False
+    print("[WARNING] Auth module not available")
+
+
+# 获取认证管理器
+def get_auth():
+    """获取认证管理器实例"""
+    if AUTH_AVAILABLE:
+        return get_auth_manager()
+    return None
+
 
 # 日志订阅器集合（用于实时推送日志）
 log_subscribers = set()
@@ -132,6 +148,15 @@ class MMLCommandTree:
                     "批量外呼": "STR CALL BATCH",
                     "查询外呼统计": "DSP CALL STAT",
                     "查询外呼配置": "DSP DIALSVC CFG"
+                }
+            },
+            "安全管理": {
+                "icon": "🛡️",
+                "commands": {
+                    "查询黑名单": "DSP BLACKLIST",
+                    "添加黑名单": "ADD BLACKLIST IP=x.x.x.x",
+                    "删除黑名单": "RMV BLACKLIST IP=x.x.x.x",
+                    "查询攻击统计": "DSP ATTACK STAT"
                 }
             },
             "帮助信息": {
@@ -259,6 +284,10 @@ class MMLCommandExecutor:
                 parts = parts[:2] + [f"SUBTYPE=CFG"] + parts[3:]
             params = self._parse_params(parts[2:])
             return self._display_dialsvc(params)
+        elif obj == "BLACKLIST":
+            return self._display_blacklist(params)
+        elif obj == "ATTACK":
+            return self._display_attack_stat(params)
         else:
             return self._error_response(f"未知对象: {obj}")
     
@@ -290,6 +319,34 @@ class MMLCommandExecutor:
             import os
             output.append(f"CPU 核心数    : {os.cpu_count() or 'N/A'}")
             output.append(f"总内存        : N/A (需要安装 psutil)")
+        
+        # B2BUA 媒体中继状态
+        output.append("")
+        output.append("-" * 60)
+        output.append("B2BUA 媒体中继状态")
+        output.append("-" * 60)
+        
+        from sipcore.media_relay import get_media_relay
+        media_relay = get_media_relay()
+        if media_relay:
+            stats = media_relay.get_all_stats()
+            output.append(f"模式          : B2BUA (媒体中继已启用)")
+            output.append(f"总端口对      : {stats['port_stats']['total_pairs']}")
+            output.append(f"已使用端口对  : {stats['port_stats']['used_pairs']}")
+            output.append(f"可用端口对    : {stats['port_stats']['available_pairs']}")
+            output.append(f"活跃会话数    : {stats['active_sessions']}")
+            if stats['active_sessions'] > 0:
+                output.append("")
+                output.append("活跃会话详情:")
+                for call_id, session_stats in stats['sessions'].items():
+                    if session_stats:
+                        output.append(f"  {call_id}:")
+                        output.append(f"    A-leg端口: {session_stats['a_leg_port']}")
+                        output.append(f"    B-leg端口: {session_stats['b_leg_port']}")
+                        output.append(f"    A→B包数  : {session_stats['a_to_b_packets']}")
+                        output.append(f"    B→A包数  : {session_stats['b_to_a_packets']}")
+        else:
+            output.append(f"模式          : Proxy (媒体中继未启用)")
         
         output.append("=" * 60)
         
@@ -1624,6 +1681,8 @@ class MMLCommandExecutor:
         
         if obj == "USR" or obj == "USER":
             return self._add_user(params)
+        elif obj == "BLACKLIST":
+            return self._add_blacklist(params)
         else:
             return self._error_response(f"不支持的对象类型: {obj}")
     
@@ -1637,6 +1696,8 @@ class MMLCommandExecutor:
         
         if obj == "USR" or obj == "USER":
             return self._remove_user(params)
+        elif obj == "BLACKLIST":
+            return self._remove_blacklist(params)
         elif obj == "REG":
             return self._remove_registration(params)
         elif obj == "CALL":
@@ -2187,6 +2248,123 @@ class MMLCommandExecutor:
         """处理 RST 命令"""
         return self._error_response("RST 命令暂未实现")
     
+    def _display_blacklist(self, params):
+        """查询 IP 黑名单"""
+        try:
+            # 从 run.py 导入黑名单
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from run import IP_BLACKLIST, ATTEMPT_COUNTER, SECURITY_CONFIG
+            
+            output = [
+                "=" * 80,
+                "IP 黑名单列表",
+                "=" * 80,
+            ]
+            
+            if IP_BLACKLIST:
+                output.append(f"{'序号':<6} {'IP 地址':<20} {'类型':<15}")
+                output.append("-" * 80)
+                for idx, ip in enumerate(sorted(IP_BLACKLIST), 1):
+                    output.append(f"{idx:<6} {ip:<20} {'手动/自动':<15}")
+            else:
+                output.append("黑名单为空")
+            
+            output.append("-" * 80)
+            output.append(f"总计: {len(IP_BLACKLIST)} 个黑名单 IP")
+            output.append("=" * 80)
+            
+            # 显示攻击统计
+            output.append("")
+            output.append("=" * 80)
+            "攻击尝试统计（最近）",
+            "=" * 80,
+            
+            if ATTEMPT_COUNTER:
+                output.append(f"{'IP 地址':<20} {'失败次数':<12} {'剩余时间(秒)':<15}")
+                output.append("-" * 80)
+                import time
+                now = time.time()
+                for ip, (count, first_time) in sorted(ATTEMPT_COUNTER.items(), key=lambda x: -x[1][0])[:20]:
+                    remaining = max(0, SECURITY_CONFIG["RATE_LIMIT_WINDOW"] - (now - first_time))
+                    output.append(f"{ip:<20} {count:<12} {int(remaining):<15}")
+            else:
+                output.append("暂无攻击尝试记录")
+            
+            output.append("=" * 80)
+            
+            return self._success_response("\n".join(output))
+        except Exception as e:
+            import traceback
+            return self._error_response(f"查询黑名单失败: {str(e)}\n{traceback.format_exc()}")
+    
+    def _display_attack_stat(self, params):
+        """查询攻击统计"""
+        return self._display_blacklist(params)  # 复用黑名单显示
+    
+    def _add_blacklist(self, params):
+        """添加 IP 到黑名单"""
+        ip = params.get('IP', '')
+        if not ip:
+            return self._error_response("需要指定 IP 参数，例如: ADD BLACKLIST IP=1.2.3.4")
+        
+        # 验证 IP 格式
+        import re
+        if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+            return self._error_response(f"无效的 IP 地址格式: {ip}")
+        
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from run import IP_BLACKLIST, _save_ip_blacklist
+            
+            if ip in IP_BLACKLIST:
+                return self._error_response(f"IP {ip} 已在黑名单中")
+            
+            IP_BLACKLIST.add(ip)
+            _save_ip_blacklist()
+            
+            output = [
+                "=" * 60,
+                "添加黑名单成功",
+                "=" * 60,
+                f"IP 地址        : {ip}",
+                f"当前黑名单数量 : {len(IP_BLACKLIST)}",
+                "=" * 60,
+            ]
+            return self._success_response("\n".join(output))
+        except Exception as e:
+            return self._error_response(f"添加黑名单失败: {str(e)}")
+    
+    def _remove_blacklist(self, params):
+        """从黑名单移除 IP"""
+        ip = params.get('IP', '')
+        if not ip:
+            return self._error_response("需要指定 IP 参数，例如: RMV BLACKLIST IP=1.2.3.4")
+        
+        try:
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            from run import IP_BLACKLIST, _save_ip_blacklist
+            
+            if ip not in IP_BLACKLIST:
+                return self._error_response(f"IP {ip} 不在黑名单中")
+            
+            IP_BLACKLIST.discard(ip)
+            _save_ip_blacklist()
+            
+            output = [
+                "=" * 60,
+                "删除黑名单成功",
+                "=" * 60,
+                f"IP 地址        : {ip}",
+                f"当前黑名单数量 : {len(IP_BLACKLIST)}",
+                "=" * 60,
+            ]
+            return self._success_response("\n".join(output))
+        except Exception as e:
+            return self._error_response(f"删除黑名单失败: {str(e)}")
+    
     def _handle_start(self, parts):
         """处理 STR (Start) 命令"""
         if len(parts) < 2:
@@ -2311,14 +2489,72 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
         """禁用默认日志"""
         pass
     
+    def _get_session_id(self):
+        """从 cookie 中获取 session_id"""
+        cookie_header = self.headers.get('Cookie', '')
+        if not cookie_header:
+            return None
+        
+        for cookie in cookie_header.split(';'):
+            cookie = cookie.strip()
+            if cookie.startswith('session_id='):
+                return cookie[11:]  # len('session_id=') = 11
+        return None
+    
+    def _set_session_cookie(self, session_id, max_age=3600):
+        """设置 session cookie"""
+        self.send_header('Set-Cookie', f'session_id={session_id}; HttpOnly; SameSite=Strict; Max-Age={max_age}; Path=/')
+    
+    def _clear_session_cookie(self):
+        """清除 session cookie"""
+        self.send_header('Set-Cookie', 'session_id=; HttpOnly; SameSite=Strict; Max-Age=0; Path=/')
+    
+    def _check_auth(self):
+        """检查用户是否已认证"""
+        if not AUTH_AVAILABLE:
+            return True  # 认证模块不可用时不限制访问
+        
+        auth = get_auth()
+        if auth is None:
+            return True
+        
+        session_id = self._get_session_id()
+        return auth.check_auth(session_id)
+    
+    def _require_auth(self):
+        """要求认证，未认证时返回 401"""
+        if not self._check_auth():
+            self.send_response(302)
+            self.send_header('Location', '/login.html')
+            self.end_headers()
+            return False
+        return True
+    
+    def _send_json_response(self, data, status_code=200):
+        """发送 JSON 响应"""
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        response = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self.wfile.write(response)
+    
     def do_GET(self):
         """处理 GET 请求"""
         parsed_path = urlparse(self.path)
         
         if parsed_path.path == '/' or parsed_path.path == '/index.html':
-            self._serve_index()
+            if self._require_auth():
+                self._serve_index()
+        elif parsed_path.path == '/login.html':
+            self._serve_login()
         elif parsed_path.path == '/api/command_tree':
-            self._serve_command_tree()
+            if self._require_auth():
+                self._serve_command_tree()
+        elif parsed_path.path == '/api/check_auth':
+            self._check_auth_status()
+        elif parsed_path.path == '/api/logout':
+            self._handle_logout()
         else:
             self.send_error(404)
     
@@ -2326,10 +2562,107 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
         """处理 POST 请求"""
         parsed_path = urlparse(self.path)
         
-        if parsed_path.path == '/api/execute':
-            self._execute_command()
+        if parsed_path.path == '/api/login':
+            self._handle_login()
+        elif parsed_path.path == '/api/execute':
+            if self._require_auth():
+                self._execute_command()
         else:
             self.send_error(404)
+    
+    def _serve_login(self):
+        """提供登录页面"""
+        html_file = os.path.join(os.path.dirname(__file__), 'login.html')
+        
+        try:
+            with open(html_file, 'rb') as f:
+                content = f.read()
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', len(content))
+            self.end_headers()
+            self.wfile.write(content)
+        except FileNotFoundError:
+            self.send_error(404, "Login page not found")
+    
+    def _handle_login(self):
+        """处理登录请求"""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            username = data.get('username', '').strip()
+            password = data.get('password', '')
+            
+            if not username or not password:
+                self._send_json_response({
+                    'success': False,
+                    'message': '用户名和密码不能为空'
+                }, 400)
+                return
+            
+            if not AUTH_AVAILABLE:
+                # 认证模块不可用，允许任意登录（仅用于开发）
+                self._send_json_response({
+                    'success': True,
+                    'message': '登录成功（无认证）'
+                })
+                return
+            
+            auth = get_auth()
+            session_id = auth.login(username, password)
+            
+            if session_id:
+                self.send_response(200)
+                self._set_session_cookie(session_id)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                response = json.dumps({
+                    'success': True,
+                    'message': '登录成功'
+                }, ensure_ascii=False).encode('utf-8')
+                self.wfile.write(response)
+            else:
+                self._send_json_response({
+                    'success': False,
+                    'message': '用户名或密码错误'
+                }, 401)
+                
+        except Exception as e:
+            self._send_json_response({
+                'success': False,
+                'message': f'登录失败: {str(e)}'
+            }, 500)
+    
+    def _handle_logout(self):
+        """处理登出请求"""
+        if AUTH_AVAILABLE:
+            auth = get_auth()
+            session_id = self._get_session_id()
+            if session_id:
+                auth.logout(session_id)
+        
+        self.send_response(302)
+        self._clear_session_cookie()
+        self.send_header('Location', '/login.html')
+        self.end_headers()
+    
+    def _check_auth_status(self):
+        """检查认证状态"""
+        is_authenticated = self._check_auth()
+        username = None
+        
+        if is_authenticated and AUTH_AVAILABLE:
+            auth = get_auth()
+            session_id = self._get_session_id()
+            username = auth.get_current_user(session_id)
+        
+        self._send_json_response({
+            'authenticated': is_authenticated,
+            'username': username
+        })
     
     def _serve_index(self):
         """提供主页面"""

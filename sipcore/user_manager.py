@@ -136,7 +136,7 @@ class UserManager:
             user = self.users[username]
             
             # 允许修改的字段
-            allowed_fields = ['password', 'display_name', 'phone', 'email', 'status', 'service_type']
+            allowed_fields = ['password', 'display_name', 'phone', 'email', 'status', 'service_type', 'role']
             
             for field, value in kwargs.items():
                 if field in allowed_fields and value is not None:

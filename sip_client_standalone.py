@@ -82,7 +82,8 @@ class SIPClient:
     """
     
     def __init__(self, username: str, password: str, server_ip: str, 
-                 server_port: int = 5060, local_ip: str = None, local_port: int = 10000):
+                 server_port: int = 5060, local_ip: str = None, local_port: int = 10000,
+                 sdp_ip: str = None):
         """
         初始化 SIP 客户端
         
@@ -93,12 +94,14 @@ class SIPClient:
             server_port: SIP 服务器端口（默认 5060）
             local_ip: 本地 IP 地址（如果为 None，则自动检测）
             local_port: 本地端口（默认 10000）
+            sdp_ip: SDP 中使用的 IP 地址（用于 NAT 场景，默认为 server_ip）
         """
         self.username = username
         self.password = password
         self.server_ip = server_ip
         self.server_port = server_port
         self.local_port = local_port
+        self.sdp_ip = sdp_ip  # SDP 中使用的 IP 地址
         
         # 获取本地 IP
         if local_ip:
@@ -513,12 +516,12 @@ class SIPClient:
             try:
                 temp_sock.bind((self.local_ip, self.local_port))
             except OSError as e:
-                if e.errno == 48:  # Address already in use
+                if e.errno == 48 or e.errno == 98:  # Address already in use (macOS=48, Linux=98)
                     # 端口被占用，使用临时端口（让系统自动分配）
                     temp_sock.bind((self.local_ip, 0))
                     actual_port = temp_sock.getsockname()[1]
-                    self.local_port = actual_port  # 更新本地端口
                     print(f"[SIP] 端口 {self.local_port} 被占用，使用临时端口: {actual_port}")
+                    self.local_port = actual_port  # 更新本地端口
                 else:
                     raise
             
@@ -699,6 +702,7 @@ class SIPClient:
                 if first_line.startswith('SIP/2.0'):
                     # 这是响应
                     resp = self._parse_response(data)
+                    resp['_source_addr'] = addr  # 保存源地址（用于 NAT 修正）
                     call_id = resp.get('headers', {}).get('call-id', '')
                 else:
                     # 这是请求（如 BYE）
@@ -761,11 +765,18 @@ class SIPClient:
     
     def create_sdp_offer(self, local_rtp_port: int, codec: str = "PCMU") -> str:
         """创建 SDP Offer（RFC 4566）"""
+        # 使用 sdp_ip（外部可路由地址）或 local_ip
+        # sdp_ip 用于 NAT 场景，让对方知道该往哪个公网地址发送 RTP
+        sdp_ip = getattr(self, 'sdp_ip', None) or self.local_ip
+        # 如果 sdp_ip 是 0.0.0.0，使用 server_ip
+        if sdp_ip == "0.0.0.0":
+            sdp_ip = self.server_ip
+        
         sdp = (
             f"v=0\r\n"
-            f"o=- {int(time.time())} {int(time.time())} IN IP4 {self.local_ip}\r\n"
+            f"o=- {int(time.time())} {int(time.time())} IN IP4 {sdp_ip}\r\n"
             f"s=Auto Dialer Call\r\n"
-            f"c=IN IP4 {self.local_ip}\r\n"
+            f"c=IN IP4 {sdp_ip}\r\n"
             f"t=0 0\r\n"
             f"m=audio {local_rtp_port} RTP/AVP 0\r\n"
             f"a=rtpmap:0 {codec}/8000\r\n"
@@ -773,8 +784,23 @@ class SIPClient:
         )
         return sdp
     
-    def parse_sdp_answer(self, sdp_body: str) -> Optional[Tuple[str, int]]:
-        """解析 SDP Answer，提取 RTP 地址和端口"""
+    def _is_private_ip(self, ip: str) -> bool:
+        """检查是否是内网地址（RFC 1918）"""
+        import ipaddress
+        try:
+            addr = ipaddress.ip_address(ip)
+            # 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+            return addr.is_private
+        except:
+            return False
+    
+    def parse_sdp_answer(self, sdp_body: str, actual_remote_addr: Optional[Tuple[str, int]] = None) -> Optional[Tuple[str, int]]:
+        """解析 SDP Answer，提取 RTP 地址和端口
+        
+        Args:
+            sdp_body: SDP 内容
+            actual_remote_addr: 实际的信令地址（用于 NAT 修正）
+        """
         try:
             lines = sdp_body.split('\r\n')
             
@@ -795,11 +821,18 @@ class SIPClient:
                     break
             
             if connection_ip and rtp_port:
+                # NAT 修正：如果 SDP 中的 IP 是内网地址，但信令地址是公网地址，使用信令地址
+                if actual_remote_addr and self._is_private_ip(connection_ip):
+                    print(f"[RTP] NAT 修正: SDP 中的 {connection_ip} 是内网地址，使用信令地址 {actual_remote_addr[0]}")
+                    connection_ip = actual_remote_addr[0]
+                
                 return (connection_ip, rtp_port)
             
             return None
         except Exception as e:
             print(f"[ERROR] SDP 解析失败: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def invite(self, callee: str, local_rtp_port: int, codec: str = "PCMU", 
@@ -912,8 +945,9 @@ class SIPClient:
             
             # 解析 SDP Answer
             sdp_body = resp.get('body', '')
+            actual_remote_addr = resp.get('_source_addr')  # 获取实际信令地址（用于 NAT 修正）
             if sdp_body:
-                remote_rtp_addr = self.parse_sdp_answer(sdp_body)
+                remote_rtp_addr = self.parse_sdp_answer(sdp_body, actual_remote_addr)
                 if remote_rtp_addr:
                     self.current_call.remote_rtp_addr = remote_rtp_addr
                     if not self.current_call.dialog_established:
@@ -1219,7 +1253,7 @@ class SIPClient:
                 try:
                     temp_sock.bind((self.local_ip, self.local_port))
                 except OSError as e:
-                    if e.errno == 48:  # Address already in use
+                    if e.errno == 48 or e.errno == 98:  # Address already in use (macOS=48, Linux=98)
                         temp_sock.bind((self.local_ip, 0))
                     else:
                         raise
@@ -1348,12 +1382,31 @@ class SIPClient:
 
 
 class RTPPlayer:
-    """RTP 媒体播放器（简化版）"""
+    """RTP 媒体播放器（简化版）
     
-    def __init__(self, local_port: int, remote_addr: Tuple[str, int], codec: str = "PCMU"):
+    支持对称 RTP（Symmetric RTP）：等待对端先发送 RTP 包，
+    获取 NAT 穿透后的真实地址，然后往该地址发送媒体。
+    """
+    
+    def __init__(self, local_port: int, remote_addr: Tuple[str, int], codec: str = "PCMU",
+                 symmetric_rtp: bool = True, symmetric_timeout: float = 2.0):
+        """
+        初始化 RTP 播放器
+        
+        Args:
+            local_port: 本地 RTP 端口
+            remote_addr: 对端 RTP 地址 (ip, port)（来自 SDP）
+            codec: 编解码器（默认 PCMU）
+            symmetric_rtp: 是否启用对称 RTP（等待对端先发包）
+            symmetric_timeout: 等待对端 RTP 的超时时间（秒）
+        """
         self.local_port = local_port
-        self.remote_addr = remote_addr
+        self.remote_addr = remote_addr  # SDP 中声明的地址
+        self.actual_remote_addr = remote_addr  # 实际发送地址（可能被对称 RTP 更新）
         self.codec = codec
+        self.symmetric_rtp = symmetric_rtp
+        self.symmetric_timeout = symmetric_timeout
+        
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp_sock.bind(("0.0.0.0", local_port))
         
@@ -1363,6 +1416,41 @@ class RTPPlayer:
         # 使用随机起始值（避免与其他流冲突）
         self.timestamp = random.randint(0, 2**32 - 1) % (2**32)
         self.playing = False
+    
+    def _wait_for_symmetric_rtp(self) -> bool:
+        """
+        等待对端发送第一个 RTP 包（对称 RTP）
+        
+        Returns:
+            是否收到对端 RTP 包并更新地址
+        """
+        if not self.symmetric_rtp:
+            return False
+        
+        print(f"[RTP] 等待对端 RTP 包（对称 RTP，超时 {self.symmetric_timeout}s）...")
+        
+        # 设置非阻塞模式
+        self.rtp_sock.setblocking(False)
+        
+        start_time = time.time()
+        while time.time() - start_time < self.symmetric_timeout:
+            try:
+                data, addr = self.rtp_sock.recvfrom(2048)
+                if len(data) >= 12:  # RTP 头至少 12 字节
+                    # 收到对端 RTP 包，更新实际地址
+                    old_addr = self.actual_remote_addr
+                    self.actual_remote_addr = addr
+                    print(f"[RTP] ✓ 收到对端 RTP 包，更新地址: {old_addr} -> {addr}")
+                    return True
+            except BlockingIOError:
+                time.sleep(0.01)
+            except Exception as e:
+                pass
+        
+        # 超时，恢复阻塞模式，使用 SDP 中的地址
+        print(f"[RTP] 对称 RTP 等待超时，使用 SDP 地址: {self.actual_remote_addr}")
+        self.rtp_sock.setblocking(True)
+        return False
     
     def play_wav_file(self, wav_file: str, duration: float = 0.0):
         """
@@ -1382,6 +1470,10 @@ class RTPPlayer:
             return
         
         print(f"[RTP] 开始播放媒体: {wav_file}")
+        
+        # 对称 RTP：等待对端先发送 RTP 包（解决 NAT 穿透问题）
+        if self.symmetric_rtp:
+            self._wait_for_symmetric_rtp()
         
         try:
             import wave
@@ -1508,9 +1600,9 @@ class RTPPlayer:
                     if sleep_time > 0:
                         time_module.sleep(sleep_time)
                 
-                # 发送 RTP 包
+                # 发送 RTP 包（使用对称 RTP 后的实际地址）
                 try:
-                    self.rtp_sock.sendto(rtp_packet, self.remote_addr)
+                    self.rtp_sock.sendto(rtp_packet, self.actual_remote_addr)
                     packets_sent += 1
                     bytes_sent += len(rtp_packet)
                 except Exception as e:
@@ -1872,7 +1964,8 @@ class AutoDialerClient:
             server_ip=server_ip,
             server_port=server_port,
             local_ip=local_ip,
-            local_port=local_port
+            local_port=local_port,
+            sdp_ip=self.config.get("sdp_ip") or server_ip
         )
         
         # 注册
@@ -1961,7 +2054,7 @@ class AutoDialerClient:
                         remote_rtp_addr = call_info['remote_rtp_addr']
                         
                         print(f"[RTP] 准备播放媒体: {media_file_path} (Call-ID: {call_id})")
-                        rtp_player = RTPPlayer(rtp_port, remote_rtp_addr)
+                        rtp_player = RTPPlayer(rtp_port, remote_rtp_addr, symmetric_rtp=True, symmetric_timeout=3.0)
                         
                         # 播放音频（如果duration为0，播放完整文件）
                         # 注意：duration=0表示播放整个文件，>0表示限制播放时长
@@ -2065,13 +2158,17 @@ class AutoDialerClient:
                         self._local_port_counter = 10000  # 重置端口范围
             
             # 创建独立的客户端（使用分配的端口）
+            # 获取 sdp_ip 配置
+            sdp_ip = self.config.get("sdp_ip") or server_ip
+            
             client = SIPClient(
                 username=username,
                 password=password,
                 server_ip=server_ip,
                 server_port=server_port,
                 local_ip=local_ip,
-                local_port=local_port  # 使用分配的端口
+                local_port=local_port,  # 使用分配的端口
+                sdp_ip=sdp_ip
             )
             
             # 注册（如果端口被占用，会自动使用临时端口）
@@ -2120,21 +2217,30 @@ class AutoDialerClient:
                         try:
                             remote_rtp_addr = client.current_call.remote_rtp_addr
                             print(f"[RTP] [{callee}] 准备播放媒体: {media_file_path}")
-                            rtp_player = RTPPlayer(rtp_port, remote_rtp_addr)
+                            rtp_player = RTPPlayer(rtp_port, remote_rtp_addr, symmetric_rtp=True, symmetric_timeout=3.0)
                             
-                            play_duration = duration if duration > 0 else 0
-                            print(f"[RTP] [{callee}] 准备播放，时长限制: {play_duration if play_duration > 0 else '完整文件'}")
-                            rtp_player.play_wav_file(media_file_path, play_duration)
-                            
-                            rtp_player.playing = False
-                            rtp_player.close()
-                            
-                            import time as time_module
-                            if client and client.current_call:
-                                print(f"[SIP] [{callee}] 播放完成，正在挂断...")
-                                client.bye()
-                                time_module.sleep(0.2)
-                                print(f"[SIP] [{callee}] 呼叫已挂断")
+                            # duration < 0 表示不自动挂断（保持通话直到对方挂断）
+                            if duration < 0:
+                                print(f"[RTP] [{callee}] 保持通话模式（不自动挂断），不播放媒体")
+                                # 保持通话，等待对方挂断
+                                while client and client.current_call:
+                                    import time as time_module
+                                    time_module.sleep(1.0)
+                                print(f"[SIP] [{callee}] 对方已挂断")
+                            else:
+                                play_duration = duration if duration > 0 else 0
+                                print(f"[RTP] [{callee}] 准备播放，时长限制: {play_duration if play_duration > 0 else '完整文件'}")
+                                rtp_player.play_wav_file(media_file_path, play_duration)
+                                
+                                rtp_player.playing = False
+                                rtp_player.close()
+                                
+                                import time as time_module
+                                if client and client.current_call:
+                                    print(f"[SIP] [{callee}] 播放完成，正在挂断...")
+                                    client.bye()
+                                    time_module.sleep(0.2)
+                                    print(f"[SIP] [{callee}] 呼叫已挂断")
                         except Exception as e:
                             print(f"[ERROR] [{callee}] 媒体播放失败: {e}")
                             import traceback

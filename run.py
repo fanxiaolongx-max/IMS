@@ -12,6 +12,7 @@ from sipcore.timers import create_timers
 from sipcore.cdr import init_cdr, get_cdr
 from sipcore.user_manager import init_user_manager, get_user_manager
 from sipcore.sdp_parser import extract_sdp_info
+from sipcore.media_relay import init_media_relay, get_media_relay
 
 # 初始化日志系统
 log = init_logging(level="DEBUG", log_file="logs/ims-sip-server.log")
@@ -28,6 +29,15 @@ user_mgr = init_user_manager(data_file="data/users.json")
 
 # ====== 配置区 ======
 # SERVER_IP: 从环境变量读取，如果没有则自动获取本机IP，最后回退到默认值
+def is_private_ip(ip: str) -> bool:
+    """检查是否为私网IP"""
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr.is_private
+    except ValueError:
+        return False
+
 def get_server_ip():
     """获取服务器IP地址，优先级：环境变量 > 自动检测 > 默认值"""
     # 1. 优先从环境变量读取
@@ -42,7 +52,14 @@ def get_server_ip():
         s.connect(("8.8.8.8", 80))
         server_ip = s.getsockname()[0]
         s.close()
-        log.info(f"[CONFIG] SERVER_IP auto-detected: {server_ip}")
+        
+        # 检查是否是私网IP，给出警告
+        if is_private_ip(server_ip):
+            log.warning(f"[CONFIG] Auto-detected PRIVATE IP: {server_ip}")
+            log.warning(f"[CONFIG] For cloud servers, set SERVER_IP env var to public IP")
+            log.warning(f"[CONFIG] Example: export SERVER_IP=113.44.149.111")
+        else:
+            log.info(f"[CONFIG] SERVER_IP auto-detected (public): {server_ip}")
         return server_ip
     except Exception as e:
         log.warning(f"[CONFIG] Failed to auto-detect IP: {e}, using default")
@@ -92,6 +109,111 @@ INVITE_BRANCHES: dict[str, str] = {}
 # 最后响应状态追踪：Call-ID -> 最后响应状态码（用于区分 2xx 和非 2xx ACK）
 # 当收到 INVITE 的最终响应时，记录状态码，用于后续 ACK 类型判断
 LAST_RESPONSE_STATUS: dict[str, str] = {}
+
+# B2BUA 媒体模式：
+#   "relay"    - 媒体中继模式：RTP 经服务器转发，修改 SDP IP/端口指向服务器
+#   "passthrough" - 媒体透传模式：SDP 原样透传，RTP 直接在主被叫间传输（用于排查终端问题）
+#   False      - 禁用，使用普通 Proxy 模式
+MEDIA_MODE = "relay"  # relay=媒体中继(解决NAT穿越), passthrough=透传(仅同网段可用)
+ENABLE_MEDIA_RELAY = (MEDIA_MODE == "relay")
+
+# ====== 安全防护配置 ======
+# IP 黑名单（已知攻击源）
+IP_BLACKLIST: set[str] = set()
+
+# 尝试计数器：IP -> (失败次数, 首次失败时间)
+# 用于速率限制和自动黑名单
+ATTEMPT_COUNTER: dict[str, tuple[int, float]] = {}
+
+# 安全配置
+SECURITY_CONFIG = {
+    "ENABLE_IP_BLACKLIST": True,           # 启用 IP 黑名单
+    "ENABLE_RATE_LIMIT": True,             # 启用速率限制
+    "RATE_LIMIT_THRESHOLD": 10,            # 10 次失败请求/分钟
+    "RATE_LIMIT_WINDOW": 60,               # 时间窗口（秒）
+    "AUTO_BLACKLIST_THRESHOLD": 50,        # 自动加入黑名单的阈值
+    "BLOCK_NON_LOCAL_USERS": False,        # 是否只允许本地网络用户
+}
+
+# 从文件加载黑名单
+def _load_ip_blacklist():
+    """从文件加载 IP 黑名单"""
+    blacklist_file = "config/ip_blacklist.txt"
+    if os.path.exists(blacklist_file):
+        try:
+            with open(blacklist_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        IP_BLACKLIST.add(line)
+            log.info(f"[SECURITY] 已加载 {len(IP_BLACKLIST)} 个黑名单 IP")
+        except Exception as e:
+            log.warning(f"[SECURITY] 加载黑名单失败: {e}")
+
+# 保存黑名单到文件
+def _save_ip_blacklist():
+    """保存 IP 黑名单到文件"""
+    blacklist_file = "config/ip_blacklist.txt"
+    try:
+        os.makedirs("config", exist_ok=True)
+        with open(blacklist_file, 'w') as f:
+            f.write("# SIP 攻击源 IP 黑名单\n")
+            f.write("# 格式: 每行一个 IP 地址\n\n")
+            for ip in sorted(IP_BLACKLIST):
+                f.write(f"{ip}\n")
+    except Exception as e:
+        log.warning(f"[SECURITY] 保存黑名单失败: {e}")
+
+# 检查 IP 是否应该被阻止
+def _is_ip_blocked(ip: str) -> bool:
+    """检查 IP 是否被阻止"""
+    if not SECURITY_CONFIG["ENABLE_IP_BLACKLIST"]:
+        return False
+    
+    # 检查黑名单
+    if ip in IP_BLACKLIST:
+        return True
+    
+    # 检查速率限制
+    if SECURITY_CONFIG["ENABLE_RATE_LIMIT"]:
+        now = time.time()
+        if ip in ATTEMPT_COUNTER:
+            count, first_time = ATTEMPT_COUNTER[ip]
+            # 检查是否在时间窗口内
+            if now - first_time < SECURITY_CONFIG["RATE_LIMIT_WINDOW"]:
+                if count >= SECURITY_CONFIG["RATE_LIMIT_THRESHOLD"]:
+                    # 超过阈值，加入黑名单
+                    if count >= SECURITY_CONFIG["AUTO_BLACKLIST_THRESHOLD"]:
+                        IP_BLACKLIST.add(ip)
+                        _save_ip_blacklist()
+                        log.warning(f"[SECURITY] IP {ip} 已自动加入黑名单（{count} 次失败请求）")
+                    return True
+            else:
+                # 时间窗口已过，重置计数
+                del ATTEMPT_COUNTER[ip]
+    
+    return False
+
+# 记录失败的请求尝试
+def _record_failed_attempt(ip: str):
+    """记录失败的请求尝试（用于速率限制）"""
+    if not SECURITY_CONFIG["ENABLE_RATE_LIMIT"]:
+        return
+    
+    now = time.time()
+    if ip in ATTEMPT_COUNTER:
+        count, first_time = ATTEMPT_COUNTER[ip]
+        # 检查是否还在时间窗口内
+        if now - first_time < SECURITY_CONFIG["RATE_LIMIT_WINDOW"]:
+            ATTEMPT_COUNTER[ip] = (count + 1, first_time)
+        else:
+            # 重置计数
+            ATTEMPT_COUNTER[ip] = (1, now)
+    else:
+        ATTEMPT_COUNTER[ip] = (1, now)
+
+# 加载黑名单
+_load_ip_blacklist()
 
 # ====== 工具函数 ======
 def _aor_from_from(from_val: str | None) -> str:
@@ -630,6 +752,14 @@ def _forward_request(msg: SIPMessage, addr, transport):
         log.debug(f"[{method}-INITIAL] Found {len(targets)} valid bindings for AOR: {aor}")
         if not targets:
             log.warning(f"[{method}-INITIAL] No valid bindings for AOR: {aor}")
+            # 记录失败的尝试（用于速率限制和攻击检测）
+            client_ip = addr[0]
+            _record_failed_attempt(client_ip)
+            # 检查是否达到黑名单阈值
+            if client_ip in ATTEMPT_COUNTER:
+                count, _ = ATTEMPT_COUNTER[client_ip]
+                if count >= SECURITY_CONFIG["RATE_LIMIT_THRESHOLD"]:
+                    log.warning(f"[SECURITY] IP {client_ip} 请求未注册用户 {aor} 达到 {count} 次，可能被攻击")
             resp = _make_response(msg, 480, "Temporarily Unavailable")
             transport.sendto(resp.to_bytes(), addr)
             log.tx(addr, resp.start_line, extra=f"aor={aor}")
@@ -883,26 +1013,69 @@ def _forward_request(msg: SIPMessage, addr, transport):
     # 注意：ACK 已经在环路检测中使用了 contact 地址，这里跳过避免重复处理
     if method in ("INVITE", "BYE", "CANCEL", "UPDATE", "PRACK", "MESSAGE", "REFER", "NOTIFY", "SUBSCRIBE"):
         try:
-            aor = _aor_from_to(msg.get("to")) or msg.start_line.split()[1]
-            bindings = REG_BINDINGS.get(aor, [])
-            if bindings:
-                # 取第一个绑定的 contact，解析 IP 和端口
-                b_uri = bindings[0]["contact"]
-                real_host, real_port = _host_port_from_sip_uri(b_uri)
-                host, port = real_host, real_port
-                log.debug(f"[{method}] Using registered contact: {b_uri} -> {host}:{port}")
-            else:
-                # 没有找到注册绑定，回复 480 Temporarily Unavailable
-                if method in ("MESSAGE", "REFER", "NOTIFY", "SUBSCRIBE"):
-                    log.warning(f"[{method}] No bindings found for AOR: {aor}")
-                    resp = _make_response(msg, 480, "Temporarily Unavailable")
-                    transport.sendto(resp.to_bytes(), addr)
-                    log.tx(addr, resp.start_line, extra=f"aor={aor}")
-                    return
+            # B2BUA: BYE 必须转发到对话的另一方，用 DIALOGS 确保对方一定能收到挂断
+            bye_routed_by_dialogs = False
+            if method == "BYE" and call_id and call_id in DIALOGS:
+                caller_addr, callee_addr = DIALOGS[call_id]
+                if (addr[0], addr[1]) == (caller_addr[0], caller_addr[1]):
+                    host, port = callee_addr[0], callee_addr[1]
+                    bye_routed_by_dialogs = True
+                    log.info(f"[BYE] Route to callee (other party): {host}:{port}")
+                elif (addr[0], addr[1]) == (callee_addr[0], callee_addr[1]):
+                    host, port = caller_addr[0], caller_addr[1]
+                    bye_routed_by_dialogs = True
+                    log.info(f"[BYE] Route to caller (other party): {host}:{port}")
+            if not bye_routed_by_dialogs:
+                aor = _aor_from_to(msg.get("to")) or msg.start_line.split()[1]
+                bindings = REG_BINDINGS.get(aor, [])
+                if bindings:
+                    # 取第一个绑定的 contact，解析 IP 和端口
+                    b_uri = bindings[0]["contact"]
+                    real_host, real_port = _host_port_from_sip_uri(b_uri)
+                    host, port = real_host, real_port
+                    log.debug(f"[{method}] Using registered contact: {b_uri} -> {host}:{port}")
+                else:
+                    # 没有找到注册绑定，回复 480 Temporarily Unavailable
+                    if method in ("MESSAGE", "REFER", "NOTIFY", "SUBSCRIBE"):
+                        log.warning(f"[{method}] No bindings found for AOR: {aor}")
+                        resp = _make_response(msg, 480, "Temporarily Unavailable")
+                        transport.sendto(resp.to_bytes(), addr)
+                        log.tx(addr, resp.start_line, extra=f"aor={aor}")
+                        return
         except Exception as e:
             log.warning(f"NAT fix skipped: {e}")
     # -------------------------------------------------------------------------------
 
+    # B2BUA 模式：转发 INVITE 前修改 SDP（确保被叫收到普通RTP SDP）
+    call_id = msg.get("call-id")
+    if method == "INVITE" and call_id and ENABLE_MEDIA_RELAY and msg.body:
+        try:
+            to_header = msg.get("to") or ""
+            has_to_tag = "tag=" in to_header
+            if not has_to_tag:
+                # 初始 INVITE：修改 SDP 为普通RTP并指向B2BUA媒体B-leg端口（被叫发媒体到这里）
+                media_relay = get_media_relay()
+                if media_relay:
+                    sdp_body = msg.body.decode('utf-8', errors='ignore') if isinstance(msg.body, bytes) else msg.body
+                    log.info(f"[B2BUA-DEBUG] 转发INVITE前原始SDP:\n{sdp_body[:500]}...")
+                    try:
+                        # 使用 process_invite_to_callee 修改SDP指向B-leg端口，同时保存A-leg信息
+                        new_sdp, session = media_relay.process_invite_to_callee(call_id, sdp_body, addr)
+                        if session:
+                            msg.body = new_sdp.encode('utf-8') if isinstance(msg.body, bytes) else new_sdp
+                            if 'content-length' in msg.headers:
+                                msg.headers['content-length'] = [str(len(msg.body) if isinstance(msg.body, bytes) else len(msg.body.encode('utf-8')))]
+                            log.info(f"[B2BUA] INVITE SDP 修改为普通RTP: {call_id} -> B-leg端口 {session.b_leg_rtp_port}")
+                            log.info(f"[B2BUA-DEBUG] 转发INVITE后SDP:\n{new_sdp[:500]}...")
+                        else:
+                            log.error(f"[B2BUA] 会话创建失败: {call_id}")
+                    except Exception as inner_e:
+                        log.error(f"[B2BUA] process_invite_to_callee异常: {inner_e}")
+                        import traceback
+                        log.error(traceback.format_exc())
+        except Exception as e:
+            log.error(f"[B2BUA] 转发INVITE时SDP修改失败: {e}")
+    
     try:
         # 详细日志：显示发送前的消息详情
         call_id = msg.get("call-id")
@@ -926,6 +1099,12 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 
                 # 解析 SDP 提取呼叫类型和编解码信息
                 call_type, codec = extract_sdp_info(msg.body)
+                
+                # B2BUA 模式：记录媒体会话信息（SDP已在上面修改过）
+                if ENABLE_MEDIA_RELAY and msg.body and has_to_tag:
+                    # re-INVITE：更新媒体会话
+                    log.info(f"[re-INVITE] Media change - Call-ID: {call_id}, "
+                            f"New media: {call_type}, Codec: {codec}")
                 
                 if not has_to_tag:
                     # 初始 INVITE：建立新对话
@@ -967,6 +1146,11 @@ def _forward_request(msg: SIPMessage, addr, transport):
                         termination_reason="Normal",
                         cseq=msg.get("cseq") or ""
                     )
+                # B2BUA: 清理媒体会话
+                if ENABLE_MEDIA_RELAY:
+                    media_relay = get_media_relay()
+                    if media_relay:
+                        media_relay.end_session(call_id)
             elif method == "CANCEL":
                 # CDR: 记录呼叫取消（只在第一次收到时记录）
                 if call_id in DIALOGS:
@@ -974,6 +1158,11 @@ def _forward_request(msg: SIPMessage, addr, transport):
                         call_id=call_id,
                         cseq=msg.get("cseq") or ""
                     )
+                # B2BUA: 清理媒体会话
+                if ENABLE_MEDIA_RELAY:
+                    media_relay = get_media_relay()
+                    if media_relay:
+                        media_relay.end_session(call_id)
             elif method == "MESSAGE":
                 # CDR: 记录短信（MESSAGE 一般不会重传，但为了统一性也加上检查）
                 # 使用 CSeq 作为唯一性标识，防止重复记录
@@ -1264,6 +1453,42 @@ def _forward_response(resp: SIPMessage, addr, transport):
                 # 解析 200 OK 响应中的 SDP（被叫可能使用不同的编解码）
                 call_type_answer, codec_answer = extract_sdp_info(resp.body)
                 
+                # B2BUA 模式：修改 200 OK 中的 SDP 并启动媒体转发（同一呼叫只启动一次，避免重传 200 OK 导致主叫收两份 200 转圈）
+                if ENABLE_MEDIA_RELAY and resp.body:
+                    media_relay = get_media_relay()
+                    if media_relay:
+                        try:
+                            session = media_relay._sessions.get(call_id)
+                            already_started = session and session.started_at is not None
+                            log.info(f"[B2BUA] 检查媒体转发状态: {call_id}, session存在={session is not None}, started_at={session.started_at if session else None}, already_started={already_started}")
+                            sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
+                            if not already_started:
+                                log.info(f"[B2BUA-DEBUG] 原始200OK SDP:\n{sdp_body[:500]}...")
+                            new_sdp, success = media_relay.process_answer_sdp(call_id, sdp_body, addr)
+                            log.info(f"[B2BUA] process_answer_sdp结果: {call_id}, success={success}")
+                            if success:
+                                resp.body = new_sdp.encode('utf-8') if isinstance(resp.body, bytes) else new_sdp
+                                if 'content-length' in resp.headers:
+                                    resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
+                                log.info(f"[B2BUA] 200 OK SDP 修改: {call_id} -> A-leg端口 {media_relay._sessions.get(call_id) and media_relay._sessions[call_id].a_leg_rtp_port}")
+                                if not already_started:
+                                    log.info(f"[B2BUA-DEBUG] 修改后200OK SDP:\n{new_sdp[:500]}...")
+                                    log.info(f"[B2BUA] 准备启动媒体转发: {call_id}, already_started={already_started}")
+                                    try:
+                                        result = media_relay.start_media_forwarding(call_id)
+                                        log.info(f"[B2BUA] 媒体转发启动结果: {call_id}, result={result}")
+                                        media_relay.print_media_diagnosis(call_id)
+                                    except Exception as start_e:
+                                        log.error(f"[B2BUA] 启动媒体转发异常: {call_id}, error={start_e}")
+                                        import traceback
+                                        log.error(traceback.format_exc())
+                                else:
+                                    log.debug(f"[B2BUA] 200 OK 重传，媒体已启动，仅更新 SDP 并转发: {call_id}")
+                        except Exception as e:
+                            log.error(f"[B2BUA] 200 OK SDP 修改失败: {e}")
+                            import traceback
+                            log.error(traceback.format_exc())
+                
                 # 判断是初始 INVITE 还是 re-INVITE 的 200 OK
                 # 通过检查会话是否已有 answer_time 来判断
                 session = cdr.get_session(call_id)
@@ -1284,6 +1509,12 @@ def _forward_response(resp: SIPMessage, addr, transport):
                     log.info(f"[re-INVITE-OK] Media change confirmed - Call-ID: {call_id}, "
                             f"Media: {call_type_answer}, Codec: {codec_answer}")
                     
+                    # 打印媒体诊断信息
+                    if ENABLE_MEDIA_RELAY:
+                        media_relay = get_media_relay()
+                        if media_relay:
+                            media_relay.print_media_diagnosis(call_id)
+                    
                     # 更新最终媒体信息（如果有的话）
                     if call_type_answer or codec_answer:
                         cdr.record_media_change(
@@ -1300,6 +1531,11 @@ def _forward_response(resp: SIPMessage, addr, transport):
                     status_text=status_text,
                     reason=f"{status_code} {status_text}"
                 )
+                # B2BUA: 清理媒体会话
+                if ENABLE_MEDIA_RELAY:
+                    media_relay = get_media_relay()
+                    if media_relay:
+                        media_relay.end_session(call_id)
             elif status_code.startswith(('4', '5', '6')) and status_code not in ("100", "180", "183", "486", "487", "488", "600", "603", "604"):
                 # CDR: 记录其他失败响应（如 480, 404 等）
                 # 只有当 call_id 还在 DIALOGS 中时才记录（第一次）
@@ -1318,6 +1554,11 @@ def _forward_response(resp: SIPMessage, addr, transport):
                         del DIALOGS[call_id]
                     if call_id in INVITE_BRANCHES:
                         del INVITE_BRANCHES[call_id]
+                    # B2BUA: 清理媒体会话
+                    if ENABLE_MEDIA_RELAY:
+                        media_relay = get_media_relay()
+                        if media_relay:
+                            media_relay.end_session(call_id)
         elif status_code == "200":
             # 200 OK：需要区分不同场景
             # - INVITE 200 OK：已在上面处理（保留 DIALOGS 等待 ACK）
@@ -1334,9 +1575,15 @@ def _forward_response(resp: SIPMessage, addr, transport):
             # ⚠️ 注意：CANCEL 的 200 OK 不应该清理 INVITE_BRANCHES
             # 因为后续的 487 响应的 ACK 需要复用 INVITE 的 branch
             # 只有 BYE 200 OK 才清理 INVITE_BRANCHES（呼叫已完全结束）
-            if "BYE" in cseq_header and call_id in INVITE_BRANCHES:
-                del INVITE_BRANCHES[call_id]
-                log.debug(f"[BRANCH-CLEANUP] Cleaned up INVITE branch after BYE 200 OK: {call_id}")
+            if "BYE" in cseq_header:
+                if call_id in INVITE_BRANCHES:
+                    del INVITE_BRANCHES[call_id]
+                    log.debug(f"[BRANCH-CLEANUP] Cleaned up INVITE branch after BYE 200 OK: {call_id}")
+                # B2BUA: 清理媒体会话
+                if ENABLE_MEDIA_RELAY:
+                    media_relay = get_media_relay()
+                    if media_relay:
+                        media_relay.end_session(call_id)
             elif "CANCEL" in cseq_header:
                 # CANCEL 200 OK：保留 INVITE_BRANCHES，等待 487 响应的 ACK
                 log.debug(f"[BRANCH-KEEP] Keeping INVITE_BRANCHES for Call-ID {call_id} after CANCEL 200 OK (waiting for 487 ACK)")
@@ -1359,6 +1606,14 @@ def on_datagram(data: bytes, addr, transport):
     # 忽略 UA keepalive 空包
     if not data or data.strip() in (b"", b"\r\n", b"\r\n\r\n"):
         return
+    
+    # 安全检查：IP 黑名单和速率限制
+    client_ip = addr[0]
+    if _is_ip_blocked(client_ip):
+        # 静默丢弃黑名单 IP 的请求（不回复，不记录详细日志，防止放大攻击）
+        log.debug(f"[SECURITY] 丢弃黑名单 IP {client_ip} 的请求")
+        return
+    
     try:
         msg = parse(data)
         is_req = _is_request(msg.start_line)
@@ -1420,6 +1675,19 @@ async def main():
         'PENDING_REQUESTS': PENDING_REQUESTS,
         'INVITE_BRANCHES': INVITE_BRANCHES,
     }
+    
+    # 初始化媒体中继（B2BUA 模式）
+    if ENABLE_MEDIA_RELAY:
+        try:
+            media_relay = init_media_relay(SERVER_IP)
+            server_globals['MEDIA_RELAY'] = media_relay
+            log.info(f"[B2BUA] 媒体中继已初始化，服务器IP: {SERVER_IP}")
+        except Exception as e:
+            log.error(f"[B2BUA] 媒体中继初始化失败: {e}")
+            server_globals['MEDIA_RELAY'] = None
+    else:
+        log.info("[B2BUA] 媒体中继已禁用（Proxy模式）")
+        server_globals['MEDIA_RELAY'] = None
     
     # 初始化外呼管理器
     try:

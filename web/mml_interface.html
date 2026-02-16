@@ -82,6 +82,32 @@
             gap: 15px;
         }
 
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .username {
+            color: #4ec9b0;
+            font-weight: 500;
+        }
+
+        .logout-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .logout-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
         .status-indicator {
             display: flex;
             align-items: center;
@@ -858,6 +884,10 @@
                 </div>
                 <div class="status-indicator">
                     <span id="time"></span>
+                </div>
+                <div class="user-info">
+                    <span class="username" id="current-username"></span>
+                    <button class="logout-btn" id="logout-btn" title="退出登录">退出</button>
                 </div>
             </div>
         </div>
@@ -1736,6 +1766,19 @@
             ],
             'DSP CALL': [
                 // 查询外呼统计不需要参数表单（STAT 直接在命令中）
+            ],
+            // 安全管理命令
+            'DSP BLACKLIST': [
+                // 无需参数
+            ],
+            'DSP ATTACK': [
+                // 无需参数
+            ],
+            'ADD BLACKLIST': [
+                { name: 'IP', label: 'IP 地址', required: true, placeholder: '如: 223.165.6.138' }
+            ],
+            'RMV BLACKLIST': [
+                { name: 'IP', label: 'IP 地址', required: true, placeholder: '如: 223.165.6.138' }
             ]
         };
         
@@ -2018,7 +2061,30 @@
             input.addEventListener('keydown', (e) => {
                 const items = dropdown.querySelectorAll('.autocomplete-item');
                 
-                if (items.length === 0) return;
+                if (e.key === 'Tab') {
+                    e.preventDefault();
+                    // Tab 补全：如果有匹配项，补全第一个
+                    if (items.length > 0) {
+                        if (autocompleteIndex >= 0) {
+                            items[autocompleteIndex].click();
+                        } else {
+                            items[0].click();
+                        }
+                    } else {
+                        // 尝试参数补全
+                        doParamAutocomplete(input);
+                    }
+                    return;
+                }
+                
+                if (items.length === 0) {
+                    // 没有下拉菜单时，也处理上下键历史记录
+                    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                        // 让事件冒泡到历史记录处理
+                        return;
+                    }
+                    return;
+                }
                 
                 if (e.key === 'ArrowDown') {
                     e.preventDefault();
@@ -2036,6 +2102,60 @@
                     autocompleteIndex = -1;
                 }
             });
+            
+            // 参数补全功能
+            function doParamAutocomplete(input) {
+                const value = input.value.trim().toUpperCase();
+                const cursorPos = input.selectionStart;
+                
+                // 查找当前命令的参数配置
+                for (const [cmdPattern, config] of Object.entries(commandParamConfigs)) {
+                    if (value.startsWith(cmdPattern)) {
+                        // 找到匹配的命令，提示下一个参数
+                        const existingParams = value.substring(cmdPattern.length).trim();
+                        const existingKeys = new Set();
+                        
+                        // 解析已有的参数
+                        const paramRegex = /(\w+)=/g;
+                        let match;
+                        while ((match = paramRegex.exec(existingParams)) !== null) {
+                            existingKeys.add(match[1]);
+                        }
+                        
+                        // 找到第一个未填写的必填参数
+                        for (const field of config) {
+                            if (field.required && !existingKeys.has(field.name)) {
+                                // 插入参数模板
+                                const insertText = `${field.name}=`;
+                                const newValue = value + (value.endsWith(' ') ? '' : ' ') + insertText;
+                                input.value = newValue;
+                                // 将光标放到等号后面
+                                setTimeout(() => {
+                                    input.setSelectionRange(newValue.length, newValue.length);
+                                    input.focus();
+                                }, 0);
+                                return;
+                            }
+                        }
+                        
+                        // 所有必填参数都有了，提示可选参数
+                        for (const field of config) {
+                            if (!field.required && !existingKeys.has(field.name)) {
+                                const insertText = `${field.name}=`;
+                                const newValue = value + (value.endsWith(' ') ? '' : ' ') + insertText;
+                                input.value = newValue;
+                                setTimeout(() => {
+                                    input.setSelectionRange(newValue.length, newValue.length);
+                                    input.focus();
+                                }, 0);
+                                return;
+                            }
+                        }
+                        
+                        break;
+                    }
+                }
+            };
             
             // 点击外部关闭下拉框
             document.addEventListener('click', (e) => {
@@ -2186,7 +2306,32 @@
             updateHistoryButtons();
         }
         
+        // 获取当前登录用户信息
+        async function loadUserInfo() {
+            try {
+                const response = await fetch('/api/check_auth');
+                const data = await response.json();
+                
+                if (data.authenticated && data.username) {
+                    document.getElementById('current-username').textContent = `👤 ${data.username}`;
+                } else {
+                    // 未登录，跳转到登录页
+                    window.location.href = '/login.html';
+                }
+            } catch (error) {
+                console.error('获取用户信息失败:', error);
+            }
+        }
+        
+        // 处理登出
+        document.getElementById('logout-btn').addEventListener('click', async () => {
+            if (confirm('确定要退出登录吗？')) {
+                window.location.href = '/api/logout';
+            }
+        });
+        
         document.addEventListener('DOMContentLoaded', () => {
+            loadUserInfo();
             loadCommandTree();
             connectWebSocket();
             initResizers();

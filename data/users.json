@@ -23,20 +23,7 @@
     "create_time": "2025-10-29T00:36:33.528947",
     "role": "USER",
     "mml_access": false,
-    "update_time": "2025-10-29T00:36:33.528947"
-  },
-  "1003": {
-    "username": "1003",
-    "password": "1234",
-    "display_name": "测试用户1003",
-    "phone": "13800001003",
-    "email": "user1003@example.com",
-    "status": "ACTIVE",
-    "service_type": "VIP",
-    "create_time": "2025-10-29T04:32:20.397036",
-    "update_time": "2025-10-29T05:01:22.797099",
-    "role": "USER",
-    "mml_access": false
+    "update_time": "2026-02-16T08:33:55.697427"
   },
   "1004": {
     "username": "1004",
@@ -126,5 +113,17 @@
     "service_type": "BASIC",
     "create_time": "2025-10-31T15:52:22.438680",
     "update_time": "2025-10-31T15:52:22.438697"
+  },
+  "admin": {
+    "username": "admin",
+    "password": "lem600@HW",
+    "display_name": "管理员",
+    "phone": "",
+    "email": "",
+    "status": "ACTIVE",
+    "service_type": "BASIC",
+    "create_time": "2026-02-15T21:09:51.888070",
+    "update_time": "2026-02-15T21:10:37.967274",
+    "role": "ADMIN"
   }
 }
