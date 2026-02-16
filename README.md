@@ -1,6 +1,6 @@
 # IMS SIP Server
 
-基于 RFC 3261 标准实现的 SIP 代理服务器，提供用户注册、呼叫控制、CDR 话单、外呼服务和 Web 管理功能。
+基于 RFC 3261 标准实现的 SIP B2BUA（Back-to-Back User Agent）服务器，提供用户注册、呼叫控制、媒体中继、CDR 话单、外呼服务和 Web 管理功能。
 
 ## 快速开始
 
@@ -92,6 +92,37 @@ docker run -d --name ims \
 | OPTIONS | 能力查询 | ✓ | ✓ |
 | MESSAGE | 即时消息 | ✓ | ✓ |
 
+### B2BUA + 媒体中继
+
+**功能特性**：
+- **媒体中继模式**：RTP/RTCP 流经服务器转发，解决 NAT 穿越问题
+- **媒体透传模式**：SDP 原样透传，RTP 直连（仅同网段可用，用于调试）
+- **对称 RTP 学习（Latching）**：自动学习 NAT 后的真实媒体地址
+- **SRTP 支持**：保留并转发 SRTP 加密参数（`RTP/SAVP`、`a=crypto`）
+- **RTP 端口管理**：自动分配和回收 RTP/RTCP 端口（20000-30000）
+- **媒体诊断**：实时监控媒体流状态、包统计、地址学习情况
+
+**配置方式**：
+```python
+# run.py
+MEDIA_MODE = "relay"  # "relay"=媒体中继, "passthrough"=透传
+```
+
+**工作原理**：
+```
+主叫 (1002) ←── SIP ──→ 服务器 ←── SIP ──→ 被叫 (1001)
+     ↑                                    ↑
+     │ SDP: SERVER_IP:20000              │ SDP: SERVER_IP:20002
+     │                                    │
+     └────────── RTP ──→ 服务器 ←── RTP ──┘
+                    (20000↔20002)
+```
+
+**NAT 穿越机制**：
+- 使用信令来源地址（NAT 后的公网 IP）作为初始目标
+- 通过对称 RTP 学习（Latching）自动更新为实际媒体地址
+- 支持跨网络场景（Wi-Fi、移动网络、不同 NAT）
+
 ### 外呼服务（Auto Dialer）
 
 - **单次外呼**：发起单个号码的外呼，支持媒体文件播放
@@ -160,6 +191,7 @@ ims/
 │   ├── user_manager.py   # 用户管理
 │   ├── logger.py         # 日志系统
 │   ├── sdp_parser.py      # SDP 解析
+│   ├── media_relay.py    # B2BUA 媒体中继
 │   └── timers.py         # RFC 3261 定时器
 │
 ├── web/                   # MML 管理界面
@@ -316,6 +348,9 @@ Transport: UDP
 - ✓ **re-INVITE 支持**：支持媒体切换（hold/resume/add video）
 - ✓ **CANCEL 处理**：复用 INVITE branch，确保兼容性
 - ✓ **资源清理**：按协议标准延迟清理 DIALOGS，等待 ACK 确认
+- ✓ **B2BUA 模式**：作为 Back-to-Back User Agent，终结并重新发起 SIP 会话
+- ✓ **媒体中继**：RTP/RTCP 转发，支持对称 RTP 学习（RFC 4961）
+- ✓ **SRTP 支持**：保留并转发 SRTP 参数，不强制降级为 RTP
 
 ## Docker 部署
 
@@ -409,10 +444,12 @@ DSP LOG RECENT LINES=100
 
 - 并发注册支持：1000+
 - 呼叫建立延迟：<100ms (LAN)
-- 内存占用：~50MB (空闲)
+- 内存占用：~50MB (空闲)，~100MB (100并发呼叫)
 - 日志限制：1000 条/页面 (MML)
 - CDR 自动归档：按日期分文件夹
 - 外呼并发：支持批量并发外呼（可配置）
+- 媒体中继：支持双向 RTP/RTCP 转发，自动 NAT 穿越
+- RTP 端口范围：20000-30000（自动分配和回收）
 
 ## 安全说明
 
@@ -491,6 +528,18 @@ CLR CDR BEFORE=2025-10-30 CONFIRM=YES
 - 确保外呼终端用户名已存在于 `data/users.json`
 - 查看日志：`grep "外呼" logs/*/ims-sip-server.log`
 
+**Q: 媒体不通（无声音）？**
+- 检查 `MEDIA_MODE` 设置：`"relay"` 用于跨网络，`"passthrough"` 仅同网段
+- 查看日志中的 `[RTP-LATCH]` 标记，确认是否学习到 NAT 地址
+- 使用 `DSP CALL STAT` 查看媒体统计信息
+- 检查防火墙是否放行 RTP 端口范围（20000-30000/udp）
+- 确认终端是否支持 SRTP（服务器会保留 SRTP 参数）
+
+**Q: 跨网络（移动网络）媒体不通？**
+- 确保使用 `MEDIA_MODE = "relay"`（媒体中继模式）
+- 服务器会自动学习 NAT 后的真实地址（对称 RTP）
+- 查看日志中的媒体诊断信息，确认地址学习状态
+
 ## 开发路线图
 
 **P0 - 阻塞性问题**（商用前必须）：
@@ -508,8 +557,8 @@ CLR CDR BEFORE=2025-10-30 CONFIRM=YES
 - [ ] 完善文档
 
 **P2 - 中优先级**（增强竞争力）：
+- [x] RTP 媒体转发（已实现 B2BUA 媒体中继）
 - [ ] TLS/SIPS 支持
-- [ ] RTP 媒体转发
 - [ ] 多进程架构
 - [ ] 计费系统
 - [ ] 多租户支持
@@ -522,6 +571,8 @@ MIT License
 
 ## 版本历史
 
+- v0.6 (2026-02-16): B2BUA + 媒体中继、对称 RTP 学习、SRTP 支持、NAT 穿越增强
+- v0.5 (2025-11-XX): 媒体中继基础实现
 - v0.4 (2025-11-04): 支持 Docker 部署、环境变量配置、外呼服务增强
 - v0.3 (2025-10-30): 完善 MML 管理功能、性能监控、配置管理
 - v0.2 (2025-10-29): CDR 增强、re-INVITE 支持、日志优化
@@ -538,4 +589,5 @@ MIT License
 
 **项目状态**: 开发测试中  
 **RFC 3261 合规性**: 基础合规  
-**更新时间**: 2025-11-04
+**B2BUA 模式**: 已实现（媒体中继 + NAT 穿越）  
+**更新时间**: 2026-02-16
