@@ -14,19 +14,23 @@ class UDPServer:
     async def start(self):
         loop = asyncio.get_running_loop()
         await loop.create_datagram_endpoint(
-            lambda: _UDPProtocol(self.handler),
+            lambda: _UDPProtocol(self.handler, self),
             local_addr=self.local
         )
 
 class _UDPProtocol(asyncio.DatagramProtocol):
-    def __init__(self, handler):
+    def __init__(self, handler, server_ref=None):
         self.handler = handler
         self.transport = None
+        self.server_ref = server_ref  # 引用UDPServer实例
 
     def connection_made(self, transport):
         self.transport = transport
         sock = transport.get_extra_info("sockname")
         log.info(f"UDP server listening on {sock}")
+        # 通知UDPServer保存transport引用
+        if self.server_ref:
+            self.server_ref.transport = transport
 
     def datagram_received(self, data, addr):
         if self.handler:

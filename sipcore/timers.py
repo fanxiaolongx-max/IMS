@@ -45,32 +45,44 @@ DIALOG_TIMEOUT = 3600.0      # 对话超时: 1小时
 PENDING_CLEANUP = 300.0      # 待处理请求清理: 5分钟
 BRANCH_CLEANUP = 60.0        # INVITE branch 清理: 1分钟
 REGISTRATION_CHECK = 30.0    # 注册检查间隔: 30秒
+NAT_KEEPALIVE_INTERVAL = 25.0  # NAT保活间隔: 25秒（小于常见NAT超时30秒）
 
 
 class SIPTimers:
     """SIP 定时器管理器"""
-    
+
     def __init__(self, log):
         self.log = log
         self._tasks = []
         self._running = False
+        self._transport = None  # UDP transport for NAT keepalive
         
-    async def start(self, 
+    async def start(self,
                    pending_requests: Dict,
                    dialogs: Dict,
                    invite_branches: Dict,
-                   reg_bindings: Dict):
+                   reg_bindings: Dict,
+                   transport=None,
+                   server_ip=None,
+                   server_port=5060,
+                   cancel_forwarded: Dict = None):
         """
         启动所有定时器
-        
+
         Args:
             pending_requests: PENDING_REQUESTS 字典引用
             dialogs: DIALOGS 字典引用
             invite_branches: INVITE_BRANCHES 字典引用
             reg_bindings: REG_BINDINGS 字典引用
+            transport: UDP transport for NAT keepalive
+            server_ip: 服务器IP
+            server_port: 服务器端口
         """
         self._running = True
-        
+        self._transport = transport
+        self._server_ip = server_ip
+        self._server_port = server_port
+
         # 启动各个定时器任务
         self._tasks.append(asyncio.create_task(
             self._cleanup_pending_requests(pending_requests)
@@ -78,13 +90,20 @@ class SIPTimers:
         self._tasks.append(asyncio.create_task(
             self._cleanup_dialogs(dialogs)
         ))
+        self._cancel_forwarded = cancel_forwarded or {}
         self._tasks.append(asyncio.create_task(
             self._cleanup_invite_branches(invite_branches)
         ))
         self._tasks.append(asyncio.create_task(
             self._cleanup_expired_registrations(reg_bindings)
         ))
-        
+
+        # 启动NAT保活定时器
+        if transport and reg_bindings:
+            self._tasks.append(asyncio.create_task(
+                self._nat_keepalive(reg_bindings)
+            ))
+
         self.log.info("[TIMERS] Started all SIP timers")
         
     async def stop(self):
@@ -230,7 +249,16 @@ class SIPTimers:
                 
                 if expired_branches:
                     self.log.debug(f"[TIMER-CLEANUP] INVITE branches: {len(invite_branches)}, Cleaned: {len(expired_branches)}")
-                    
+
+                # 同时清理 CANCEL_FORWARDED 缓存（超过 64 秒的条目）
+                cancel_fwd = self._cancel_forwarded
+                if cancel_fwd is not None:
+                    stale = [k for k, t in cancel_fwd.items() if now - t > TIMER_H]
+                    for k in stale:
+                        cancel_fwd.pop(k, None)
+                    if stale:
+                        self.log.debug(f"[TIMER-CLEANUP] CANCEL_FORWARDED cleaned: {len(stale)}")
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -274,6 +302,102 @@ class SIPTimers:
                 break
             except Exception as e:
                 self.log.error(f"[TIMER-REG] Error in registration cleanup: {e}")
+
+    async def _nat_keepalive(self, reg_bindings: Dict):
+        """
+        NAT保活定时器
+
+        定期向已注册的客户端发送OPTIONS请求或CRLF keepalive
+        防止移动网络NAT端口回收（常见超时30秒）
+
+        RFC 3261 Section 4.4: Keep-Alive机制
+        - OPTIONS请求（信令保活）
+        - CRLF双换行保活（客户端支持时）
+        """
+        import random
+        from sipcore.utils import gen_tag, sip_date
+
+        keepalive_counter = 0
+
+        while self._running:
+            try:
+                await asyncio.sleep(NAT_KEEPALIVE_INTERVAL)
+                keepalive_counter += 1
+
+                if not self._transport:
+                    continue
+
+                now = int(time.time())
+                keepalive_count = 0
+                crlf_count = 0
+
+                # 遍历所有注册的绑定
+                for aor in list(reg_bindings.keys()):
+                    bindings = reg_bindings[aor]
+                    for b in bindings:
+                        # 只处理未过期的绑定
+                        if b["expires"] <= now:
+                            continue
+
+                        # 优先使用真实来源地址
+                        target_addr = b.get("real_addr")
+                        if not target_addr:
+                            # 回退：从contact解析地址
+                            from sipcore.utils import _host_port_from_sip_uri
+                            contact_uri = b["contact"]
+                            target_addr = _host_port_from_sip_uri(contact_uri)
+
+                        if not target_addr or target_addr == ("", 0):
+                            continue
+
+                        target_host, target_port = target_addr
+
+                        # 检查是否是本地地址（不发送keepalive给本地）
+                        if target_host in ("127.0.0.1", "localhost"):
+                            continue
+
+                        # 尝试发送OPTIONS保活
+                        try:
+                            # 构造OPTIONS请求
+                            options_req = (
+                                f"OPTIONS {b['contact']} SIP/2.0\r\n"
+                                f"Via: SIP/2.0/UDP {self._server_ip}:{self._server_port};branch=z9hG4bK-{gen_tag()};rport\r\n"
+                                f"Max-Forwards: 70\r\n"
+                                f"To: {b['contact']}\r\n"
+                                f"From: <sip:keepalive@{self._server_ip}>;tag={gen_tag()}\r\n"
+                                f"Call-ID: {gen_tag()}@{self._server_ip}\r\n"
+                                f"CSeq: 1 OPTIONS\r\n"
+                                f"Contact: <sip:{self._server_ip}:{self._server_port}>\r\n"
+                                f"Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE\r\n"
+                                f"Content-Length: 0\r\n"
+                                f"User-Agent: IMS-NAT-KEEPALIVE/1.0\r\n"
+                                f"\r\n"
+                            ).encode('utf-8')
+
+                            self._transport.sendto(options_req, target_addr)
+                            keepalive_count += 1
+                        except Exception as e:
+                            self.log.debug(f"[NAT-KEEPALIVE] Failed to send OPTIONS to {target_addr}: {e}")
+
+                        # CRLF keepalive (双换行)
+                        # RFC 3261: 空行或CRLF可用于保活
+                        try:
+                            crlf = b"\r\n"
+                            self._transport.sendto(crlf, target_addr)
+                            crlf_count += 1
+                        except Exception as e:
+                            # CRLF失败不是错误，某些客户端不支持
+                            pass
+
+                if keepalive_count > 0:
+                    self.log.debug(f"[NAT-KEEPALIVE] #{keepalive_counter} sent OPTIONS to {keepalive_count} bindings")
+                    if crlf_count > 0:
+                        self.log.debug(f"[NAT-KEEPALIVE] #{keepalive_counter} sent CRLF to {crlf_count} bindings")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.log.error(f"[NAT-KEEPALIVE] Error: {e}")
 
 
 def create_timers(log) -> SIPTimers:

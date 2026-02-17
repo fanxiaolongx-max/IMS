@@ -13,7 +13,7 @@ import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
-from typing import List
+from typing import List, Set, Dict
 import os
 import sys
 import queue
@@ -28,6 +28,14 @@ except ImportError:
     WEBSOCKET_AVAILABLE = False
     print("[WARNING] websockets not installed, real-time logs disabled")
     print("Install: pip install websockets")
+
+# 数据包抓取支持
+try:
+    from web.packet_capture import get_capture, create_capture, start_capture, stop_capture, get_capture_stats
+    PACKET_CAPTURE_AVAILABLE = True
+except ImportError:
+    PACKET_CAPTURE_AVAILABLE = False
+    print("[WARNING] packet_capture module not available")
 
 # 导入认证模块
 try:
@@ -2555,6 +2563,9 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
             self._check_auth_status()
         elif parsed_path.path == '/api/logout':
             self._handle_logout()
+        elif parsed_path.path == '/api/packet-capture':
+            if self._require_auth():
+                self._handle_packet_capture_api()
         else:
             self.send_error(404)
     
@@ -2720,6 +2731,73 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
             
         except Exception as e:
             self.send_error(500, str(e))
+    
+    def _handle_packet_capture_api(self):
+        """处理数据包抓取API"""
+        if not PACKET_CAPTURE_AVAILABLE:
+            result = {
+                "success": False,
+                "message": "Packet capture not available"
+            }
+            self._send_json_response(result, 503)
+            return
+        
+        try:
+            parsed_path = urlparse(self.path)
+            query_params = parse_qs(parsed_path.query)
+            action = query_params.get('action', [''])[0]
+            
+            print(f"[MML-DEBUG] 抓包API请求: action={action}", file=sys.stderr, flush=True)
+            
+            if action == 'start':
+                interface = query_params.get('interface', ['any'])[0]
+                filter_expr = query_params.get('filter', [''])[0]
+                print(f"[MML-DEBUG] 启动抓包: interface={interface}, filter={filter_expr}", file=sys.stderr, flush=True)
+                success = start_capture(interface, filter_expr)
+                result = {
+                    "success": success,
+                    "message": "抓包已启动" if success else "抓包启动失败"
+                }
+            elif action == 'stop':
+                print(f"[MML-DEBUG] 停止抓包", file=sys.stderr, flush=True)
+                try:
+                    stop_capture()
+                    result = {
+                        "success": True,
+                        "message": "抓包已停止"
+                    }
+                    print(f"[MML-DEBUG] 抓包已停止", file=sys.stderr, flush=True)
+                except Exception as stop_e:
+                    print(f"[MML-ERROR] 停止抓包异常: {stop_e}", file=sys.stderr, flush=True)
+                    import traceback
+                    traceback.print_exc()
+                    result = {
+                        "success": False,
+                        "message": f"停止抓包失败: {str(stop_e)}"
+                    }
+            elif action == 'stats':
+                stats = get_capture_stats()
+                result = {
+                    "success": True,
+                    "stats": stats
+                }
+            else:
+                result = {
+                    "success": False,
+                    "message": f"未知操作: {action}"
+                }
+            
+            self._send_json_response(result)
+            
+        except Exception as e:
+            print(f"[MML-ERROR] 抓包API处理异常: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc()
+            result = {
+                "success": False,
+                "message": f"抓包操作失败: {str(e)}"
+            }
+            self._send_json_response(result, 500)
 
 
 def init_mml_interface(port=8888, server_globals=None):
@@ -2790,14 +2868,119 @@ def init_mml_interface(port=8888, server_globals=None):
 
 # WebSocket 日志推送（可选）
 if WEBSOCKET_AVAILABLE:
+    # 数据包抓取订阅者
+    packet_subscribers: Set = set()
+    packet_callbacks: Dict = {}  # websocket -> callback映射
+    # 数据包队列（用于线程安全的异步发送）
+    packet_queue: queue.Queue = queue.Queue(maxsize=1000)
+    
     async def log_push_handler(websocket):
-        """WebSocket 日志推送处理器"""
-        log_subscribers.add(websocket)
+        """WebSocket 处理器（支持多路径）"""
+        # websockets 16.0+: 通过websocket.request.path获取路径
+        path = websocket.request.path
+        print(f"[MML-DEBUG] WebSocket连接请求: path={path}, remote={websocket.remote_address}", file=sys.stderr, flush=True)
+        
+        if path == '/ws/logs':
+            log_subscribers.add(websocket)
+            print(f"[MML-DEBUG] WebSocket连接建立: /ws/logs, 订阅者数量: {len(log_subscribers)}", file=sys.stderr, flush=True)
+            try:
+                # 发送欢迎消息
+                await websocket.send("[INFO] WebSocket日志连接已建立")
+                # 保持连接
+                await websocket.wait_closed()
+                print(f"[MML-DEBUG] WebSocket连接已关闭: /ws/logs", file=sys.stderr, flush=True)
+            except websockets.exceptions.ConnectionClosed:
+                print(f"[MML-DEBUG] WebSocket连接正常关闭: /ws/logs", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[MML-ERROR] WebSocket日志处理异常: {e}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc()
+            finally:
+                log_subscribers.discard(websocket)
+                print(f"[MML-DEBUG] 已移除日志订阅者，剩余: {len(log_subscribers)}", file=sys.stderr, flush=True)
+        elif path == '/ws/packets':
+            # 数据包抓取WebSocket
+            packet_subscribers.add(websocket)
+            callback_ref = None
+            
+            print(f"[MML-DEBUG] WebSocket连接建立: /ws/packets, 订阅者数量: {len(packet_subscribers)}", file=sys.stderr, flush=True)
+            
+            try:
+                # 发送欢迎消息（使用type字段标识，前端会过滤掉）
+                welcome_msg = {"type": "connected", "message": "数据包WebSocket连接已建立"}
+                await websocket.send(json.dumps(welcome_msg, ensure_ascii=False))
+                print(f"[MML-DEBUG] 已发送欢迎消息", file=sys.stderr, flush=True)
+                
+                # 如果正在抓包，订阅数据包通知
+                if PACKET_CAPTURE_AVAILABLE:
+                    capture = get_capture()
+                    if capture:
+                        print(f"[MML-DEBUG] 找到抓包实例，订阅数据包通知", file=sys.stderr, flush=True)
+                        def packet_callback(packet_info):
+                            # 线程安全的回调：将数据包放入队列
+                            # 数据包读取在独立线程中，没有事件循环，所以使用队列机制
+                            try:
+                                # 将数据包和websocket引用放入队列
+                                packet_queue.put_nowait((websocket, packet_info))
+                            except queue.Full:
+                                # 队列满了，丢弃最老的数据包
+                                try:
+                                    packet_queue.get_nowait()
+                                    packet_queue.put_nowait((websocket, packet_info))
+                                except:
+                                    pass
+                            except Exception as e:
+                                print(f"[MML-ERROR] 回调执行失败: {e}", file=sys.stderr, flush=True)
+                        
+                        callback_ref = packet_callback
+                        packet_callbacks[websocket] = callback_ref
+                        capture.subscribe(callback_ref)
+                        print(f"[MML-DEBUG] 已订阅数据包通知，订阅者数量: {len(capture.subscribers)}", file=sys.stderr, flush=True)
+                    else:
+                        print(f"[MML-DEBUG] 抓包实例不存在，可能未启动抓包", file=sys.stderr, flush=True)
+                        await websocket.send(json.dumps({"type": "warning", "message": "抓包未启动"}, ensure_ascii=False))
+                else:
+                    print(f"[MML-DEBUG] 抓包功能不可用", file=sys.stderr, flush=True)
+                    await websocket.send(json.dumps({"type": "error", "message": "抓包功能不可用"}, ensure_ascii=False))
+                
+                # 保持连接
+                await websocket.wait_closed()
+                print(f"[MML-DEBUG] WebSocket连接已关闭: /ws/packets", file=sys.stderr, flush=True)
+            except websockets.exceptions.ConnectionClosed:
+                print(f"[MML-DEBUG] WebSocket连接正常关闭: /ws/packets", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[MML-ERROR] WebSocket处理异常: {e}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc()
+            finally:
+                packet_subscribers.discard(websocket)
+                # 取消订阅
+                if PACKET_CAPTURE_AVAILABLE and callback_ref:
+                    capture = get_capture()
+                    if capture:
+                        capture.unsubscribe(callback_ref)
+                        print(f"[MML-DEBUG] 已取消订阅，订阅者数量: {len(capture.subscribers)}", file=sys.stderr, flush=True)
+                if websocket in packet_callbacks:
+                    del packet_callbacks[websocket]
+                print(f"[MML-DEBUG] 已移除数据包订阅者，剩余: {len(packet_subscribers)}", file=sys.stderr, flush=True)
+        else:
+            # 未知路径，关闭连接
+            await websocket.close()
+    
+    async def _send_packet(websocket, packet_info):
+        """发送数据包到WebSocket"""
         try:
-            # 保持连接
-            await websocket.wait_closed()
-        finally:
-            log_subscribers.discard(websocket)
+            if websocket in packet_subscribers:
+                packet_json = json.dumps(packet_info, ensure_ascii=False)
+                await websocket.send(packet_json)
+                # 减少日志输出频率（每100个包打印一次）
+                if packet_info.get('packet_num', 0) % 100 == 0:
+                    print(f"[MML-DEBUG] 发送数据包到WebSocket: {len(packet_json)} bytes", file=sys.stderr, flush=True)
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+            # WebSocket连接已关闭，这是正常的
+            pass
+        except Exception as e:
+            print(f"[MML-ERROR] 发送数据包失败: {e}", file=sys.stderr, flush=True)
     
     async def broadcast_logs():
         """从队列中读取日志并广播给所有客户端"""
@@ -2827,13 +3010,71 @@ if WEBSOCKET_AVAILABLE:
                 print(f"[MML] 日志广播错误: {e}")
                 await asyncio.sleep(1)
     
+    async def broadcast_packets():
+        """从队列中读取数据包并发送给对应的WebSocket客户端"""
+        while True:
+            try:
+                # 非阻塞地检查队列
+                await asyncio.sleep(0.01)  # 更短的延迟，保证实时性
+                
+                # 批量获取数据包（最多100个）
+                packets_to_send = []
+                while not packet_queue.empty() and len(packets_to_send) < 100:
+                    try:
+                        packets_to_send.append(packet_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                
+                # 发送数据包给对应的WebSocket
+                for ws, packet_info in packets_to_send:
+                    try:
+                        # 检查WebSocket是否还在订阅列表中
+                        if ws in packet_subscribers:
+                            await _send_packet(ws, packet_info)
+                        else:
+                            # WebSocket已断开，跳过
+                            pass
+                    except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
+                        # 连接已关闭，移除订阅者
+                        packet_subscribers.discard(ws)
+                        if ws in packet_callbacks:
+                            callback_ref = packet_callbacks[ws]
+                            if PACKET_CAPTURE_AVAILABLE:
+                                capture = get_capture()
+                                if capture:
+                                    capture.unsubscribe(callback_ref)
+                            del packet_callbacks[ws]
+                    except Exception as e:
+                        print(f"[MML-ERROR] 发送数据包失败: {e}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[MML-ERROR] 数据包广播错误: {e}", file=sys.stderr, flush=True)
+                await asyncio.sleep(0.1)
+    
     def start_websocket_server(port=8889):
         """启动 WebSocket 服务器"""
+        async def handler(websocket):
+            """WebSocket处理器（websockets 16.0+ API）"""
+            try:
+                await log_push_handler(websocket)
+            except Exception as e:
+                print(f"[MML-ERROR] WebSocket handler异常: {e}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc()
+                try:
+                    await websocket.close(code=1011, reason=str(e))
+                except:
+                    pass
+        
         async def main():
-            async with websockets.serve(log_push_handler, "0.0.0.0", port):
-                print(f"[MML] WebSocket 日志推送服务已启动: ws://0.0.0.0:{port}")
+            async with websockets.serve(handler, "0.0.0.0", port):
+                print(f"[MML] WebSocket 服务已启动: ws://0.0.0.0:{port}")
+                print(f"[MML]   - 日志推送: ws://0.0.0.0:{port}/ws/logs")
+                if PACKET_CAPTURE_AVAILABLE:
+                    print(f"[MML]   - 数据包抓取: ws://0.0.0.0:{port}/ws/packets")
                 # 启动日志广播任务
                 asyncio.create_task(broadcast_logs())
+                # 启动数据包广播任务
+                asyncio.create_task(broadcast_packets())
                 await asyncio.Future()  # 永久运行
         
         def run():

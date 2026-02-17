@@ -301,6 +301,140 @@
         }
         
         /* 历史记录区域 */
+        /* 数据包抓取面板 */
+        #packet-content {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            background: #1e1e1e;
+        }
+
+        .packet-controls {
+            padding: 15px;
+            background: #2d2d30;
+            border-bottom: 1px solid #3e3e42;
+        }
+
+        .packet-control-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .packet-control-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .packet-control-row label {
+            font-size: 12px;
+            color: #cccccc;
+            white-space: nowrap;
+        }
+
+        .packet-control-row select,
+        .packet-control-row input {
+            background: #3c3c3c;
+            border: 1px solid #4ec9b0;
+            color: #d4d4d4;
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+
+        .packet-btn {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 6px 15px;
+            border-radius: 3px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: background 0.2s;
+        }
+
+        .packet-btn:hover:not(:disabled) {
+            background: #1177bb;
+        }
+
+        .packet-btn:disabled {
+            background: #3c3c3c;
+            color: #666;
+            cursor: not-allowed;
+        }
+
+        #packet-stats {
+            font-size: 12px;
+            color: #4ec9b0;
+            margin-left: auto;
+        }
+
+        .packet-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 11px;
+        }
+
+        .packet-entry {
+            padding: 8px;
+            margin-bottom: 5px;
+            background: #252526;
+            border-left: 3px solid #4ec9b0;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .packet-entry:hover {
+            background: #2d2d30;
+        }
+
+        .packet-entry.sip {
+            border-left-color: #4ec9b0;
+        }
+
+        .packet-entry.udp {
+            border-left-color: #ce9178;
+        }
+
+        .packet-entry.tcp {
+            border-left-color: #569cd6;
+        }
+
+        .packet-entry.icmp {
+            border-left-color: #c586c0;
+        }
+
+        .packet-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+        }
+
+        .packet-time {
+            color: #858585;
+            font-size: 10px;
+        }
+
+        .packet-protocol {
+            color: #4ec9b0;
+            font-weight: bold;
+        }
+
+        .packet-info {
+            color: #d4d4d4;
+            margin-bottom: 3px;
+        }
+
+        .packet-raw {
+            color: #858585;
+            font-size: 10px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            word-break: break-all;
+        }
+
         #history-content {
             flex: 1;
             display: none;
@@ -920,6 +1054,7 @@
                 <div id="output-tabs">
                     <button class="output-tab active" id="current-tab">当前回显</button>
                     <button class="output-tab" id="history-tab">历史记录</button>
+                    <button class="output-tab" id="packet-tab">📡 数据包抓取</button>
                 </div>
                 
                 <!-- 当前回显内容 -->
@@ -944,6 +1079,32 @@
                     </div>
                     <!-- 滚动锚点：用于可靠的自动滚动 -->
                     <div id="output-anchor" style="height: 1px;"></div>
+                </div>
+                
+                <!-- 数据包抓取内容 -->
+                <div id="packet-content" style="display: none;">
+                    <div class="packet-controls">
+                        <div class="packet-control-row">
+                            <label>网络接口:</label>
+                            <select id="packet-interface">
+                                <option value="any">any (所有接口)</option>
+                                <option value="eth0">eth0</option>
+                                <option value="eth1">eth1</option>
+                                <option value="lo">lo (本地回环)</option>
+                            </select>
+                            <label>过滤表达式:</label>
+                            <input type="text" id="packet-filter" placeholder="例如: port 5060, host 192.168.1.1" style="flex: 1;">
+                            <button id="packet-start-btn" class="packet-btn">开始抓包</button>
+                            <button id="packet-stop-btn" class="packet-btn" disabled>停止抓包</button>
+                            <button id="packet-clear-btn" class="packet-btn">清空</button>
+                        </div>
+                        <div class="packet-control-row">
+                            <label>显示过滤:</label>
+                            <input type="text" id="packet-display-filter" placeholder="过滤显示的数据包..." style="flex: 1;">
+                            <span id="packet-stats">未开始</span>
+                        </div>
+                    </div>
+                    <div id="packet-list" class="packet-list"></div>
                 </div>
                 
                 <!-- 历史记录内容 -->
@@ -1477,7 +1638,7 @@
                                  (window.location.protocol === 'https:' ? 443 : 80);
                 // WebSocket 端口 = HTTP 端口 + 1（如果 HTTP 端口是 80，则使用 8889）
                 const wsPort = (httpPort === 80 || httpPort === 443) ? 8889 : (httpPort + 1);
-                const wsUrl = `ws://${wsHost}:${wsPort}`;
+                const wsUrl = `ws://${wsHost}:${wsPort}/ws/logs`;
                 console.log(`[WebSocket] 连接到: ${wsUrl}`);
                 ws = new WebSocket(wsUrl);
 
@@ -1505,8 +1666,15 @@
                     appendLog('WebSocket 连接错误（实时日志不可用）', 'WARNING');
                 };
 
-                ws.onclose = () => {
-                    appendLog('WebSocket 连接已关闭', 'WARNING');
+                ws.onclose = (event) => {
+                    appendLog(`WebSocket 连接已关闭 (code: ${event.code}, reason: ${event.reason || 'none'})`, 'WARNING');
+                    // 如果连接意外关闭，尝试重连（延迟3秒）
+                    if (event.code !== 1000) {  // 1000是正常关闭
+                        setTimeout(() => {
+                            console.log('[WebSocket] 尝试重连...');
+                            connectWebSocket();
+                        }, 3000);
+                    }
                 };
             } catch (error) {
                 console.error('WebSocket 不可用:', error);
@@ -2182,23 +2350,352 @@
         function initOutputTabs() {
             const currentTab = document.getElementById('current-tab');
             const historyTab = document.getElementById('history-tab');
+            const packetTab = document.getElementById('packet-tab');
             const outputContent = document.getElementById('output-content');
             const historyContent = document.getElementById('history-content');
+            const packetContent = document.getElementById('packet-content');
             
             currentTab.addEventListener('click', () => {
                 currentTab.classList.add('active');
                 historyTab.classList.remove('active');
+                packetTab.classList.remove('active');
                 outputContent.style.display = 'block';
                 historyContent.style.display = 'none';
+                packetContent.style.display = 'none';
             });
             
             historyTab.addEventListener('click', () => {
                 historyTab.classList.add('active');
                 currentTab.classList.remove('active');
+                packetTab.classList.remove('active');
                 historyContent.style.display = 'flex';
                 outputContent.style.display = 'none';
+                packetContent.style.display = 'none';
+            });
+            
+            packetTab.addEventListener('click', () => {
+                packetTab.classList.add('active');
+                currentTab.classList.remove('active');
+                historyTab.classList.remove('active');
+                packetContent.style.display = 'flex';
+                outputContent.style.display = 'none';
+                historyContent.style.display = 'none';
             });
         }
+        
+        // 数据包抓取功能
+        let packetWebSocket = null;
+        let packetList = [];
+        let displayFilter = '';
+        
+        function initPacketCapture() {
+            const startBtn = document.getElementById('packet-start-btn');
+            const stopBtn = document.getElementById('packet-stop-btn');
+            const clearBtn = document.getElementById('packet-clear-btn');
+            const displayFilterInput = document.getElementById('packet-display-filter');
+            
+            startBtn.addEventListener('click', () => {
+                const interface = document.getElementById('packet-interface').value;
+                const filter = document.getElementById('packet-filter').value;
+                startPacketCapture(interface, filter);
+            });
+            
+            stopBtn.addEventListener('click', () => {
+                stopPacketCapture();
+            });
+            
+            clearBtn.addEventListener('click', () => {
+                packetList = [];
+                updatePacketDisplay();
+            });
+            
+            displayFilterInput.addEventListener('input', (e) => {
+                displayFilter = e.target.value.toLowerCase();
+                updatePacketDisplay();
+            });
+        }
+        
+        function startPacketCapture(interface, filter) {
+            const startBtn = document.getElementById('packet-start-btn');
+            const stopBtn = document.getElementById('packet-stop-btn');
+            const statsSpan = document.getElementById('packet-stats');
+            
+            // 调用API启动抓包
+            const url = `/api/packet-capture?action=start&interface=${encodeURIComponent(interface)}&filter=${encodeURIComponent(filter)}`;
+            fetch(url, {
+                method: 'GET',
+                credentials: 'include'  // 包含cookie
+            })
+                .then(response => {
+                    if (response.redirected || response.status === 302) {
+                        throw new Error('需要登录，请刷新页面');
+                    }
+                    if (!response.ok) {
+                        throw new Error(`HTTP错误: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.success) {
+                        startBtn.disabled = true;
+                        stopBtn.disabled = false;
+                        statsSpan.textContent = '抓包中...';
+                        
+                        // 连接WebSocket接收数据包
+                        connectPacketWebSocket();
+                    } else {
+                        alert('启动抓包失败: ' + data.message);
+                    }
+                })
+                .catch(error => {
+                    alert('启动抓包失败: ' + error);
+                });
+        }
+        
+        function stopPacketCapture() {
+            const startBtn = document.getElementById('packet-start-btn');
+            const stopBtn = document.getElementById('packet-stop-btn');
+            const statsSpan = document.getElementById('packet-stats');
+            
+            // 调用API停止抓包
+            fetch('/api/packet-capture?action=stop', {
+                method: 'GET',
+                credentials: 'include',  // 包含cookie
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            })
+                .then(response => {
+                    // 检查是否是重定向（302）
+                    if (response.redirected || response.status === 302) {
+                        throw new Error('需要登录，请刷新页面');
+                    }
+                    if (!response.ok) {
+                        // 尝试读取错误响应
+                        return response.text().then(text => {
+                            try {
+                                const data = JSON.parse(text);
+                                throw new Error(data.message || `HTTP错误: ${response.status}`);
+                            } catch {
+                                throw new Error(`HTTP错误: ${response.status} - ${text.substring(0, 100)}`);
+                            }
+                        });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data && data.success) {
+                        startBtn.disabled = false;
+                        stopBtn.disabled = true;
+                        
+                        // 断开WebSocket
+                        if (packetWebSocket) {
+                            packetWebSocket.close();
+                            packetWebSocket = null;
+                        }
+                        
+                        // 更新统计
+                        updatePacketStats();
+                        console.log('[PacketCapture] 抓包已停止:', data.message);
+                    } else {
+                        alert('停止抓包失败: ' + (data?.message || '未知错误'));
+                    }
+                })
+                .catch(error => {
+                    console.error('[PacketCapture] 停止抓包错误:', error);
+                    // 如果是网络错误，可能是认证问题
+                    if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
+                        alert('停止抓包失败: 网络错误，可能是认证问题。请刷新页面后重试。');
+                    } else {
+                        alert('停止抓包失败: ' + error.message);
+                    }
+                });
+        }
+        
+        function connectPacketWebSocket() {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsPort = parseInt(window.location.port) + 1;
+            const wsUrl = `${wsProtocol}//${window.location.hostname}:${wsPort}/ws/packets`;
+            
+            console.log('[PacketCapture] 连接WebSocket:', wsUrl);
+            packetWebSocket = new WebSocket(wsUrl);
+            
+            packetWebSocket.onopen = () => {
+                console.log('[PacketCapture] WebSocket连接已建立');
+            };
+            
+            packetWebSocket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    // 检查是否是系统消息（如连接确认）
+                    if (data.type && data.type !== 'packet') {
+                        console.log('[PacketCapture] 收到系统消息:', data);
+                        if (data.type === 'connected') {
+                            console.log('[PacketCapture]', data.message);
+                        }
+                        return; // 不添加到数据包列表
+                    }
+                    
+                    // 这是实际的数据包
+                    console.log('[PacketCapture] 收到数据包:', data);
+                    packetList.push(data);
+                    
+                    // 限制列表大小（保留最近1000个）
+                    if (packetList.length > 1000) {
+                        packetList.shift();
+                    }
+                    
+                    updatePacketDisplay();
+                    updatePacketStats();
+                } catch (e) {
+                    console.error('[PacketCapture] 解析数据包失败:', e, '原始数据:', event.data);
+                }
+            };
+            
+            packetWebSocket.onerror = (error) => {
+                console.error('[PacketCapture] WebSocket错误:', error);
+            };
+            
+            packetWebSocket.onclose = (event) => {
+                console.log('[PacketCapture] WebSocket连接已关闭', 'code:', event.code, 'reason:', event.reason);
+                packetWebSocket = null;
+                // 如果连接意外关闭，尝试重连（延迟3秒）
+                if (event.code !== 1000) {  // 1000是正常关闭
+                    console.log('[PacketCapture] 连接意外关闭，3秒后尝试重连...');
+                    setTimeout(() => {
+                        if (document.getElementById('packet-start-btn').disabled) {
+                            console.log('[PacketCapture] 尝试重连WebSocket...');
+                            connectPacketWebSocket();
+                        }
+                    }, 3000);
+                }
+            };
+        }
+        
+        function updatePacketDisplay() {
+            const packetListDiv = document.getElementById('packet-list');
+            if (!packetListDiv) {
+                console.error('[PacketCapture] packet-list元素不存在');
+                return;
+            }
+            
+            console.log('[PacketCapture] 更新显示，数据包数量:', packetList.length);
+            packetListDiv.innerHTML = '';
+            
+            // 应用显示过滤
+            let filteredPackets = packetList;
+            if (displayFilter) {
+                filteredPackets = packetList.filter(p => {
+                    const searchText = JSON.stringify(p).toLowerCase();
+                    return searchText.includes(displayFilter);
+                });
+            }
+            
+            console.log('[PacketCapture] 过滤后数据包数量:', filteredPackets.length);
+            
+            // 显示数据包（最新的在前）
+            filteredPackets.slice().reverse().forEach(packet => {
+                // 跳过系统消息
+                if (packet.type && packet.type !== 'packet') {
+                    return;
+                }
+                
+                // 确保数据包有必要的字段
+                if (!packet.protocol) {
+                    console.warn('[PacketCapture] 数据包缺少protocol字段:', packet);
+                    return;
+                }
+                
+                const entry = document.createElement('div');
+                const protocolClass = packet.sip_method ? 'sip' : (packet.protocol ? packet.protocol.toLowerCase() : 'unknown');
+                entry.className = `packet-entry ${protocolClass}`;
+                
+                // 创建可展开的数据包条目
+                const isExpanded = packet.expanded || false;
+                entry.innerHTML = `
+                    <div class="packet-header" style="cursor: pointer;">
+                        <span class="packet-time">${packet.timestamp || 'N/A'}</span>
+                        <span class="packet-protocol">${packet.protocol || 'UNKNOWN'}</span>
+                        <span class="packet-toggle" style="margin-left: auto; color: #858585;">${isExpanded ? '▼' : '▶'}</span>
+                    </div>
+                    <div class="packet-info">
+                        ${packet.src_ip || 'N/A'}:${packet.src_port || 'N/A'} → ${packet.dst_ip || 'N/A'}:${packet.dst_port || 'N/A'}
+                        ${packet.length ? `(${packet.length} bytes)` : ''}
+                        ${packet.sip_method ? `[SIP: ${packet.sip_method}]` : ''}
+                        ${packet.flags ? `[${packet.flags}]` : ''}
+                    </div>
+                    <div class="packet-detail" style="display: ${isExpanded ? 'block' : 'none'}; margin-top: 8px; padding: 8px; background: #1e1e1e; border-radius: 3px; font-family: 'Consolas', 'Monaco', monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all;">
+                        <div style="color: #4ec9b0; margin-bottom: 5px;">原始数据包:</div>
+                        <div style="color: #d4d4d4;">${escapeHtml(packet.raw || '')}</div>
+                        ${packet.sip_method ? `
+                        <div style="color: #4ec9b0; margin-top: 10px; margin-bottom: 5px;">SIP消息:</div>
+                        <div style="color: #d4d4d4;">${escapeHtml(packet.raw || '')}</div>
+                        ` : ''}
+                    </div>
+                `;
+                
+                // 添加点击事件展开/收起详情
+                const header = entry.querySelector('.packet-header');
+                const detail = entry.querySelector('.packet-detail');
+                const toggle = entry.querySelector('.packet-toggle');
+                
+                header.addEventListener('click', () => {
+                    const wasExpanded = detail.style.display === 'block';
+                    detail.style.display = wasExpanded ? 'none' : 'block';
+                    toggle.textContent = wasExpanded ? '▶' : '▼';
+                    // 更新数据包状态
+                    packet.expanded = !wasExpanded;
+                });
+                
+                packetListDiv.appendChild(entry);
+            });
+            
+            // 自动滚动到底部
+            packetListDiv.scrollTop = packetListDiv.scrollHeight;
+        }
+        
+        function updatePacketStats() {
+            const statsSpan = document.getElementById('packet-stats');
+            if (!statsSpan) {
+                return;
+            }
+            
+            fetch('/api/packet-capture?action=stats', {
+                method: 'GET',
+                credentials: 'include'  // 包含cookie
+            })
+                .then(response => {
+                    if (response.redirected || response.status === 302) {
+                        return { success: false, stats: { is_capturing: false, packet_count: 0, duration: 0 } };
+                    }
+                    if (!response.ok) {
+                        return { success: false, stats: { is_capturing: false, packet_count: 0, duration: 0 } };
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    if (data.success && data.stats) {
+                        const stats = data.stats;
+                        if (stats.is_capturing) {
+                            const duration = Math.floor(stats.duration);
+                            statsSpan.textContent = `抓包中 | ${stats.packet_count} 个数据包 | ${duration}秒 | ${stats.interface} | ${stats.filter || '无过滤'}`;
+                        } else {
+                            statsSpan.textContent = `已停止 | 共 ${stats.packet_count} 个数据包`;
+                        }
+                    }
+                })
+                .catch(error => {
+                    console.error('获取统计失败:', error);
+                });
+        }
+        
+        // 定期更新统计信息
+        setInterval(() => {
+            if (packetWebSocket) {
+                updatePacketStats();
+            }
+        }, 2000);
         
         // 更新历史记录显示
         function updateHistoryDisplay() {
@@ -2339,6 +2836,7 @@
             initParamForm();
             initOutputTabs();
             initHistoryNavigation();
+            initPacketCapture();
         });
     </script>
 </body>

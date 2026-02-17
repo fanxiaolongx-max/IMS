@@ -12,7 +12,9 @@ from sipcore.timers import create_timers
 from sipcore.cdr import init_cdr, get_cdr
 from sipcore.user_manager import init_user_manager, get_user_manager
 from sipcore.sdp_parser import extract_sdp_info
-from sipcore.media_relay import init_media_relay, get_media_relay
+# 使用RTPProxy媒体中继（替代自定义媒体转发）
+from sipcore.rtpproxy_media_relay import init_media_relay, get_media_relay
+from sipcore.stun_server import init_stun_server
 
 # 初始化日志系统
 log = init_logging(level="DEBUG", log_file="logs/ims-sip-server.log")
@@ -110,12 +112,35 @@ INVITE_BRANCHES: dict[str, str] = {}
 # 当收到 INVITE 的最终响应时，记录状态码，用于后续 ACK 类型判断
 LAST_RESPONSE_STATUS: dict[str, str] = {}
 
+# CANCEL 转发去重：Call-ID -> 上次转发时间戳
+# 避免对同一 CANCEL 重传进行重复转发，产生无意义的流量
+CANCEL_FORWARDED: dict[str, float] = {}
+
 # B2BUA 媒体模式：
-#   "relay"    - 媒体中继模式：RTP 经服务器转发，修改 SDP IP/端口指向服务器
+#   "relay"    - 媒体中继模式：使用RTPProxy进行媒体转发（推荐）
 #   "passthrough" - 媒体透传模式：SDP 原样透传，RTP 直接在主被叫间传输（用于排查终端问题）
 #   False      - 禁用，使用普通 Proxy 模式
-MEDIA_MODE = "relay"  # relay=媒体中继(解决NAT穿越), passthrough=透传(仅同网段可用)
-ENABLE_MEDIA_RELAY = (MEDIA_MODE == "relay")
+MEDIA_MODE = "passthrough"  # relay=媒体中继(使用RTPProxy), passthrough=透传(仅同网段可用)
+ENABLE_MEDIA_RELAY = (MEDIA_MODE == "relay")  # 只有 relay 模式才启用媒体中继，passthrough 模式应该透传 SDP
+
+# RTPProxy配置
+# 注意：RTPProxy使用UDP控制socket，不是TCP
+RTPPROXY_UDP_HOST = os.getenv("RTPPROXY_UDP_HOST", "127.0.0.1")
+RTPPROXY_UDP_PORT = int(os.getenv("RTPPROXY_UDP_PORT", "7722"))
+RTPPROXY_UDP = (RTPPROXY_UDP_HOST, RTPPROXY_UDP_PORT)
+# 保留TCP配置用于兼容性（如果将来需要）
+RTPPROXY_TCP_HOST = os.getenv("RTPPROXY_TCP_HOST", "127.0.0.1")
+RTPPROXY_TCP_PORT = int(os.getenv("RTPPROXY_TCP_PORT", "7722"))
+RTPPROXY_TCP = (RTPPROXY_TCP_HOST, RTPPROXY_TCP_PORT)
+
+# ====== STUN 配置 ======
+# STUN 服务器配置（用于 NAT 穿透辅助）
+ENABLE_STUN = True                # 是否启用 STUN 服务器
+STUN_BIND_IP = "0.0.0.0"        # STUN 绑定地址
+STUN_PORT = 3478                  # STUN 端口（标准端口）
+STUN_USERNAME = "123"            # STUN 认证用户名
+STUN_PASSWORD = "123"            # STUN 认证密码
+STUN_REALM = "ims.stun.server"   # STUN 认证域
 
 # ====== 安全防护配置 ======
 # IP 黑名单（已知攻击源）
@@ -237,6 +262,23 @@ def _same_user(uri1: str, uri2: str) -> bool:
         m = re.search(r"sip:([^@;>]+)", u)
         return m.group(1) if m else u
     return extract_user(uri1) == extract_user(uri2)
+
+def _extract_number_from_uri(uri: str | None) -> str:
+    """从 SIP URI 中提取号码（用户部分）
+    
+    例如:
+    - sip:1001@sip.local -> 1001
+    - <sip:1002@192.168.1.1:5060>;tag=xxx -> 1002
+    - 1003 -> 1003
+    """
+    if not uri:
+        return ""
+    import re
+    m = re.search(r"sip:([^@;>]+)", uri)
+    if m:
+        return m.group(1)
+    # 如果没有 sip: 前缀，直接返回
+    return uri.strip("<>")
 
 def _aor_from_to(to_val: str | None) -> str:
     if not to_val:
@@ -495,6 +537,12 @@ def handle_register(msg: SIPMessage, addr, transport):
     # 检查认证
     if not check_digest(msg, active_users):
         resp = make_401(msg)
+        # 打印完整的 SIP 响应内容（发送前）
+        try:
+            resp_content = resp.to_bytes().decode('utf-8', errors='ignore')
+            log.debug(f"[TX-RESP-FULL] {addr} <- 401 Unauthorized Full SIP response:\n{resp_content}")
+        except Exception as e:
+            log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
         transport.sendto(resp.to_bytes(), addr)
         log.tx(addr, resp.start_line, extra="Auth failed")
         # CDR: 401 是正常的 SIP 认证挑战流程，不记录为失败
@@ -530,16 +578,32 @@ def handle_register(msg: SIPMessage, addr, transport):
             lst[:] = [x for x in lst if x["contact"] != b["contact"]]
         else:
             abs_exp = now + b["expires"]
+            # 检查是否已有相同contact的绑定
             for x in lst:
                 if x["contact"] == b["contact"]:
                     x["expires"] = abs_exp
+                    # 更新真实来源地址（NAT场景下可能变化）
+                    x["real_addr"] = addr  # (ip, port)
                     break
             else:
-                lst.append({"contact": b["contact"], "expires": abs_exp})
+                # 新绑定，保存真实来源地址
+                lst.append({
+                    "contact": b["contact"],
+                    "expires": abs_exp,
+                    "real_addr": addr  # 保存真实socket地址，用于rport
+                })
 
     resp = _make_response(msg, 200, "OK")
     for b in lst:
         resp.add_header("contact", f"<{b['contact']}>")
+    
+    # 打印完整的 SIP 响应内容（发送前）
+    try:
+        resp_content = resp.to_bytes().decode('utf-8', errors='ignore')
+        log.debug(f"[TX-RESP-FULL] {addr} <- 200 OK Full SIP response:\n{resp_content}")
+    except Exception as e:
+        log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
+    
     transport.sendto(resp.to_bytes(), addr)
     log.tx(addr, resp.start_line, extra=f"bindings={len(lst)}")
     
@@ -629,6 +693,19 @@ def _forward_request(msg: SIPMessage, addr, transport):
     # - 2xx 响应的 ACK：R-URI 应该使用 Contact 头中的地址，可以修改
     # - BYE/UPDATE：对话内请求，可以修改
     if method == "CANCEL":
+        # CANCEL 去重：同一 Call-ID 的 CANCEL 重传只转发一次
+        cancel_call_id = msg.get("call-id")
+        if cancel_call_id:
+            now_f = time.time()
+            last_fwd = CANCEL_FORWARDED.get(cancel_call_id)
+            if last_fwd and (now_f - last_fwd) < 32.0:
+                # 32秒内（Timer F）的重传，回 200 OK 但不再转发
+                resp = _make_response(msg, 200, "OK")
+                transport.sendto(resp.to_bytes(), addr)
+                log.debug(f"[CANCEL-DEDUP] Suppressed retransmission for Call-ID: {cancel_call_id}")
+                return
+            CANCEL_FORWARDED[cancel_call_id] = now_f
+
         # CANCEL R-URI 修正逻辑
         # RFC 3261: CANCEL 的 R-URI 必须和对应的 INVITE 一致
         # 由于服务器转发 INVITE 时已经修改了 R-URI，CANCEL 也必须使用相同的修正后的 R-URI
@@ -646,6 +723,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 targets = REG_BINDINGS.get(aor, [])
                 now = int(time.time())
                 targets = [t for t in targets if t["expires"] > now]
+                targets.sort(key=lambda t: t["expires"], reverse=True)
                 if targets:
                     target_uri = targets[0]["contact"]
                     # 完全移除所有参数（包括 ;ob, transport 等）
@@ -750,6 +828,20 @@ def _forward_request(msg: SIPMessage, addr, transport):
         now = int(time.time())
         targets = [t for t in targets if t["expires"] > now]
         log.debug(f"[{method}-INITIAL] Found {len(targets)} valid bindings for AOR: {aor}")
+
+        # RFC 3261 Section 16.2: 代理收到初始 INVITE 后应立即回 100 Trying
+        # 告知 UAC 请求已接收，避免不必要的重传
+        if method == "INVITE" and targets:
+            trying = _make_response(msg, 100, "Trying")
+            # 打印完整的 SIP 响应内容（发送前）
+            try:
+                resp_content = trying.to_bytes().decode('utf-8', errors='ignore')
+                log.debug(f"[TX-RESP-FULL] {addr} <- 100 Trying Full SIP response:\n{resp_content}")
+            except Exception as e:
+                log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
+            transport.sendto(trying.to_bytes(), addr)
+            log.tx(addr, trying.start_line, extra="immediate 100 Trying")
+
         if not targets:
             log.warning(f"[{method}-INITIAL] No valid bindings for AOR: {aor}")
             # 记录失败的尝试（用于速率限制和攻击检测）
@@ -765,11 +857,26 @@ def _forward_request(msg: SIPMessage, addr, transport):
             log.tx(addr, resp.start_line, extra=f"aor={aor}")
             return
 
-        # 取第一个绑定的 contact，去掉 ;ob / ;transport 等参数
+        # ---- 选择最优绑定（优先最近注册的） ----
+        # 按 expires 降序排列：expires 最大的是最近更新的绑定
+        targets.sort(key=lambda t: t["expires"], reverse=True)
+
+        # 排除与主叫相同地址的绑定（避免回环呼叫自己）
+        caller_real = addr  # (ip, port)
+        filtered = [t for t in targets if t.get("real_addr") != caller_real]
+        if filtered:
+            targets = filtered
+            log.debug(f"[{method}-INITIAL] Filtered out caller binding, remaining: {len(targets)}")
+
         import re
         target_uri = targets[0]["contact"]
         target_uri = re.sub(r";ob\b", "", target_uri)
         target_uri = re.sub(r";transport=\w+", "", target_uri)
+
+        log.info(f"[{method}-INITIAL] Selected binding: {target_uri} "
+                 f"(real_addr={targets[0].get('real_addr')}, "
+                 f"expires_in={targets[0]['expires'] - now}s, "
+                 f"total={len(targets)})")
 
         # 改写 Request-URI
         parts = msg.start_line.split()
@@ -783,19 +890,21 @@ def _forward_request(msg: SIPMessage, addr, transport):
             # 如果主叫和被叫用户名相同（同一UA呼自己）
             if _same_user(from_aor, to_aor):
                 # 强制改写被叫为目标AOR（即被叫注册的Contact）
-                targets = REG_BINDINGS.get(to_aor, [])
-                if targets:
-                    target_uri = targets[0]["contact"]
+                same_targets = REG_BINDINGS.get(to_aor, [])
+                same_targets = [t for t in same_targets if t["expires"] > now]
+                same_targets.sort(key=lambda t: t["expires"], reverse=True)
+                if same_targets:
+                    target_uri = same_targets[0]["contact"]
                     # 改写Request-URI
                     parts = msg.start_line.split()
                     parts[1] = target_uri
                     msg.start_line = " ".join(parts)
                     # 修正From为主叫AOR
-                    for aor, binds in REG_BINDINGS.items():
+                    for aor_key, binds in REG_BINDINGS.items():
                         for b in binds:
                             ip, port = _host_port_from_sip_uri(b["contact"])
                             if addr[1] == port:
-                                msg.headers["from"] = [f"<{aor}>;tag={gen_tag()}"]
+                                msg.headers["from"] = [f"<{aor_key}>;tag={gen_tag()}"]
                                 break
         except Exception as e:
             log.warning(f"From/To normalize failed: {e}")
@@ -803,8 +912,15 @@ def _forward_request(msg: SIPMessage, addr, transport):
         # 插入 Record-Route（RFC 3261 强制要求）
         # 当代理修改 R-URI 时，必须添加 Record-Route，
         # 这样后续的 in-dialog 请求（如 ACK, BYE）会通过 Route 头路由回代理
+        # 注意：passthrough 模式下仍然需要添加 Record-Route，因为：
+        # 1. 服务器修改了 R-URI（从 AOR 改为实际 Contact），必须添加 Record-Route
+        # 2. 后续的 in-dialog 请求（2xx ACK, BYE）需要通过 Route 头路由回服务器
+        # 3. passthrough 模式只是 SDP 透传（媒体直连），信令仍然需要经过服务器
         _add_record_route_for_initial(msg)
-        log.debug(f"[RECORD-ROUTE] Added Record-Route for initial INVITE")
+        if MEDIA_MODE == "passthrough":
+            log.debug(f"[PASSTHROUGH] Added Record-Route (required for in-dialog routing), but SDP will be passed through unchanged")
+        else:
+            log.debug(f"[RECORD-ROUTE] Added Record-Route for initial INVITE")
 
     # 顶层 Via（我们）
     # RFC 3261: 
@@ -1059,8 +1175,26 @@ def _forward_request(msg: SIPMessage, addr, transport):
                     sdp_body = msg.body.decode('utf-8', errors='ignore') if isinstance(msg.body, bytes) else msg.body
                     log.info(f"[B2BUA-DEBUG] 转发INVITE前原始SDP:\n{sdp_body[:500]}...")
                     try:
-                        # 使用 process_invite_to_callee 修改SDP指向B-leg端口，同时保存A-leg信息
-                        new_sdp, session = media_relay.process_invite_to_callee(call_id, sdp_body, addr)
+                        # 提取主被叫号码和from_tag
+                        from_header = msg.get("from") or ""
+                        caller_number = _extract_number_from_uri(from_header)
+                        callee_number = _extract_number_from_uri(to_header)
+                        log.info(f"[B2BUA] 提取号码: 主叫={caller_number}, 被叫={callee_number}")
+                        
+                        # 提取from_tag用于RTPProxy offer命令
+                        from_tag = None
+                        if "tag=" in from_header:
+                            from_tag = from_header.split("tag=")[1].split(";")[0].split(">")[0].strip()
+                            log.info(f"[B2BUA] INVITE阶段提取from_tag: {from_tag}")
+                        
+                        # 使用 process_invite_to_callee 修改SDP指向B-leg端口，同时保存A-leg信息和号码
+                        # 在INVITE阶段发送RTPProxy offer命令
+                        new_sdp, session = media_relay.process_invite_to_callee(
+                            call_id, sdp_body, addr, 
+                            caller_number=caller_number, 
+                            callee_number=callee_number,
+                            from_tag=from_tag
+                        )
                         if session:
                             msg.body = new_sdp.encode('utf-8') if isinstance(msg.body, bytes) else new_sdp
                             if 'content-length' in msg.headers:
@@ -1082,6 +1216,13 @@ def _forward_request(msg: SIPMessage, addr, transport):
         vias = msg.headers.get("via", [])
         routes = msg.headers.get("route", [])
         log.debug(f"[FWD-DETAIL] Method: {method} | Call-ID: {call_id} | Target: {host}:{port} | Via hops: {len(vias)} | Route: {len(routes)}")
+        
+        # 打印完整的 SIP 消息内容（转发前）
+        try:
+            msg_content = msg.to_bytes().decode('utf-8', errors='ignore')
+            log.debug(f"[FWD-FULL] {method} -> {host}:{port} Full SIP message:\n{msg_content}")
+        except Exception as e:
+            log.debug(f"[FWD-FULL] Failed to decode message: {e}")
         
         transport.sendto(msg.to_bytes(), (host, port))
         log.fwd(method, (host, port), f"R-URI={msg.start_line.split()[1]}")
@@ -1352,28 +1493,35 @@ def _forward_response(resp: SIPMessage, addr, transport):
     original_sender_addr = PENDING_REQUESTS.get(call_id) if call_id else None
     log.debug(f"[RESP-ROUTE] Call-ID: {call_id}, Original sender: {original_sender_addr}, Via解析: {nhost}:{nport}")
 
-    # NAT修正：根据网络环境判断
-    is_local_network = (
-        nhost == "127.0.0.1" or 
-        nhost.startswith(("192.168.", "10.", "172.")) or 
-        nhost in ("localhost", SERVER_IP) or
-        nhost in LOCAL_NETWORKS
-    )
-    
-    if not is_local_network:
-        # Via 头包含外部/公网地址，使用原始请求发送者地址
-        if original_sender_addr:
-            log.debug(f"[RESP-NAT] Via指向外部地址 {nhost}:{nport}, 使用原始发送者: {original_sender_addr}")
-            nhost, nport = original_sender_addr
-        else:
-            # 回退到REGISTER绑定地址
-            for aor, binds in REG_BINDINGS.items():
-                for b in binds:
-                    host2, port2 = _host_port_from_sip_uri(b["contact"])
-                    if (host2, port2) != (addr[0], addr[1]):  # 避免回环
+    # ========== rport 支持 ==========
+    # 优先使用原始请求的源地址（从UDP socket读取的真实地址）
+    # 这符合 RFC 3581: An Extension to SIP for Symmetric Response Routing
+    if original_sender_addr:
+        # rport: 使用收到请求的源地址和端口
+        real_host, real_port = original_sender_addr
+        log.debug(f"[RPORT] 使用rport地址: {real_host}:{real_port}")
+        nhost, nport = real_host, real_port
+    else:
+        # 回退方案：查找REGISTER绑定的真实地址
+        for aor, binds in REG_BINDINGS.items():
+            for b in binds:
+                if "real_addr" in b:
+                    host2, port2 = b["real_addr"]
+                    if host2 and port2:
+                        log.debug(f"[RPORT] 使用REGISTER绑定的真实地址: {host2}:{port2}")
                         nhost, nport = host2, port2
-                        log.debug(f"[RESP-NAT] 使用绑定地址: {host2}:{port2}")
                         break
+
+    # ========== 防止自环 ==========
+    # 如果最终地址指向服务器自己，回退到Via头解析的地址
+    if (nhost == SERVER_IP and nport == SERVER_PORT):
+        log.warning(f"[RPORT] 回退: rport地址指向服务器({nhost}:{nport})，使用Via地址")
+        vias = resp.headers.get("via", [])
+        if vias:
+            first_via_str = vias[0]
+            first_via_parts = _split_via_header(first_via_str)
+            if first_via_parts:
+                nhost, nport = _host_port_from_via(first_via_parts[0])
 
     # 兜底：如果还是没找到，就用当前addr（收到响应的对端）
     if not nhost or not nport:
@@ -1417,6 +1565,13 @@ def _forward_response(resp: SIPMessage, addr, transport):
     log.debug(f"[VIA-ROUTE] Response {status_code} ({cseq_header}) → {nhost}:{nport}")
 
     try:
+        # 打印完整的 SIP 响应内容（转发前）
+        try:
+            resp_content = resp.to_bytes().decode('utf-8', errors='ignore')
+            log.debug(f"[FWD-RESP-FULL] {status_code} -> {nhost}:{nport} Full SIP response:\n{resp_content}")
+        except Exception as e:
+            log.debug(f"[FWD-RESP-FULL] Failed to decode response: {e}")
+        
         transport.sendto(resp.to_bytes(), (nhost, nport))
         log.fwd(f"RESP {resp.start_line}", (nhost, nport))
         
@@ -1470,12 +1625,23 @@ def _forward_response(resp: SIPMessage, addr, transport):
                                 resp.body = new_sdp.encode('utf-8') if isinstance(resp.body, bytes) else new_sdp
                                 if 'content-length' in resp.headers:
                                     resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
-                                log.info(f"[B2BUA] 200 OK SDP 修改: {call_id} -> A-leg端口 {media_relay._sessions.get(call_id) and media_relay._sessions[call_id].a_leg_rtp_port}")
+                                log.info(f"[B2BUA] 200 OK SDP 修改: {call_id} -> 共享端口 {media_relay._sessions.get(call_id) and media_relay._sessions[call_id].b_leg_rtp_port}")
                                 if not already_started:
                                     log.info(f"[B2BUA-DEBUG] 修改后200OK SDP:\n{new_sdp[:500]}...")
                                     log.info(f"[B2BUA] 准备启动媒体转发: {call_id}, already_started={already_started}")
                                     try:
-                                        result = media_relay.start_media_forwarding(call_id)
+                                        # 提取from_tag和to_tag用于RTPProxy会话创建
+                                        from_header = resp.get("from") or ""
+                                        to_header = resp.get("to") or ""
+                                        from_tag = None
+                                        to_tag = None
+                                        if "tag=" in from_header:
+                                            from_tag = from_header.split("tag=")[1].split(";")[0].split(">")[0].strip()
+                                        if "tag=" in to_header:
+                                            to_tag = to_header.split("tag=")[1].split(";")[0].split(">")[0].strip()
+                                        
+                                        log.info(f"[B2BUA] 提取标签: from_tag={from_tag}, to_tag={to_tag}")
+                                        result = media_relay.start_media_forwarding(call_id, from_tag=from_tag, to_tag=to_tag)
                                         log.info(f"[B2BUA] 媒体转发启动结果: {call_id}, result={result}")
                                         media_relay.print_media_diagnosis(call_id)
                                     except Exception as start_e:
@@ -1631,6 +1797,13 @@ def on_datagram(data: bytes, addr, transport):
             log.info(f"[RX] {addr} -> {msg.start_line} | Call-ID: {call_id} | Via: {len(vias)} hops")
         
         log.rx(addr, msg.start_line)
+        
+        # 打印完整的 SIP 消息内容
+        try:
+            msg_content = msg.to_bytes().decode('utf-8', errors='ignore')
+            log.debug(f"[RX-FULL] {addr} -> Full SIP message:\n{msg_content}")
+        except Exception as e:
+            log.debug(f"[RX-FULL] Failed to decode message: {e}")
         if is_req:
             method = _method_of(msg)
             if method == "OPTIONS":
@@ -1638,6 +1811,12 @@ def on_datagram(data: bytes, addr, transport):
                     "accept": "application/sdp",
                     "supported": "100rel, timer, path"
                 })
+                # 打印完整的 SIP 响应内容（发送前）
+                try:
+                    resp_content = resp.to_bytes().decode('utf-8', errors='ignore')
+                    log.debug(f"[TX-RESP-FULL] {addr} <- 200 OK (OPTIONS) Full SIP response:\n{resp_content}")
+                except Exception as e:
+                    log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
                 transport.sendto(resp.to_bytes(), addr)
                 log.tx(addr, resp.start_line)
                 # CDR: 记录 OPTIONS 请求（心跳/能力查询）
@@ -1655,6 +1834,12 @@ def on_datagram(data: bytes, addr, transport):
                 _forward_request(msg, addr, transport)
             else:
                 resp = _make_response(msg, 405, "Method Not Allowed")
+                # 打印完整的 SIP 响应内容（发送前）
+                try:
+                    resp_content = resp.to_bytes().decode('utf-8', errors='ignore')
+                    log.debug(f"[TX-RESP-FULL] {addr} <- 405 Method Not Allowed Full SIP response:\n{resp_content}")
+                except Exception as e:
+                    log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
                 transport.sendto(resp.to_bytes(), addr)
                 log.tx(addr, resp.start_line)
         else:
@@ -1676,14 +1861,17 @@ async def main():
         'INVITE_BRANCHES': INVITE_BRANCHES,
     }
     
-    # 初始化媒体中继（B2BUA 模式）
+    # 初始化RTPProxy媒体中继（B2BUA 模式）
     if ENABLE_MEDIA_RELAY:
         try:
-            media_relay = init_media_relay(SERVER_IP)
+            media_relay = init_media_relay(SERVER_IP, rtpproxy_udp=RTPPROXY_UDP)
             server_globals['MEDIA_RELAY'] = media_relay
-            log.info(f"[B2BUA] 媒体中继已初始化，服务器IP: {SERVER_IP}")
+            log.info(f"[B2BUA] RTPProxy媒体中继已初始化，服务器IP: {SERVER_IP}")
+            log.info(f"[B2BUA] RTPProxy地址: {RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} (UDP)")
+            log.info(f"[B2BUA] 请确保RTPProxy已启动: rtpproxy -l {SERVER_IP} -s udp:{RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} -F")
         except Exception as e:
-            log.error(f"[B2BUA] 媒体中继初始化失败: {e}")
+            log.error(f"[B2BUA] RTPProxy媒体中继初始化失败: {e}")
+            log.error(f"[B2BUA] 请确保RTPProxy已启动: rtpproxy -l {SERVER_IP} -s udp:{RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} -F")
             server_globals['MEDIA_RELAY'] = None
     else:
         log.info("[B2BUA] 媒体中继已禁用（Proxy模式）")
@@ -1708,22 +1896,49 @@ async def main():
         init_mml_interface(port=8888, server_globals=server_globals)
     except Exception as e:
         log.warning(f"MML interface failed to start: {e}")
-    
+
+    # 初始化并启动 STUN 服务器（用于 NAT 穿透辅助）
+    stun_server = None
+    if ENABLE_STUN:
+        try:
+            stun_server = init_stun_server(
+                host=STUN_BIND_IP,
+                port=STUN_PORT,
+                username=STUN_USERNAME,
+                password=STUN_PASSWORD,
+                realm=STUN_REALM
+            )
+            await stun_server.start()
+            server_globals['STUN_SERVER'] = stun_server
+            log.info(f"[STUN] STUN服务器已启动，监听地址: {STUN_BIND_IP}:{STUN_PORT}")
+            log.info(f"[STUN] 认证信息: username={STUN_USERNAME}, password={STUN_PASSWORD}")
+        except Exception as e:
+            log.error(f"[STUN] STUN服务器启动失败: {e}")
+            server_globals['STUN_SERVER'] = None
+    else:
+        log.info("[STUN] STUN服务器已禁用")
+        server_globals['STUN_SERVER'] = None
+
     # 创建并启动 UDP 服务器
     # 绑定地址使用 0.0.0.0（监听所有接口），但对外宣告使用 SERVER_IP
     log.info(f"[CONFIG] UDP server binding to {UDP_BIND_IP}:{SERVER_PORT}, public IP: {SERVER_IP}")
     udp = UDPServer((UDP_BIND_IP, SERVER_PORT), on_datagram)
     await udp.start()
     # UDP server listening 日志已在 transport_udp.py 中输出，此处不再重复
-    
+
     # 创建并启动定时器
     timers = create_timers(log)
     await timers.start(
         pending_requests=PENDING_REQUESTS,
         dialogs=DIALOGS,
         invite_branches=INVITE_BRANCHES,
-        reg_bindings=REG_BINDINGS
+        reg_bindings=REG_BINDINGS,
+        transport=udp.transport,  # 传入UDP transport用于NAT保活
+        server_ip=SERVER_IP,
+        server_port=SERVER_PORT,
+        cancel_forwarded=CANCEL_FORWARDED
     )
+    log.info("[TIMERS] NAT keepalive enabled (interval: 25s)")
     
     try:
         # 等待服务器运行
@@ -1731,6 +1946,11 @@ async def main():
     except KeyboardInterrupt:
         log.info("Shutting down server...")
     finally:
+        # 停止 STUN 服务器
+        if stun_server:
+            await stun_server.stop()
+            log.info("[STUN] STUN服务器已停止")
+
         # 停止定时器
         await timers.stop()
 

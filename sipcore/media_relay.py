@@ -15,6 +15,7 @@ import threading
 import re
 import time
 import asyncio
+import sys
 from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass, field
 
@@ -23,24 +24,39 @@ from dataclasses import dataclass, field
 class MediaSession:
     """媒体会话信息"""
     call_id: str
-    # 主叫侧 (A-leg) - 端口（必须有，无默认值）
+    # 主叫侧 (A-leg) - 音频端口（必须有，无默认值）
     a_leg_rtp_port: int
     a_leg_rtcp_port: int
-    # 被叫侧 (B-leg) - 端口（必须有，无默认值）
+    # 被叫侧 (B-leg) - 音频端口（必须有，无默认值）
     b_leg_rtp_port: int
     b_leg_rtcp_port: int
     
-    # 主叫侧 - 其他信息（可选，有默认值）
-    a_leg_remote_addr: Optional[Tuple[str, int]] = None  # 从SDP提取的地址
+    # 主叫侧 (A-leg) - 视频端口（可选，有默认值）
+    a_leg_video_rtp_port: Optional[int] = None
+    a_leg_video_rtcp_port: Optional[int] = None
+    # 被叫侧 (B-leg) - 视频端口（可选，有默认值）
+    b_leg_video_rtp_port: Optional[int] = None
+    b_leg_video_rtcp_port: Optional[int] = None
+    
+    # 主叫侧 - 音频信息（可选，有默认值）
+    a_leg_remote_addr: Optional[Tuple[str, int]] = None  # 从SDP提取的音频地址
     a_leg_actual_addr: Optional[Tuple[str, int]] = None  # 对称RTP学习到的地址
     a_leg_sdp: Optional[str] = None  # 原始SDP
     a_leg_signaling_addr: Optional[Tuple[str, int]] = None  # 信令来源地址（优先使用）
     
-    # 被叫侧 - 其他信息（可选，有默认值）
+    # 主叫侧 - 视频信息（可选，有默认值）
+    a_leg_video_remote_addr: Optional[Tuple[str, int]] = None  # 从SDP提取的视频地址
+    a_leg_video_actual_addr: Optional[Tuple[str, int]] = None  # 对称RTP学习到的视频地址
+    
+    # 被叫侧 - 音频信息（可选，有默认值）
     b_leg_remote_addr: Optional[Tuple[str, int]] = None
     b_leg_actual_addr: Optional[Tuple[str, int]] = None
     b_leg_sdp: Optional[str] = None
     b_leg_signaling_addr: Optional[Tuple[str, int]] = None  # 信令来源地址（优先使用）
+    
+    # 被叫侧 - 视频信息（可选，有默认值）
+    b_leg_video_remote_addr: Optional[Tuple[str, int]] = None  # 从SDP提取的视频地址
+    b_leg_video_actual_addr: Optional[Tuple[str, int]] = None  # 对称RTP学习到的视频地址
     
     # 状态（可选，有默认值）
     created_at: float = field(default_factory=time.time)
@@ -52,6 +68,10 @@ class MediaSession:
     b_to_a_bytes: int = 0
     a_to_b_packets: int = 0
     b_to_a_packets: int = 0
+    
+    # 主被叫号码（可选，有默认值）
+    caller_number: Optional[str] = None  # 主叫号码 (A-leg)
+    callee_number: Optional[str] = None  # 被叫号码 (B-leg)
     
     def get_a_leg_target_addr(self) -> Optional[Tuple[str, int]]:
         """获取A-leg目标地址（优先使用信令地址）"""
@@ -89,6 +109,28 @@ class MediaSession:
             return self.b_leg_signaling_addr
         # 其次使用SDP地址
         return self.b_leg_remote_addr
+    
+    def get_a_leg_video_rtp_target_addr(self) -> Optional[Tuple[str, int]]:
+        """获取发往 A-leg 的视频 RTP 目标地址"""
+        if not self.a_leg_video_remote_addr:
+            return None
+        video_rtp_ip = self.a_leg_video_remote_addr[0]
+        video_rtp_port = self.a_leg_video_remote_addr[1]
+        # NAT 场景：使用信令侧的公网 IP + SDP 里的视频 RTP 端口
+        if self.a_leg_signaling_addr:
+            video_rtp_ip = self.a_leg_signaling_addr[0]
+        return (video_rtp_ip, video_rtp_port)
+    
+    def get_b_leg_video_rtp_target_addr(self) -> Optional[Tuple[str, int]]:
+        """获取发往 B-leg 的视频 RTP 目标地址"""
+        if not self.b_leg_video_remote_addr:
+            return None
+        video_rtp_ip = self.b_leg_video_remote_addr[0]
+        video_rtp_port = self.b_leg_video_remote_addr[1]
+        # NAT 场景：使用信令侧的公网 IP + SDP 里的视频 RTP 端口
+        if self.b_leg_signaling_addr:
+            video_rtp_ip = self.b_leg_signaling_addr[0]
+        return (video_rtp_ip, video_rtp_port)
 
 
 class RTPPortManager:
@@ -155,13 +197,17 @@ class SDPProcessor:
     @staticmethod
     def extract_media_info(sdp_body: str) -> Optional[Dict]:
         """
-        从SDP中提取媒体信息
+        从SDP中提取媒体信息（支持音频和视频）
         
         Returns:
             {
-                'connection_ip': str,  # c= 行中的IP
+                'connection_ip': str,  # c= 行中的IP（会话级别）
                 'audio_port': int,     # m=audio 行中的端口
-                'audio_payloads': List[str],  # 支持的payload类型
+                'audio_payloads': List[str],  # 音频支持的payload类型
+                'audio_connection_ip': str,  # 音频媒体级别的c=行（如果有）
+                'video_port': int,     # m=video 行中的端口
+                'video_payloads': List[str],  # 视频支持的payload类型
+                'video_connection_ip': str,  # 视频媒体级别的c=行（如果有）
                 'codec_info': Dict[str, str]  # payload -> codec
             }
         """
@@ -172,10 +218,16 @@ class SDPProcessor:
             'connection_ip': None,
             'audio_port': None,
             'audio_payloads': [],
+            'audio_connection_ip': None,
+            'video_port': None,
+            'video_payloads': [],
+            'video_connection_ip': None,
             'codec_info': {}
         }
         
         lines = sdp_body.split('\r\n') if '\r\n' in sdp_body else sdp_body.split('\n')
+        
+        current_media = None  # 跟踪当前处理的媒体类型 (audio/video)
         
         for line in lines:
             line = line.strip()
@@ -187,11 +239,19 @@ class SDPProcessor:
             if line.startswith('c='):
                 parts = line[2:].split()
                 if len(parts) >= 3 and parts[1] == 'IP4':
-                    result['connection_ip'] = parts[2]
+                    ip_addr = parts[2]
+                    if current_media == 'audio':
+                        result['audio_connection_ip'] = ip_addr
+                    elif current_media == 'video':
+                        result['video_connection_ip'] = ip_addr
+                    elif current_media is None:
+                        # 会话级别的 c= 行（在第一个 m= 行之前）
+                        result['connection_ip'] = ip_addr
             
-            # 解析 m=audio 行 (媒体描述)
+            # 解析 m=audio 行 (音频媒体描述)
             # 格式: m=audio 49170 RTP/AVP 0 8 18
             elif line.startswith('m=audio '):
+                current_media = 'audio'
                 parts = line.split()
                 if len(parts) >= 4:
                     try:
@@ -200,8 +260,20 @@ class SDPProcessor:
                     except ValueError:
                         pass
             
+            # 解析 m=video 行 (视频媒体描述)
+            # 格式: m=video 51372 RTP/AVP 96 97
+            elif line.startswith('m=video '):
+                current_media = 'video'
+                parts = line.split()
+                if len(parts) >= 4:
+                    try:
+                        result['video_port'] = int(parts[1])
+                        result['video_payloads'] = parts[3:]
+                    except ValueError:
+                        pass
+            
             # 解析 a=rtpmap 行 (编解码映射)
-            # 格式: a=rtpmap:0 PCMU/8000
+            # 格式: a=rtpmap:0 PCMU/8000 或 a=rtpmap:96 H264/90000
             elif line.startswith('a=rtpmap:'):
                 match = re.match(r'a=rtpmap:(\d+)\s+(.+)', line)
                 if match:
@@ -209,17 +281,20 @@ class SDPProcessor:
                     codec_info = match.group(2)
                     result['codec_info'][payload] = codec_info
         
+        # 如果没有音频端口，认为无效
         return result if result['audio_port'] else None
     
     @staticmethod
-    def modify_sdp(sdp_body: str, new_ip: str, new_port: int, force_plain_rtp: bool = False) -> str:
+    def modify_sdp(sdp_body: str, new_ip: str, new_audio_port: int, 
+                   new_video_port: Optional[int] = None, force_plain_rtp: bool = False) -> str:
         """
-        修改SDP中的IP地址和端口
+        修改SDP中的IP地址和端口（支持音频和视频）
         
         Args:
             sdp_body: 原始SDP
             new_ip: 新的IP地址
-            new_port: 新的RTP端口
+            new_audio_port: 新的音频RTP端口
+            new_video_port: 新的视频RTP端口（可选，如果SDP包含视频流）
             force_plain_rtp: 是否强制使用普通RTP（移除SRTP加密行）
                              默认 False: 保持原始的 RTP/SAVP 或 RTP/AVP 不变（推荐）
                              True: 强制改为 RTP/AVP 并删除 crypto 行（会导致 SRTP 终端无法通话）
@@ -259,7 +334,18 @@ class SDPProcessor:
                     payloads = ' '.join(parts[3:])
                     if force_plain_rtp:
                         proto = "RTP/AVP"  # 强制降级（不推荐）
-                    line = f"m=audio {new_port} {proto} {payloads}"
+                    line = f"m=audio {new_audio_port} {proto} {payloads}"
+            
+            # 修改 m=video 行（只改端口号，保留原始协议类型）
+            elif line.startswith('m=video '):
+                parts = line.split()
+                if len(parts) >= 4 and new_video_port is not None:
+                    # 保持原始协议类型，只修改端口
+                    proto = parts[2]  # 保留原始协议: RTP/AVP 或 RTP/SAVP
+                    payloads = ' '.join(parts[3:])
+                    if force_plain_rtp:
+                        proto = "RTP/AVP"  # 强制降级（不推荐）
+                    line = f"m=video {new_video_port} {proto} {payloads}"
             
             # 跳过 SRTP 加密属性行（仅在强制使用普通RTP时）
             elif force_plain_rtp and (line.startswith('a=crypto:') or line.startswith('a=fingerprint:')):
@@ -271,67 +357,77 @@ class SDPProcessor:
         return '\r\n'.join(new_lines) + '\r\n'
 
 
-class RTPForwarder:
-    """RTP转发器 (单端口)"""
+class SinglePortMediaForwarder:
+    """
+    单端口双向 RTP 转发器（核心改进）
     
-    def __init__(self, local_port: int, target_addr: Tuple[str, int], 
-                 symmetric_rtp: bool = True, timeout: float = 30.0):
-        """
-        初始化RTP转发器
-        
-        Args:
-            local_port: 本地监听端口
-            target_addr: 目标地址 (ip, port)
-            symmetric_rtp: 是否启用对称RTP
-            timeout: 对称RTP学习超时时间（秒）
-        """
+    主叫和被叫都向同一个端口发送 RTP，根据源地址区分方向：
+    - 来自主叫的包 → 转发给被叫
+    - 来自被叫的包 → 转发给主叫
+    
+    优势（相比双端口模式）：
+    1. 避免 A-leg 端口被防火墙/安全组阻断的问题
+    2. 两端看到的源端口一致（都是同一个端口），NAT 穿越更简单
+    3. 端口消耗减半
+    """
+    
+    SILENCE_RTP = (
+        b'\x80\x00'
+        b'\x00\x01'
+        b'\x00\x00\x00\xa0'
+        b'\x00\x00\x00\x00'
+        + b'\xff' * 160
+    )
+    
+    def __init__(self, local_port: int,
+                 caller_target: Tuple[str, int],
+                 callee_target: Tuple[str, int],
+                 caller_expected_ip: Optional[str] = None,
+                 callee_expected_ip: Optional[str] = None,
+                 call_name: str = ""):
         self.local_port = local_port
-        self.target_addr = target_addr
-        self.symmetric_rtp = symmetric_rtp
-        self.timeout = timeout
+        self.caller_target = caller_target
+        self.callee_target = callee_target
+        self.caller_expected_ip = caller_expected_ip
+        self.callee_expected_ip = callee_expected_ip
+        self.call_name = call_name or f"port-{local_port}"
+        
+        # 保存目标端口，用于同IP时的端口匹配
+        self.caller_target_port = caller_target[1] if caller_target else None
+        self.callee_target_port = callee_target[1] if callee_target else None
         
         self.sock: Optional[socket.socket] = None
         self.running = False
         self.thread: Optional[threading.Thread] = None
         
-        # 对称RTP学习的实际地址
-        self.actual_target_addr = target_addr
-        self._addr_learned = False
-        self._relearn_needed = False  # 重新学习标志（用于re-INVITE）
+        self.caller_latched = False
+        self.callee_latched = False
+        self.caller_actual_addr: Optional[Tuple[str, int]] = None
+        self.callee_actual_addr: Optional[Tuple[str, int]] = None
         
-        # 对端转发器引用（用于跨转发器对称RTP学习）
-        # A-leg转发器的 peer_forwarder 指向 B-leg转发器（反之亦然）
-        # 当本转发器收到首包时，把源地址通知给对端转发器作为目标地址
-        self.peer_forwarder: Optional['RTPForwarder'] = None
+        self.caller_to_callee_packets = 0
+        self.callee_to_caller_packets = 0
+        self.unknown_packets = 0
+        self.total_bytes = 0
         
-        # 统计
-        self.packets_received = 0
-        self.packets_sent = 0
-        self.bytes_received = 0
-        self.bytes_sent = 0
-        
-        # 收包统计（用于调试）
         self._last_log_time = 0
-        self._last_packets = 0
-        self._last_bytes = 0
-        self._src_addr_history: List[Tuple[str, int]] = []  # 记录源地址历史
+        self._last_a2b = 0
+        self._last_b2a = 0
+        self._last_punch_time = 0
+        self._punch_count = 0
     
     def start(self):
-        """启动转发器"""
         if self.running:
             return
-        
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(('0.0.0.0', self.local_port))
-        self.sock.settimeout(1.0)  # 1秒超时，便于检查running标志
-        
+        self.sock.settimeout(1.0)
         self.running = True
         self.thread = threading.Thread(target=self._forward_loop, daemon=True)
         self.thread.start()
     
     def stop(self):
-        """停止转发器"""
         self.running = False
         if self.sock:
             try:
@@ -343,164 +439,264 @@ class RTPForwarder:
             self.thread.join(timeout=2.0)
             self.thread = None
     
-    def update_target(self, new_addr: Tuple[str, int]):
-        """更新目标地址（用于对称RTP学习后）"""
-        self.actual_target_addr = new_addr
-        self._addr_learned = True
-    
-    def reset_symmetric_learning(self):
-        """重置对称RTP学习状态（用于re-INVITE场景）"""
-        self._addr_learned = False
-        self._relearn_needed = True
-        print(f"[RTP] 重置对称RTP学习状态: 端口 {self.local_port}")
-    
-    def _learn_symmetric_addr(self) -> bool:
-        """学习对称RTP地址"""
-        if not self.symmetric_rtp or self._addr_learned:
-            return True
-        if not self.sock:
-            return False
-
-        start_time = time.time()
-        try:
-            self.sock.setblocking(False)
-        except Exception:
-            return True
-
-        try:
-            while time.time() - start_time < self.timeout:
-                if not self.running or not self.sock:
-                    return False
-
-                try:
-                    data, addr = self.sock.recvfrom(2048)
-                    if len(data) >= 12:  # RTP头至少12字节
-                        # 学习到这个地址
-                        old_addr = self.actual_target_addr
-                        self.actual_target_addr = (addr[0], addr[1])
-                        self._addr_learned = True
-                        print(f"[RTP] 对称RTP学习: {old_addr} -> {addr}")
-
-                        # 转发这个包
-                        self._send_packet(data, addr)
-                        return True
-                except BlockingIOError:
-                    time.sleep(0.01)
-                    continue
-        finally:
-            if self.sock:
-                try:
-                    self.sock.setblocking(True)
-                except Exception:
-                    pass
-
-        # 超时，使用配置的地址
-        print(f"[RTP] 对称RTP超时，使用配置地址: {self.actual_target_addr}")
-        return True
-    
-    def _send_packet(self, data: bytes, from_addr: Tuple[str, int]):
-        """发送数据包到目标地址"""
-        if not self.sock:
+    def send_nat_punch(self, count: int = 10, interval: float = 0.02):
+        """向两端发送 NAT 打洞包"""
+        if not self.sock or not self.running:
             return
-        try:
-            self.sock.sendto(data, self.actual_target_addr)
-            self.packets_sent += 1
-            self.bytes_sent += len(data)
-        except Exception as e:
-            print(f"[RTP] 发送错误: {e}")
+        for target, name in [(self.callee_target, "被叫"),
+                             (self.caller_target, "主叫")]:
+            if not target:
+                continue
+            print(f"[RTP-PUNCH] {self.call_name}(:{self.local_port}): "
+                  f"→{name} {target} x{count}",
+                  file=sys.stderr, flush=True)
+            for i in range(count):
+                try:
+                    self.sock.sendto(self.SILENCE_RTP, target)
+                    if interval > 0 and i < count - 1:
+                        time.sleep(interval)
+                except Exception as e:
+                    print(f"[RTP-PUNCH-ERR] {self.call_name}: → {target}: {e}",
+                          file=sys.stderr, flush=True)
+                    break
+    
+    def send_aggressive_nat_punch(self, base_port: int, port_range: int = 10):
+        """
+        激进的NAT打洞：尝试多个端口范围
+        用于主叫NAT端口映射不确定的情况
+        """
+        if not self.sock or not self.running or not self.caller_target:
+            return
+        
+        caller_ip = self.caller_target[0]
+        base = self.caller_target[1]
+        
+        print(f"[RTP-PUNCH-AGGR] {self.call_name}: 激进打洞 →主叫 {caller_ip}:{base}±{port_range}",
+              file=sys.stderr, flush=True)
+        
+        # 尝试基础端口和周围端口
+        ports_to_try = [base] + [base + i for i in range(1, port_range + 1)] + [base - i for i in range(1, port_range + 1)]
+        
+        for port in ports_to_try:
+            if port < 1024 or port > 65535:
+                continue
+            try:
+                self.sock.sendto(self.SILENCE_RTP, (caller_ip, port))
+            except Exception as e:
+                pass  # 忽略错误，继续尝试
+    
+    def update_targets(self, caller_target: Tuple[str, int],
+                       callee_target: Tuple[str, int]):
+        """更新目标地址（re-INVITE 场景）"""
+        self.caller_target = caller_target
+        self.callee_target = callee_target
+        self.caller_target_port = caller_target[1] if caller_target else None
+        self.callee_target_port = callee_target[1] if callee_target else None
+        self.caller_latched = False
+        self.callee_latched = False
+        self.caller_actual_addr = None
+        self.callee_actual_addr = None
+        print(f"[RTP-RELEARN] {self.call_name}(:{self.local_port}): "
+              f"重置LATCH, 新目标: 主叫{caller_target} 被叫{callee_target}",
+              file=sys.stderr, flush=True)
+    
+    def _classify_source(self, addr: Tuple[str, int]) -> str:
+        """
+        判断 RTP 包来自主叫还是被叫（简化逻辑，更宽松）
+        
+        策略（按优先级）：
+        1. 已 LATCH 的精确地址匹配
+        2. 期望 IP 匹配（信令地址）
+        3. 排除法（一方已 LATCH，另一方未知则是新的那方）
+        4. 首包归被叫（B2BUA 中被叫通常先发 RTP）
+        """
+        # 精确匹配已学习的地址
+        if self.callee_actual_addr and addr == self.callee_actual_addr:
+            return "callee"
+        if self.caller_actual_addr and addr == self.caller_actual_addr:
+            return "caller"
+        
+        src_ip = addr[0]
+        
+        # IP 匹配（放宽：只要IP匹配就接受，不要求精确）
+        if self.callee_expected_ip and src_ip == self.callee_expected_ip:
+            if not self.caller_expected_ip or src_ip != self.caller_expected_ip:
+                return "callee"
+        if self.caller_expected_ip and src_ip == self.caller_expected_ip:
+            if not self.callee_expected_ip or src_ip != self.callee_expected_ip:
+                return "caller"
+        
+        # 排除法：如果一方已LATCH，新包来自另一方
+        if self.callee_latched and not self.caller_latched:
+            return "caller"
+        if self.caller_latched and not self.callee_latched:
+            return "callee"
+        
+        # 首包默认归被叫（被叫通常先发RTP）
+        if not self.callee_latched:
+            return "callee"
+        
+        # 如果双方都已LATCH但地址不匹配，记录为未知
+        return "unknown"
     
     def _log_stats(self):
-        """输出收包统计"""
         now = time.time()
-        if now - self._last_log_time >= 5:  # 每5秒输出一次
-            pkts_diff = self.packets_received - self._last_packets
-            bytes_diff = self.bytes_received - self._last_bytes
-            if pkts_diff > 0 or self.packets_received > 0:
-                learned_status = "已学习" if self._addr_learned else "未学习"
-                print(f"[RTP-STATS] 端口 {self.local_port}: "
-                      f"收包 {self.packets_received} ({pkts_diff}/5s), "
-                      f"发包 {self.packets_sent}, "
-                      f"目标 {self.actual_target_addr} ({learned_status}), "
-                      f"源地址历史 {self._src_addr_history[-3:] if self._src_addr_history else 'None'}")
-            elif self.packets_received == 0 and now - self._last_log_time >= 10:
-                # 如果10秒内没有收到包，输出警告
-                print(f"[RTP-WARNING] 端口 {self.local_port}: 10秒内未收到任何RTP包，目标 {self.actual_target_addr}")
+        if now - self._last_log_time >= 5:
+            a2b_diff = self.caller_to_callee_packets - self._last_a2b
+            b2a_diff = self.callee_to_caller_packets - self._last_b2a
+            cs = "✓" if self.caller_latched else "✗"
+            bs = "✓" if self.callee_latched else "✗"
+            total = self.caller_to_callee_packets + self.callee_to_caller_packets
+            if total > 0 or a2b_diff > 0 or b2a_diff > 0:
+                print(f"[RTP-STATS] {self.call_name}(:{self.local_port}): "
+                      f"A→B:{self.caller_to_callee_packets}(+{a2b_diff}) "
+                      f"B→A:{self.callee_to_caller_packets}(+{b2a_diff}) "
+                      f"主叫{cs}{self.caller_actual_addr or self.caller_target} "
+                      f"被叫{bs}{self.callee_actual_addr or self.callee_target}",
+                      file=sys.stderr, flush=True)
+            elif total == 0 and now - self._last_log_time >= 10:
+                print(f"[RTP-WARN] {self.call_name}(:{self.local_port}): "
+                      f"⚠️ 10s无收包! 主叫{cs}{self.caller_target} "
+                      f"被叫{bs}{self.callee_target}",
+                      file=sys.stderr, flush=True)
             self._last_log_time = now
-            self._last_packets = self.packets_received
-            self._last_bytes = self.bytes_received
+            self._last_a2b = self.caller_to_callee_packets
+            self._last_b2a = self.callee_to_caller_packets
     
     def _forward_loop(self):
-        """
-        转发主循环 - B2BUA模式，支持跨转发器对称RTP学习（Opto-RTP / Latching）
-        
-        NAT 穿越原理：
-        - 信令端口和 RTP 端口经过 NAT 后映射到不同的公网端口
-        - 信令: 10.x.x.x:5060 → NAT → 1.2.3.4:3189（服务器知道）
-        - RTP:  10.x.x.x:53186 → NAT → 1.2.3.4:XXXXX（服务器不知道！）
-        - SDP 中写的是私网端口 53186，但 NAT 后变成了随机端口 XXXXX
-        
-        解决方案（业界标准：Opto-RTP / Latching）：
-        - A-leg 端口收到主叫首包 → 首包源地址就是主叫的真实 NAT 后地址
-        - 把这个地址通知给 B-leg 转发器（peer_forwarder），作为"发回给主叫"的目标
-        - 同理 B-leg 端口收到被叫首包 → 通知 A-leg 转发器
-        
-        注意：不是更新自己的目标，而是更新对端转发器的目标（跨转发器学习）
-        """
-        import sys
-        initial_target = self.actual_target_addr
-        print(f"[RTP] 转发器启动: 端口 {self.local_port}, 初始目标 {initial_target}, "
-              f"对称RTP={self.symmetric_rtp}, peer={self.peer_forwarder.local_port if self.peer_forwarder else 'None'}",
+        print(f"[RTP-SINGLE] {self.call_name} 单端口转发器启动: 端口{self.local_port}",
               file=sys.stderr, flush=True)
-
+        print(f"  主叫初始目标: {self.caller_target} (期望IP: {self.caller_expected_ip})",
+              file=sys.stderr, flush=True)
+        print(f"  被叫初始目标: {self.callee_target} (期望IP: {self.callee_expected_ip})",
+              file=sys.stderr, flush=True)
+        
         while self.running and self.sock:
             try:
                 data, addr = self.sock.recvfrom(2048)
-                
-                # 检查是否是RTP/SRTP包（至少12字节头）
                 if len(data) < 12:
                     continue
                 
-                self.packets_received += 1
-                self.bytes_received += len(data)
+                self.total_bytes += len(data)
+                source = self._classify_source(addr)
                 
-                # 记录源地址（去重保存最近5个）
-                if addr not in self._src_addr_history:
-                    self._src_addr_history.append(addr)
-                    if len(self._src_addr_history) > 5:
-                        self._src_addr_history.pop(0)
-                    print(f"[RTP-SRC] 端口 {self.local_port}: 新源地址 {addr} (当前目标: {self.actual_target_addr})",
-                          file=sys.stderr, flush=True)
-                
-                # 跨转发器对称RTP学习（Latching）
-                # 本端口收到对端的首包 → 通知对端转发器（peer_forwarder）更新目标地址
-                # 例如：A-leg端口(20000)收到主叫RTP → 通知B-leg转发器：发往主叫应该用这个源地址
-                if self.symmetric_rtp and not self._addr_learned:
-                    self._addr_learned = True
-                    if self.peer_forwarder:
-                        old_peer_target = self.peer_forwarder.actual_target_addr
-                        self.peer_forwarder.actual_target_addr = addr
-                        print(f"[RTP-LATCH] 端口 {self.local_port}: 对称RTP学习成功（Latching）",
+                if source == "callee":
+                    if not self.callee_latched:
+                        self.callee_actual_addr = addr
+                        self.callee_latched = True
+                        print(f"[RTP-LATCH] {self.call_name}(:{self.local_port}): "
+                              f"✓ 被叫LATCH: {addr}",
                               file=sys.stderr, flush=True)
-                        print(f"  收到首包来自: {addr} (NAT后的真实地址)",
-                              file=sys.stderr, flush=True)
-                        print(f"  更新对端转发器(端口{self.peer_forwarder.local_port})目标: {old_peer_target} → {addr}",
-                              file=sys.stderr, flush=True)
+                    target = self.caller_actual_addr or self.caller_target
+                    if target:
+                        try:
+                            self.sock.sendto(data, target)
+                            self.callee_to_caller_packets += 1
+                            # 每100包记录一次转发详情（调试用）
+                            if self.callee_to_caller_packets % 100 == 0:
+                                print(f"[RTP-FWD] {self.call_name}: 被叫→主叫 #{self.callee_to_caller_packets} "
+                                      f"目标={target} (LATCH={'✓' if self.caller_latched else '✗'})",
+                                      file=sys.stderr, flush=True)
+                            
+                            # 如果主叫未LATCH，每次转发被叫包时也发送一个打洞包（更激进）
+                            if not self.caller_latched and self.callee_to_caller_packets % 50 == 0:
+                                try:
+                                    self.sock.sendto(self.SILENCE_RTP, self.caller_target)
+                                    if self.callee_to_caller_packets % 100 == 0:
+                                        print(f"[RTP-PUNCH-AGGR] {self.call_name}: 转发时打洞 →主叫{self.caller_target}",
+                                              file=sys.stderr, flush=True)
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            print(f"[RTP-ERROR] {self.call_name}: →主叫{target}: {e}",
+                                  file=sys.stderr, flush=True)
                     else:
-                        print(f"[RTP-LATCH] 端口 {self.local_port}: 收到首包来自 {addr}，但无对端转发器",
+                        print(f"[RTP-ERROR] {self.call_name}: 被叫包无目标地址！主叫LATCH={self.caller_latched}",
                               file=sys.stderr, flush=True)
                 
-                # 转发到目标地址
-                self._send_packet(data, addr)
+                elif source == "caller":
+                    if not self.caller_latched:
+                        self.caller_actual_addr = addr
+                        self.caller_latched = True
+                        print(f"[RTP-LATCH] {self.call_name}(:{self.local_port}): "
+                              f"✓ 主叫LATCH: {addr}",
+                              file=sys.stderr, flush=True)
+                        # 主叫LATCH成功后，立即更新被叫的转发目标
+                        if self.callee_latched:
+                            print(f"[RTP-UPDATE] {self.call_name}: 主叫LATCH成功，被叫转发目标已更新为 {addr}",
+                                  file=sys.stderr, flush=True)
+                    target = self.callee_actual_addr or self.callee_target
+                    if target:
+                        try:
+                            self.sock.sendto(data, target)
+                            self.caller_to_callee_packets += 1
+                        except Exception as e:
+                            print(f"[RTP-ERROR] {self.call_name}: →被叫{target}: {e}",
+                                  file=sys.stderr, flush=True)
                 
-                # 定期输出统计
+                else:
+                    self.unknown_packets += 1
+                    # 未知包：尝试根据IP匹配（放宽策略）
+                    src_ip = addr[0]
+                    if self.caller_expected_ip and src_ip == self.caller_expected_ip:
+                        # 可能是主叫（即使IP匹配但之前没LATCH）
+                        if not self.caller_latched:
+                            self.caller_actual_addr = addr
+                            self.caller_latched = True
+                            print(f"[RTP-LATCH-AUTO] {self.call_name}(:{self.local_port}): "
+                                  f"✓ 主叫自动LATCH（IP匹配）: {addr}",
+                                  file=sys.stderr, flush=True)
+                            target = self.callee_actual_addr or self.callee_target
+                            if target:
+                                try:
+                                    self.sock.sendto(data, target)
+                                    self.caller_to_callee_packets += 1
+                                except Exception as e:
+                                    print(f"[RTP-ERROR] {self.call_name}: →被叫{target}: {e}",
+                                          file=sys.stderr, flush=True)
+                    elif self.unknown_packets <= 5:
+                        print(f"[RTP-UNKNOWN] {self.call_name}(:{self.local_port}): "
+                              f"未知源 {addr}, 已知: 主叫={self.caller_actual_addr}(期望IP:{self.caller_expected_ip}) "
+                              f"被叫={self.callee_actual_addr}(期望IP:{self.callee_expected_ip})",
+                              file=sys.stderr, flush=True)
+                
                 self._log_stats()
+                
+                # 如果主叫未LATCH，持续发送打洞包（每2秒一次，最多30次）
+                if not self.caller_latched and self.caller_target:
+                    now = time.time()
+                    if now - self._last_punch_time >= 2.0 and self._punch_count < 30:
+                        self._last_punch_time = now
+                        self._punch_count += 1
+                        try:
+                            self.sock.sendto(self.SILENCE_RTP, self.caller_target)
+                            if self._punch_count % 5 == 0:
+                                print(f"[RTP-PUNCH-CONT] {self.call_name}: 持续打洞 #{self._punch_count} →主叫{self.caller_target}",
+                                      file=sys.stderr, flush=True)
+                        except Exception:
+                            pass
                 
             except socket.timeout:
                 self._log_stats()
+                
+                # timeout时也检查是否需要打洞
+                if not self.caller_latched and self.caller_target:
+                    now = time.time()
+                    if now - self._last_punch_time >= 2.0 and self._punch_count < 30:
+                        self._last_punch_time = now
+                        self._punch_count += 1
+                        try:
+                            self.sock.sendto(self.SILENCE_RTP, self.caller_target)
+                            if self._punch_count % 5 == 0:
+                                print(f"[RTP-PUNCH-CONT] {self.call_name}: 持续打洞 #{self._punch_count} →主叫{self.caller_target}",
+                                      file=sys.stderr, flush=True)
+                        except Exception:
+                            pass
+                
                 continue
             except Exception as e:
                 if self.running:
-                    print(f"[RTP-ERROR] 端口 {self.local_port}: 转发错误: {e}",
+                    print(f"[RTP-ERROR] {self.call_name}(:{self.local_port}): {e}",
                           file=sys.stderr, flush=True)
 
 
@@ -622,7 +818,9 @@ class MediaRelay:
         return new_sdp, session
     
     def process_invite_to_callee(self, call_id: str, sdp_body: str,
-                                  caller_addr: Tuple[str, int]) -> Tuple[str, Optional[MediaSession]]:
+                                  caller_addr: Tuple[str, int],
+                                  caller_number: Optional[str] = None,
+                                  callee_number: Optional[str] = None) -> Tuple[str, Optional[MediaSession]]:
         """
         处理转发给被叫的INVITE SDP
         修改SDP指向服务器的B-leg端口，让被叫发送RTP到B-leg端口
@@ -632,6 +830,8 @@ class MediaRelay:
             call_id: 呼叫ID
             sdp_body: 原始SDP
             caller_addr: 主叫信令地址（NAT后的真实地址）
+            caller_number: 主叫号码 (A-leg)
+            callee_number: 被叫号码 (B-leg)
             
         Returns:
             (修改后的SDP, MediaSession对象)
@@ -643,6 +843,12 @@ class MediaRelay:
             if not session:
                 return sdp_body, None
         
+        # 保存主被叫号码
+        if caller_number:
+            session.caller_number = caller_number
+        if callee_number:
+            session.callee_number = callee_number
+        
         # 保存A-leg信令地址（优先使用，NAT后的真实地址）
         # 使用信令来源端口+1作为RTP端口估计（标准RTP端口是SDP端口+0）
         session.a_leg_signaling_addr = caller_addr
@@ -651,18 +857,49 @@ class MediaRelay:
         # 提取A-leg原始媒体信息（SDP中声明的地址）
         media_info = self.sdp_processor.extract_media_info(sdp_body)
         if media_info:
-            session.a_leg_remote_addr = (media_info['connection_ip'], media_info['audio_port'])
+            # 保存音频信息
+            audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
+            session.a_leg_remote_addr = (audio_ip, media_info['audio_port'])
             session.a_leg_sdp = sdp_body
-            print(f"[MediaRelay] A-leg媒体信息: {session.a_leg_remote_addr}")
+            print(f"[MediaRelay] A-leg音频信息: {session.a_leg_remote_addr}")
+            
+            # 检测并处理视频流
+            if media_info.get('video_port'):
+                # 动态分配视频端口（如果还没有分配）
+                if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
+                    a_video_ports = self.port_manager.allocate_port_pair(call_id)
+                    b_video_ports = self.port_manager.allocate_port_pair(call_id)
+                    
+                    if a_video_ports and b_video_ports:
+                        session.a_leg_video_rtp_port = a_video_ports[0]
+                        session.a_leg_video_rtcp_port = a_video_ports[1]
+                        session.b_leg_video_rtp_port = b_video_ports[0]
+                        session.b_leg_video_rtcp_port = b_video_ports[1]
+                        
+                        print(f"[MediaRelay] 检测到视频流，分配视频端口:")
+                        print(f"  A-leg视频: RTP={a_video_ports[0]}, RTCP={a_video_ports[1]}")
+                        print(f"  B-leg视频: RTP={b_video_ports[0]}, RTCP={b_video_ports[1]}")
+                    else:
+                        print(f"[MediaRelay-WARNING] 视频端口分配失败，将只处理音频: {call_id}")
+                
+                # 保存视频信息
+                video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                session.a_leg_video_remote_addr = (video_ip, media_info['video_port'])
+                print(f"[MediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}")
         
         # 修改SDP（指向B-leg端口，给被叫用的）
         new_sdp = self.sdp_processor.modify_sdp(
             sdp_body,
             self.server_ip,
-            session.b_leg_rtp_port
+            session.b_leg_rtp_port,
+            new_video_port=session.b_leg_video_rtp_port  # 传递视频端口（如果有）
         )
         
-        print(f"[MediaRelay] INVITE转发给被叫，SDP修改为B-leg端口: {session.b_leg_rtp_port}")
+        print(f"[MediaRelay] INVITE转发给被叫，SDP修改为B-leg端口: 音频={session.b_leg_rtp_port}", end='')
+        if session.b_leg_video_rtp_port:
+            print(f", 视频={session.b_leg_video_rtp_port}")
+        else:
+            print()
         return new_sdp, session
     
     def process_answer_sdp(self, call_id: str, sdp_body: str,
@@ -692,24 +929,40 @@ class MediaRelay:
         # 提取被叫媒体信息（SDP中声明的地址）
         media_info = self.sdp_processor.extract_media_info(sdp_body)
         if media_info:
-            session.b_leg_remote_addr = (media_info['connection_ip'], media_info['audio_port'])
+            # 保存音频信息
+            audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
+            session.b_leg_remote_addr = (audio_ip, media_info['audio_port'])
             session.b_leg_sdp = sdp_body
+            print(f"[MediaRelay] B-leg音频信息: {session.b_leg_remote_addr}")
+            
+            # 检测并处理视频流
+            if media_info.get('video_port'):
+                video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                session.b_leg_video_remote_addr = (video_ip, media_info['video_port'])
+                print(f"[MediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}")
         
-        # 修改SDP（指向A-leg端口，给主叫用的）
+        # 修改SDP（使用B-leg端口——与INVITE SDP相同端口）
+        # 关键改进：主叫和被叫共享同一个RTP端口，避免A-leg端口被防火墙阻断
         new_sdp = self.sdp_processor.modify_sdp(
             sdp_body,
             self.server_ip,
-            session.a_leg_rtp_port
+            session.b_leg_rtp_port,
+            new_video_port=session.b_leg_video_rtp_port  # 传递视频端口（如果有）
         )
         
-        print(f"[MediaRelay] 200OK发给主叫，SDP修改为A-leg端口: {session.a_leg_rtp_port}")
+        print(f"[MediaRelay] 200OK发给主叫，SDP修改为共享端口: 音频={session.b_leg_rtp_port}", end='')
+        if session.b_leg_video_rtp_port:
+            print(f", 视频={session.b_leg_video_rtp_port}")
+        else:
+            print()
         return new_sdp, True
     
     def start_media_forwarding(self, call_id: str):
         """
-        启动媒体转发
-        在收到200 OK后调用（支持re-INVITE时更新目标地址）
-        正常转发模式：主叫的媒体转发给被叫，被叫的媒体转发给主叫
+        启动媒体转发（单端口模式）
+        
+        核心改进：主叫和被叫共用一个 RTP 端口（B-leg 端口），根据源地址区分方向。
+        解决了原双端口模式中 A-leg 端口可能被防火墙/安全组阻断的问题。
         """
         session = self._sessions.get(call_id)
         if not session:
@@ -722,113 +975,120 @@ class MediaRelay:
             print(f"  B-leg地址: {session.b_leg_remote_addr}", flush=True)
             return False
         
-        # 获取 RTP 目标地址：必须用 SDP 的 RTP 端口（信令 IP + SDP 端口），否则主被叫听不到
-        a_leg_target = session.get_a_leg_rtp_target_addr()  # 发往主叫的地址（用于B-leg转发器）
-        b_leg_target = session.get_b_leg_rtp_target_addr()  # 发往被叫的地址（用于A-leg转发器）
+        a_leg_target = session.get_a_leg_rtp_target_addr()
+        b_leg_target = session.get_b_leg_rtp_target_addr()
         
         if not a_leg_target or not b_leg_target:
             print(f"[MediaRelay] 无法启动转发，目标地址不完整: {call_id}", flush=True)
-            print(f"  A-leg目标: {a_leg_target}", flush=True)
-            print(f"  B-leg目标: {b_leg_target}", flush=True)
             return False
         
-        # 验证目标地址正确性（防止环回）
         if a_leg_target == b_leg_target:
-            print(f"[MediaRelay-ERROR] 目标地址相同，会导致环回！", flush=True)
-            print(f"  A-leg目标: {a_leg_target}", flush=True)
-            print(f"  B-leg目标: {b_leg_target}", flush=True)
+            print(f"[MediaRelay-ERROR] 目标地址相同，会导致环回！"
+                  f" A={a_leg_target} B={b_leg_target}", flush=True)
             return False
         
-        # 如果转发已启动，更新目标地址（re-INVITE场景）
+        # re-INVITE 场景：更新已有转发器的目标
         if session.started_at:
-            print(f"[MediaRelay] 转发已启动，更新目标地址: {call_id}")
-            print(f"  A-leg信令地址: {session.a_leg_signaling_addr}")
-            print(f"  A-legSDP地址: {session.a_leg_remote_addr}")
-            print(f"  B-leg信令地址: {session.b_leg_signaling_addr}")
-            print(f"  B-legSDP地址: {session.b_leg_remote_addr}")
-            print(f"  使用A-leg目标: {a_leg_target}")
-            print(f"  使用B-leg目标: {b_leg_target}")
-            
-            # 更新已有转发器的目标地址（正常转发模式）
-            forwarder_a_to_b = self._forwarders.get((call_id, 'a', 'rtp'))
-            forwarder_b_to_a = self._forwarders.get((call_id, 'b', 'rtp'))
-            forwarder_a_rtcp = self._forwarders.get((call_id, 'a', 'rtcp'))
-            forwarder_b_rtcp = self._forwarders.get((call_id, 'b', 'rtcp'))
-            
-            if forwarder_a_to_b:
-                forwarder_a_to_b.update_target(b_leg_target)  # 转发给B-leg
-                forwarder_a_to_b.reset_symmetric_learning()  # 重新学习真实地址
-            if forwarder_b_to_a:
-                forwarder_b_to_a.update_target(a_leg_target)  # 转发给A-leg
-                forwarder_b_to_a.reset_symmetric_learning()  # 重新学习真实地址
-            if forwarder_a_rtcp:
-                forwarder_a_rtcp.update_target((b_leg_target[0], b_leg_target[1] + 1))  # 转发给B-leg
-            if forwarder_b_rtcp:
-                forwarder_b_rtcp.update_target((a_leg_target[0], a_leg_target[1] + 1))  # 转发给A-leg
-            
+            print(f"[MediaRelay] re-INVITE 更新目标: {call_id}")
+            fwd = self._forwarders.get((call_id, 'single', 'rtp'))
+            if fwd:
+                fwd.update_targets(a_leg_target, b_leg_target)
+            fwd_rtcp = self._forwarders.get((call_id, 'single', 'rtcp'))
+            if fwd_rtcp:
+                fwd_rtcp.update_targets(
+                    (a_leg_target[0], a_leg_target[1] + 1),
+                    (b_leg_target[0], b_leg_target[1] + 1))
             return True
         
         import sys
-        print(f"[MediaRelay] 启动媒体转发: {call_id}", file=sys.stderr, flush=True)
-        print(f"  主叫(A): 信令={session.a_leg_signaling_addr}, SDP={session.a_leg_remote_addr}, 初始目标={a_leg_target}", file=sys.stderr, flush=True)
-        print(f"  被叫(B): 信令={session.b_leg_signaling_addr}, SDP={session.b_leg_remote_addr}, 初始目标={b_leg_target}", file=sys.stderr, flush=True)
-        print(f"  转发: A端口({session.a_leg_rtp_port})→被叫{b_leg_target}, B端口({session.b_leg_rtp_port})→主叫{a_leg_target}", file=sys.stderr, flush=True)
-        print(f"  对称RTP学习(Latching): 已启用，收到首包后自动学习NAT后真实地址", file=sys.stderr, flush=True)
+        caller = session.caller_number or "A"
+        callee = session.callee_number or "B"
         
-        # 创建4个转发器（正常转发模式）：
-        # A-leg RTP -> B-leg RTP (主叫媒体转发给被叫)
-        # B-leg RTP -> A-leg RTP (被叫媒体转发给主叫)
-        # A-leg RTCP -> B-leg RTCP
-        # B-leg RTCP -> A-leg RTCP
+        a_expected_ip = session.a_leg_signaling_addr[0] if session.a_leg_signaling_addr else (
+            session.a_leg_remote_addr[0] if session.a_leg_remote_addr else None)
+        b_expected_ip = session.b_leg_signaling_addr[0] if session.b_leg_signaling_addr else (
+            session.b_leg_remote_addr[0] if session.b_leg_remote_addr else None)
         
-        # A-leg RTP 接收器 (端口: session.a_leg_rtp_port)
-        # 收到后转发到 B-leg 的实际地址（主叫媒体转发给被叫）
-        forwarder_a_to_b = RTPForwarder(
-            local_port=session.a_leg_rtp_port,
-            target_addr=b_leg_target,
-            symmetric_rtp=True
-        )
-        forwarder_a_to_b.start()
+        print(f"[MediaRelay] 启动单端口媒体转发: {call_id}", file=sys.stderr, flush=True)
+        print(f"  主叫({caller}): 信令={session.a_leg_signaling_addr}, "
+              f"SDP={session.a_leg_remote_addr}, 目标={a_leg_target}",
+              file=sys.stderr, flush=True)
+        print(f"  被叫({callee}): 信令={session.b_leg_signaling_addr}, "
+              f"SDP={session.b_leg_remote_addr}, 目标={b_leg_target}",
+              file=sys.stderr, flush=True)
+        print(f"  共享RTP端口: {session.b_leg_rtp_port} "
+              f"(主叫和被叫都发到此端口)", file=sys.stderr, flush=True)
         
-        # B-leg RTP 接收器 (端口: session.b_leg_rtp_port)
-        # 收到后转发到 A-leg 的实际地址（被叫媒体转发给主叫）
-        forwarder_b_to_a = RTPForwarder(
+        forwarder = SinglePortMediaForwarder(
             local_port=session.b_leg_rtp_port,
-            target_addr=a_leg_target,
-            symmetric_rtp=True
+            caller_target=a_leg_target,
+            callee_target=b_leg_target,
+            caller_expected_ip=a_expected_ip,
+            callee_expected_ip=b_expected_ip,
+            call_name=f"{caller}↔{callee}"
         )
-        forwarder_b_to_a.start()
+        forwarder.start()
         
-        # RTCP转发器（正常转发模式）
-        forwarder_a_rtcp = RTPForwarder(
-            local_port=session.a_leg_rtcp_port,
-            target_addr=(b_leg_target[0], b_leg_target[1] + 1),
-            symmetric_rtp=False
-        )
-        forwarder_a_rtcp.start()
-        
-        forwarder_b_rtcp = RTPForwarder(
+        forwarder_rtcp = SinglePortMediaForwarder(
             local_port=session.b_leg_rtcp_port,
-            target_addr=(a_leg_target[0], a_leg_target[1] + 1),
-            symmetric_rtp=False
+            caller_target=(a_leg_target[0], a_leg_target[1] + 1),
+            callee_target=(b_leg_target[0], b_leg_target[1] + 1),
+            caller_expected_ip=a_expected_ip,
+            callee_expected_ip=b_expected_ip,
+            call_name=f"{caller}↔{callee}-RTCP"
         )
-        forwarder_b_rtcp.start()
+        forwarder_rtcp.start()
         
-        # 设置跨转发器对称RTP学习（peer关联）
-        # A-leg端口收到主叫首包 → 更新B-leg转发器的目标（发回给主叫的地址）
-        # B-leg端口收到被叫首包 → 更新A-leg转发器的目标（发回给被叫的地址）
-        forwarder_a_to_b.peer_forwarder = forwarder_b_to_a  # A收到主叫包→更新B的目标为主叫真实地址
-        forwarder_b_to_a.peer_forwarder = forwarder_a_to_b  # B收到被叫包→更新A的目标为被叫真实地址
+        print(f"[MediaRelay] 发送NAT打洞包（音频）: {call_id}", file=sys.stderr, flush=True)
+        forwarder.send_nat_punch(count=20, interval=0.01)  # 增加打洞包数量
         
-        # 保存转发器
-        self._forwarders[(call_id, 'a', 'rtp')] = forwarder_a_to_b
-        self._forwarders[(call_id, 'b', 'rtp')] = forwarder_b_to_a
-        self._forwarders[(call_id, 'a', 'rtcp')] = forwarder_a_rtcp
-        self._forwarders[(call_id, 'b', 'rtcp')] = forwarder_b_rtcp
+        self._forwarders[(call_id, 'single', 'rtp')] = forwarder
+        self._forwarders[(call_id, 'single', 'rtcp')] = forwarder_rtcp
+        
+        # 如果有视频流，启动视频转发器
+        if (session.b_leg_video_rtp_port and 
+            session.a_leg_video_remote_addr and 
+            session.b_leg_video_remote_addr):
+            
+            a_leg_video_target = session.get_a_leg_video_rtp_target_addr()
+            b_leg_video_target = session.get_b_leg_video_rtp_target_addr()
+            
+            if a_leg_video_target and b_leg_video_target:
+                print(f"[MediaRelay] 启动视频转发: {call_id}", file=sys.stderr, flush=True)
+                print(f"  主叫({caller})视频: {a_leg_video_target}", file=sys.stderr, flush=True)
+                print(f"  被叫({callee})视频: {b_leg_video_target}", file=sys.stderr, flush=True)
+                print(f"  共享视频RTP端口: {session.b_leg_video_rtp_port}", file=sys.stderr, flush=True)
+                
+                forwarder_video = SinglePortMediaForwarder(
+                    local_port=session.b_leg_video_rtp_port,
+                    caller_target=a_leg_video_target,
+                    callee_target=b_leg_video_target,
+                    caller_expected_ip=a_expected_ip,
+                    callee_expected_ip=b_expected_ip,
+                    call_name=f"{caller}↔{callee}-VIDEO"
+                )
+                forwarder_video.start()
+                
+                forwarder_video_rtcp = SinglePortMediaForwarder(
+                    local_port=session.b_leg_video_rtcp_port,
+                    caller_target=(a_leg_video_target[0], a_leg_video_target[1] + 1),
+                    callee_target=(b_leg_video_target[0], b_leg_video_target[1] + 1),
+                    caller_expected_ip=a_expected_ip,
+                    callee_expected_ip=b_expected_ip,
+                    call_name=f"{caller}↔{callee}-VIDEO-RTCP"
+                )
+                forwarder_video_rtcp.start()
+                
+                print(f"[MediaRelay] 发送NAT打洞包（视频）: {call_id}", file=sys.stderr, flush=True)
+                forwarder_video.send_nat_punch(count=20, interval=0.01)
+                
+                self._forwarders[(call_id, 'single', 'video-rtp')] = forwarder_video
+                self._forwarders[(call_id, 'single', 'video-rtcp')] = forwarder_video_rtcp
+                
+                print(f"[MediaRelay] 视频转发已启动: {call_id}", file=sys.stderr, flush=True)
         
         session.started_at = time.time()
-        import sys
-        print(f"[MediaRelay] 媒体转发已启动: {call_id}", file=sys.stderr, flush=True)
+        print(f"[MediaRelay] 媒体转发已启动（音频+视频）: {call_id}", file=sys.stderr, flush=True)
         print(f"[MediaRelay] 媒体转发已启动: {call_id}", flush=True)
         
         return True
@@ -841,8 +1101,10 @@ class MediaRelay:
         
         print(f"[MediaRelay] 停止媒体转发: {call_id}")
         
-        # 停止所有转发器
-        for key in [(call_id, 'a', 'rtp'), (call_id, 'b', 'rtp'),
+        # 停止音频和视频转发器
+        for key in [(call_id, 'single', 'rtp'), (call_id, 'single', 'rtcp'),
+                    (call_id, 'single', 'video-rtp'), (call_id, 'single', 'video-rtcp'),
+                    (call_id, 'a', 'rtp'), (call_id, 'b', 'rtp'),
                     (call_id, 'a', 'rtcp'), (call_id, 'b', 'rtcp')]:
             forwarder = self._forwarders.pop(key, None)
             if forwarder:
@@ -861,19 +1123,32 @@ class MediaRelay:
         # 停止转发
         self.stop_media_forwarding(call_id)
         
-        # 释放端口
+        # 释放音频端口
         self.port_manager.release_port_pair(session.a_leg_rtp_port, session.a_leg_rtcp_port)
         self.port_manager.release_port_pair(session.b_leg_rtp_port, session.b_leg_rtcp_port)
         
+        # 释放视频端口（如果有）
+        if session.a_leg_video_rtp_port and session.a_leg_video_rtcp_port:
+            self.port_manager.release_port_pair(session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port)
+        if session.b_leg_video_rtp_port and session.b_leg_video_rtcp_port:
+            self.port_manager.release_port_pair(session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port)
+        
         # 清理映射
         with self._lock:
-            for port in [session.a_leg_rtp_port, session.a_leg_rtcp_port,
-                        session.b_leg_rtp_port, session.b_leg_rtcp_port]:
+            ports_to_clean = [session.a_leg_rtp_port, session.a_leg_rtcp_port,
+                            session.b_leg_rtp_port, session.b_leg_rtcp_port]
+            # 添加视频端口（如果有）
+            if session.a_leg_video_rtp_port:
+                ports_to_clean.extend([session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port])
+            if session.b_leg_video_rtp_port:
+                ports_to_clean.extend([session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port])
+            
+            for port in ports_to_clean:
                 self._port_session_map.pop(port, None)
             
             self._sessions.pop(call_id, None)
         
-        print(f"[MediaRelay] 会话已清理: {call_id}")
+        print(f"[MediaRelay] 会话已清理（包含视频端口）: {call_id}")
     
     def get_session_stats(self, call_id: str) -> Optional[Dict]:
         """获取会话统计信息"""
@@ -881,15 +1156,15 @@ class MediaRelay:
         if not session:
             return None
         
-        forwarder_a = self._forwarders.get((call_id, 'a', 'rtp'))
-        forwarder_b = self._forwarders.get((call_id, 'b', 'rtp'))
+        fwd = self._forwarders.get((call_id, 'single', 'rtp'))
         
         return {
             'call_id': call_id,
-            'a_leg_port': session.a_leg_rtp_port,
-            'b_leg_port': session.b_leg_rtp_port,
-            'a_to_b_packets': forwarder_a.packets_sent if forwarder_a else 0,
-            'b_to_a_packets': forwarder_b.packets_sent if forwarder_b else 0,
+            'shared_port': session.b_leg_rtp_port,
+            'a_to_b_packets': fwd.caller_to_callee_packets if fwd else 0,
+            'b_to_a_packets': fwd.callee_to_caller_packets if fwd else 0,
+            'caller_latched': fwd.caller_latched if fwd else False,
+            'callee_latched': fwd.callee_latched if fwd else False,
             'duration': time.time() - session.started_at if session.started_at else 0
         }
     
@@ -919,95 +1194,24 @@ class MediaRelay:
             print(f"[MediaRelay-DIAG] 会话不存在: {call_id}")
             return
         
+        caller = session.caller_number or "A-leg"
+        callee = session.callee_number or "B-leg"
+        
         print(f"\n========== 媒体诊断: {call_id} ==========")
-        print(f"[服务器配置]")
-        print(f"  服务器IP: {self.server_ip}")
+        print(f"  模式: 单端口 (共享端口 {session.b_leg_rtp_port})")
+        print(f"  主叫({caller}): 信令={session.a_leg_signaling_addr}, SDP={session.a_leg_remote_addr}")
+        print(f"  被叫({callee}): 信令={session.b_leg_signaling_addr}, SDP={session.b_leg_remote_addr}")
+        print(f"  {caller}和{callee}都应发送到: {self.server_ip}:{session.b_leg_rtp_port}")
         
-        print(f"\n[地址信息]")
-        print(f"  A-leg(1001):")
-        print(f"    信令地址: {session.a_leg_signaling_addr} (NAT后真实地址，优先使用)")
-        print(f"    SDP声明:  {session.a_leg_remote_addr} (可能为私网)")
-        print(f"  B-leg(1003):")
-        print(f"    信令地址: {session.b_leg_signaling_addr} (NAT后真实地址，优先使用)")
-        print(f"    SDP声明:  {session.b_leg_remote_addr} (可能为私网)")
-        
-        print(f"\n[服务器监听端口]")
-        print(f"  A-leg RTP端口 {session.a_leg_rtp_port}: {'✓ 监听中' if self._check_port_listening(session.a_leg_rtp_port) else '❌ 未监听'}")
-        print(f"  B-leg RTP端口 {session.b_leg_rtp_port}: {'✓ 监听中' if self._check_port_listening(session.b_leg_rtp_port) else '❌ 未监听'}")
-        
-        print(f"\n[转发器状态]")
-        print(f"  会话启动时间: {session.started_at}")
-        print(f"  使用目标地址: A-leg={session.get_a_leg_target_addr()}, B-leg={session.get_b_leg_target_addr()}")
-        
-        # A-leg RTP转发器统计（接收主叫RTP，转发给被叫）
-        fa = self._forwarders.get((call_id, 'a', 'rtp'))
-        if fa:
-            expected_target = session.get_b_leg_rtp_target_addr()  # 应该转发给被叫
-            print(f"\n  [A-leg转发器] 端口 {fa.local_port} (接收主叫RTP -> 转发给被叫)")
-            print(f"    运行状态: {'运行中' if fa.running else '已停止'}")
-            print(f"    配置目标: {fa.actual_target_addr}")
-            print(f"    期望目标: {expected_target} (被叫地址)")
-            if fa.actual_target_addr != expected_target:
-                print(f"    ⚠️ 警告: 配置目标与期望目标不一致！可能导致转发错误")
-            print(f"    收包: {fa.packets_received}, 发包: {fa.packets_sent}")
-            print(f"    源地址历史: {fa._src_addr_history}")
-            if fa.packets_received == 0:
-                print(f"    ❌ 问题: A-leg转发器没有收到任何RTP包！")
-                print(f"    说明: 主叫没有发送RTP到服务器A-leg端口 {fa.local_port}")
-                print(f"    主叫应该发送到: {self.server_ip}:{fa.local_port}")
-                print(f"    检查: 主叫是否按照200 OK中的SDP发送RTP？")
+        fwd = self._forwarders.get((call_id, 'single', 'rtp'))
+        if fwd:
+            elapsed = time.time() - session.started_at if session.started_at else 0
+            print(f"  运行: {'是' if fwd.running else '否'}, 已启动 {elapsed:.1f}s")
+            print(f"  主叫LATCH: {'✓ ' + str(fwd.caller_actual_addr) if fwd.caller_latched else '✗'}")
+            print(f"  被叫LATCH: {'✓ ' + str(fwd.callee_actual_addr) if fwd.callee_latched else '✗'}")
+            print(f"  A→B: {fwd.caller_to_callee_packets} 包, B→A: {fwd.callee_to_caller_packets} 包")
         else:
-            print(f"\n  [A-leg转发器] 未创建")
-        
-        # B-leg RTP转发器统计（接收被叫RTP，转发给主叫）
-        fb = self._forwarders.get((call_id, 'b', 'rtp'))
-        if fb:
-            expected_target = session.get_a_leg_rtp_target_addr()  # 应该转发给主叫
-            print(f"\n  [B-leg转发器] 端口 {fb.local_port} (接收被叫RTP -> 转发给主叫)")
-            print(f"    运行状态: {'运行中' if fb.running else '已停止'}")
-            print(f"    配置目标: {fb.actual_target_addr}")
-            print(f"    期望目标: {expected_target} (主叫地址)")
-            if fb.actual_target_addr != expected_target:
-                print(f"    ⚠️ 警告: 配置目标与期望目标不一致！可能导致环回或转发错误")
-                print(f"    问题: B-leg转发器应该转发给主叫，但配置目标是 {fb.actual_target_addr}")
-                print(f"    这会导致被叫的RTP被转发回被叫自己，造成环回！")
-            print(f"    收包: {fb.packets_received}, 发包: {fb.packets_sent}")
-            print(f"    源地址历史: {fb._src_addr_history}")
-            if fb.packets_received > 0 and fb.packets_sent == 0:
-                print(f"    ❌ 问题: B-leg转发器收到包但没有发送！")
-                print(f"    检查: 目标地址 {fb.actual_target_addr} 是否正确？")
-            elif fb.packets_received == 0:
-                print(f"    ❌ 问题: B-leg转发器没有收到任何RTP包！")
-                print(f"    说明: 被叫没有发送RTP到服务器B-leg端口 {fb.local_port}")
-                print(f"    被叫应该发送到: {self.server_ip}:{fb.local_port}")
-        else:
-            print(f"\n  [B-leg转发器] 未创建")
-        
-        print(f"\n[预期媒体流]")
-        print(f"  1001应发送到: {self.server_ip}:{session.a_leg_rtp_port}")
-        print(f"  1003应发送到: {self.server_ip}:{session.b_leg_rtp_port}")
-        
-        print(f"\n[诊断结论]")
-        if fa and fb and fa.running and fb.running:
-            if fa.packets_received == 0 and fb.packets_received == 0:
-                print(f"  ❌ 双向都没有收到媒体包")
-                print(f"     → 检查1001和1003是否把RTP发到上述服务器端口")
-                print(f"     → 可能SDP中的IP/端口修改未生效")
-                print(f"     → 可能终端有NAT，没有发送到服务器")
-            elif fa.packets_received == 0:
-                print(f"  ❌ A-leg(1001→服务器)没有媒体包")
-                print(f"     → 1001没有把RTP发到 {self.server_ip}:{session.a_leg_rtp_port}")
-            elif fb.packets_received == 0:
-                print(f"  ❌ B-leg(1003→服务器)没有媒体包")
-                print(f"     → 1003没有把RTP发到 {self.server_ip}:{session.b_leg_rtp_port}")
-            else:
-                print(f"  ✓ 双向都有媒体包")
-                if fa.packets_sent == 0:
-                    print(f"  ❌ A-leg转发器没有发包到1003")
-                if fb.packets_sent == 0:
-                    print(f"  ❌ B-leg转发器没有发包到1001")
-        else:
-            print(f"  ❌ 转发器未启动或已停止")
+            print(f"  ❌ 转发器未创建")
         print(f"========================================\n")
 
 
