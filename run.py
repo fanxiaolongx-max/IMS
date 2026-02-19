@@ -554,6 +554,35 @@ def _host_port_from_via(via_val: str) -> tuple[str, int]:
     else:
         return (sent_by, 5060)
 
+def _is_loopback(ip: str) -> bool:
+    """是否为环回地址（本机）。来自本机的注册应把 Contact 写成公网地址以便显示与路由一致。"""
+    if not ip:
+        return False
+    norm = ip.strip().lower()
+    return norm in ("127.0.0.1", "::1", "localhost") or norm.startswith("::ffff:127.0.0.1")
+
+
+def _send_addr_from_binding(b: dict) -> tuple[str, int]:
+    """从绑定取实际发送地址：优先 real_addr（真实 UDP 源），否则从 Contact 解析。"""
+    if b.get("real_addr"):
+        h, p = b["real_addr"]
+        if h and p:
+            return (h, int(p)) if isinstance(p, int) else (h, int(p))
+    return _host_port_from_sip_uri(b["contact"])
+
+
+def _resolve_send_addr(host: str, port: int) -> tuple[str, int]:
+    """若某绑定的 Contact 解析为 (host,port) 且存在 real_addr，则返回 real_addr，否则返回 (host,port)。用于环回注册时仍发往 127.0.0.1。"""
+    for binds in REG_BINDINGS.values():
+        for b in binds:
+            if b.get("expires", 0) <= int(time.time()):
+                continue
+            c_h, c_p = _host_port_from_sip_uri(b["contact"])
+            if (c_h, c_p) == (host, port) and b.get("real_addr"):
+                return _send_addr_from_binding(b)
+    return (host, port)
+
+
 def _host_port_from_sip_uri(uri: str) -> tuple[str, int]:
     # 例：sip:1002@192.168.1.60:5066;transport=udp
     # 或 sip:192.168.1.60:5066
@@ -775,13 +804,14 @@ def handle_register(msg: SIPMessage, addr, transport):
 
     binds = _parse_contacts(msg)
 
-    # --- 自动修正 Contact 的 IP/端口 ---
+    # --- 自动修正 Contact 的 IP/端口：来源为环回(127.0.0.1)时用公网地址，便于注册列表与信令显示一致 ---
+    import re
+    contact_host = advertised_sip_host() if _is_loopback(addr[0]) else addr[0]
+    contact_port = addr[1]
     fixed_binds = []
     for b in binds:
         contact = b["contact"]
-        # 提取 sip:user@IP:port
-        import re
-        contact = re.sub(r"@[^;>]+", f"@{addr[0]}:{addr[1]}", contact)
+        contact = re.sub(r"@[^;>]+", f"@{contact_host}:{contact_port}", contact)
         b["contact"] = contact
         fixed_binds.append(b)
     binds = fixed_binds
@@ -790,27 +820,27 @@ def handle_register(msg: SIPMessage, addr, transport):
     now = int(time.time())
     lst = REG_BINDINGS.setdefault(aor, [])
     lst[:] = [b for b in lst if b["expires"] > now]
-    # 终端更换 IP 重新注册时：清理该 AOR 下其它地址的绑定，只保留本次注册地址，避免同一号码多 IP 并存导致误路由
+    # 终端更换 IP 重新注册时：清理该 AOR 下其它地址的绑定，只保留本次注册地址（按 real_addr 匹配）
     if binds and any(b.get("expires", 0) > 0 for b in binds):
-        lst[:] = [x for x in lst if _host_port_from_sip_uri(x["contact"]) == (addr[0], addr[1])]
+        lst[:] = [x for x in lst if x.get("real_addr") == addr]
     for b in binds:
         if b["expires"] == 0:
             lst[:] = [x for x in lst if x["contact"] != b["contact"]]
         else:
             abs_exp = now + b["expires"]
-            # 检查是否已有相同contact的绑定
+            # 检查是否已有同一来源(real_addr)的绑定，有则只更新过期时间
             for x in lst:
-                if x["contact"] == b["contact"]:
+                if x.get("real_addr") == addr:
                     x["expires"] = abs_exp
-                    # 更新真实来源地址（NAT场景下可能变化）
-                    x["real_addr"] = addr  # (ip, port)
+                    x["contact"] = b["contact"]  # 保持 Contact 与本次一致（公网/环回修正后）
+                    x["real_addr"] = addr
                     break
             else:
-                # 新绑定，保存真实来源地址
+                # 新绑定，保存真实来源地址（转发时用 real_addr 发送）
                 lst.append({
                     "contact": b["contact"],
                     "expires": abs_exp,
-                    "real_addr": addr  # 保存真实socket地址，用于rport
+                    "real_addr": addr  # 保存真实socket地址，用于实际发送
                 })
 
     resp = _make_response(msg, 200, "OK")
@@ -1316,8 +1346,9 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 now = int(time.time())
                 targets = [t for t in targets if t["expires"] > now]
                 if targets:
-                    b_uri = targets[0]["contact"]
-                    real_host, real_port = _host_port_from_sip_uri(b_uri)
+                    b = targets[0]
+                    real_host, real_port = _send_addr_from_binding(b)
+                    b_uri = b["contact"]
                     if real_host and real_port:
                         next_hop = (real_host, real_port)
                         log.info(f"[ACK-2XX-DIALOGS] 2xx ACK routing via REG_BINDINGS: Call-ID={call_id}, callee_addr={next_hop} (AOR: {to_aor})")
@@ -1406,11 +1437,12 @@ def _forward_request(msg: SIPMessage, addr, transport):
                             targets = [t for t in targets if t["expires"] > now]
                             log.info(f"[ACK-NON2XX] {len(targets)} valid (not expired) bindings")
                             if targets:
-                                b_uri = targets[0]["contact"]
+                                b = targets[0]
+                                b_uri = b["contact"]
                                 log.info(f"[ACK-NON2XX] Using contact: {b_uri}")
-                                real_host, real_port = _host_port_from_sip_uri(b_uri)
+                                host, port = _send_addr_from_binding(b)
+                                real_host, real_port = host, port
                                 if real_host and real_port:
-                                    host, port = real_host, real_port
                                     log.info(f"[ACK-NON2XX] ✓ Routing to callee from REG_BINDINGS: {host}:{port} (AOR: {to_aor})")
                                 else:
                                     log.error(f"[ACK-NON2XX] ✗ Invalid contact address for AOR {to_aor}: {b_uri}, cannot route ACK")
@@ -1474,14 +1506,14 @@ def _forward_request(msg: SIPMessage, addr, transport):
                     elif to_aor:
                         targets = REG_BINDINGS.get(to_aor, [])
                         if targets:
-                            b_uri = targets[0]["contact"]
-                            real_host, real_port = _host_port_from_sip_uri(b_uri)
+                            b = targets[0]
+                            host, port = _send_addr_from_binding(b)
+                            real_host, real_port = host, port
+                            b_uri = b["contact"]
                             if real_host and real_port:
-                                host, port = real_host, real_port
                                 log.info(f"[ACK-2XX-CHECK] ✓ Found callee address from REG_BINDINGS: {host}:{port} (AOR: {to_aor})")
                             else:
                                 log.error(f"[ACK-2XX-CHECK] ✗ Invalid contact address for AOR {to_aor}: {b_uri}")
-                                # 即使找不到有效地址，也记录 ACK（用于调试）
                                 tracker = get_tracker()
                                 if tracker:
                                     try:
@@ -1531,8 +1563,8 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 to_aor = _aor_from_to(msg.get("to")) or msg.start_line.split()[1]
                 targets = REG_BINDINGS.get(to_aor, [])
                 if targets:
-                    b_uri = targets[0]["contact"]
-                    real_host, real_port = _host_port_from_sip_uri(b_uri)
+                    b = targets[0]
+                    real_host, real_port = _send_addr_from_binding(b)
                     if real_host and real_port and (real_host != SERVER_IP or real_port != SERVER_PORT):
                         host, port = real_host, real_port
                         log.debug(f"[IN-DIALOG] Using contact address from REG_BINDINGS: {host}:{port}")
@@ -1571,10 +1603,9 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 aor = _aor_from_to(msg.get("to")) or msg.start_line.split()[1]
                 bindings = REG_BINDINGS.get(aor, [])
                 if bindings:
-                    # 取第一个绑定的 contact，解析 IP 和端口
-                    b_uri = bindings[0]["contact"]
-                    real_host, real_port = _host_port_from_sip_uri(b_uri)
-                    host, port = real_host, real_port
+                    b = bindings[0]
+                    host, port = _send_addr_from_binding(b)
+                    b_uri = b["contact"]
                     log.debug(f"[{method}] Using registered contact: {b_uri} -> {host}:{port}")
                 else:
                     # 没有找到注册绑定，回复 480 Temporarily Unavailable
@@ -1669,6 +1700,9 @@ def _forward_request(msg: SIPMessage, addr, transport):
         vias = msg.headers.get("via", [])
         routes = msg.headers.get("route", [])
         log.debug(f"[FWD-DETAIL] Method: {method} | Call-ID: {call_id} | Target: {host}:{port} | Via hops: {len(vias)} | Route: {len(routes)}")
+        
+        # 环回注册时 Contact 存公网地址，实际发送需用 real_addr（127.0.0.1）
+        host, port = _resolve_send_addr(host, port)
         
         # 打印完整的 SIP 消息内容（转发前）
         try:
