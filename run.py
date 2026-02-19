@@ -359,14 +359,46 @@ def _save_ip_blacklist():
     except Exception as e:
         log.warning(f"[SECURITY] 保存黑名单失败: {e}")
 
+
+def _reload_ip_blacklist_from_file():
+    """从文件重新加载黑名单（以文件为源，覆盖内存列表），便于 MML/手动改文件后立即生效。"""
+    blacklist_file = "config/ip_blacklist.txt"
+    if not os.path.exists(blacklist_file):
+        return
+    try:
+        new_set = set()
+        with open(blacklist_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    new_set.add(line)
+        if new_set != IP_BLACKLIST:
+            IP_BLACKLIST.clear()
+            IP_BLACKLIST.update(new_set)
+            log.info(f"[SECURITY] 黑名单已从文件重载，当前 {len(IP_BLACKLIST)} 个 IP，立即生效")
+    except Exception as e:
+        log.warning(f"[SECURITY] 重载黑名单失败: {e}")
+
+def _normalize_client_ip(ip: str) -> str:
+    """将 IPv4-mapped IPv6 转为纯 IPv4，便于与黑名单一致比对。"""
+    if not ip:
+        return ip
+    if ip.startswith("::ffff:"):
+        return ip[7:]
+    return ip
+
+
 # 检查 IP 是否应该被阻止
 def _is_ip_blocked(ip: str) -> bool:
     """检查 IP 是否被阻止"""
     if not SECURITY_CONFIG["ENABLE_IP_BLACKLIST"]:
         return False
-    
+
+    # 统一为 IPv4 形式再比对（系统可能返回 ::ffff:1.2.3.4，黑名单存 1.2.3.4）
+    ip_canonical = _normalize_client_ip(ip)
+
     # 检查黑名单
-    if ip in IP_BLACKLIST:
+    if ip_canonical in IP_BLACKLIST or ip in IP_BLACKLIST:
         return True
     
     # 检查速率限制
@@ -2128,8 +2160,20 @@ def _forward_response(resp: SIPMessage, addr, transport):
                                 if 'content-length' in resp.headers:
                                     resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
                                 log.info(f"[B2BUA] 200 OK SDP 已修改为服务器地址端口（发送前），Call-ID: {call_id}")
-                                # 如果转发器未启动或不存在，则启动/创建转发器
-                                if not already_started or not has_forwarder:
+                                # 若会话有视频但尚无视频转发器（re-INVITE 加视频），也需调用以创建视频转发器
+                                has_video_forwarder = False
+                                if session and hasattr(media_relay, '_forwarders'):
+                                    has_video_forwarder = (
+                                        (call_id, 'a', 'video-rtp') in media_relay._forwarders and
+                                        (call_id, 'b', 'video-rtp') in media_relay._forwarders
+                                    )
+                                need_start = (
+                                    not already_started or
+                                    not has_forwarder or
+                                    (session and session.b_leg_video_rtp_port and not has_video_forwarder)
+                                )
+                                # 转发器未启动、不存在、或需补建视频转发器时，启动/创建
+                                if need_start:
                                     try:
                                         from_header = resp.get("from") or ""
                                         to_header = resp.get("to") or ""
@@ -2649,8 +2693,18 @@ async def main():
     )
     log.info("[TIMERS] NAT keepalive enabled (interval: 25s)")
 
-    # 优雅停止：SIGTERM/SIGINT 时设置此事件，主循环退出后执行 finally 清理
+    # 黑名单定期从文件重载（MML 添加/删除或手动改文件后，本进程内立即/15秒内生效）
     shutdown_event = asyncio.Event()
+    blacklist_reload_task = None
+
+    async def _periodic_blacklist_reload():
+        while not shutdown_event.is_set():
+            await asyncio.sleep(15)
+            if shutdown_event.is_set():
+                break
+            _reload_ip_blacklist_from_file()
+
+    blacklist_reload_task = asyncio.create_task(_periodic_blacklist_reload())
 
     def _on_shutdown_signal():
         log.info("收到停止信号，正在优雅退出...")
@@ -2697,7 +2751,13 @@ async def main():
                 log.info("[STUN] STUN服务器已停止")
             except Exception as e:
                 log.warning(f"[STUN] 停止时异常: {e}")
-        # 3. 停止定时器
+        # 3. 停止黑名单重载任务与定时器
+        if blacklist_reload_task is not None and not blacklist_reload_task.done():
+            blacklist_reload_task.cancel()
+            try:
+                await blacklist_reload_task
+            except asyncio.CancelledError:
+                pass
         try:
             await timers.stop()
         except Exception as e:

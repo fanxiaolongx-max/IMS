@@ -2334,7 +2334,7 @@ class MMLCommandExecutor:
             
             output = [
                 "=" * 60,
-                "添加黑名单成功",
+                "添加黑名单成功，已立即生效",
                 "=" * 60,
                 f"IP 地址        : {ip}",
                 f"当前黑名单数量 : {len(IP_BLACKLIST)}",
@@ -2363,7 +2363,7 @@ class MMLCommandExecutor:
             
             output = [
                 "=" * 60,
-                "删除黑名单成功",
+                "删除黑名单成功，已立即生效",
                 "=" * 60,
                 f"IP 地址        : {ip}",
                 f"当前黑名单数量 : {len(IP_BLACKLIST)}",

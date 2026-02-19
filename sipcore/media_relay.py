@@ -414,7 +414,8 @@ class DualPortMediaForwarder:
     - A-leg 转发器：监听 A-leg 端口，接收主叫的 RTP，转发给被叫
     - B-leg 转发器：监听 B-leg 端口，接收被叫的 RTP，转发给主叫
     """
-    
+    _RECV_BUF = 4096  # 视频 RTP 可能超过 2KB
+
     SILENCE_RTP = (
         b'\x80\x00'
         b'\x00\x01'
@@ -449,6 +450,12 @@ class DualPortMediaForwarder:
             return
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            buf_size = 512 * 1024  # 512KB，减少视频突发丢包
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buf_size)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buf_size)
+        except OSError:
+            pass
         self.sock.bind(('0.0.0.0', self.local_port))
         self.sock.settimeout(1.0)
         self.running = True
@@ -506,8 +513,11 @@ class DualPortMediaForwarder:
                   file=sys.stderr, flush=True)
     
     def _log_stats(self):
+        # 降低热路径开销：仅每 100 包检查一次时间，且统计日志间隔改为 15 秒，减少打印造成的卡顿
+        if self.packets_sent > 0 and self.packets_sent % 100 != 0:
+            return
         now = time.time()
-        if now - self._last_log_time >= 5:
+        if now - self._last_log_time >= 15:
             packets_diff = self.packets_sent - self._last_packets
             if self.packets_sent > 0 or packets_diff > 0:
                 print(f"[RTP-STATS] {self.call_name}(:{self.local_port}): "
@@ -523,16 +533,16 @@ class DualPortMediaForwarder:
         print(f"  目标地址: {self.target_addr} (期望IP: {self.expected_ip})",
               file=sys.stderr, flush=True)
         
+        # 视频 RTP 可能超过 2KB，使用更大缓冲区减少分片/丢包
         while self.running and self.sock:
             try:
-                data, addr = self.sock.recvfrom(2048)
+                data, addr = self.sock.recvfrom(self._RECV_BUF)
                 if len(data) < 12:
                     continue
                 
-                self.packets_received += 1  # 记录接收到的包
+                self.packets_received += 1
                 self.total_bytes += len(data)
                 
-                # 直接转发到目标地址
                 if self.target_addr:
                     try:
                         self.sock.sendto(data, self.target_addr)
