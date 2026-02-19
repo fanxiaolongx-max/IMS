@@ -2566,6 +2566,9 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == '/api/sip-messages':
             if self._require_auth():
                 self._handle_sip_messages_api()
+        elif parsed_path.path == '/api/media-endpoints':
+            if self._require_auth():
+                self._handle_media_endpoints_api()
         else:
             self.send_error(404)
     
@@ -2731,6 +2734,102 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
             
         except Exception as e:
             self.send_error(500, str(e))
+    
+    def _handle_media_endpoints_api(self):
+        """媒体端点可视化 API：返回当前媒体转发器各会话的音视频 RTP/RTCP 端口及上下行包数、自动诊断"""
+        try:
+            # MMLHTTPHandler 通过 executor 获取 server_globals（BaseHTTPRequestHandler 无 server_globals 属性）
+            server_globals = getattr(self.executor, 'server_globals', None) or {}
+            media_relay = server_globals.get('MEDIA_RELAY')
+            if not media_relay:
+                try:
+                    from sipcore.rtpproxy_media_relay import get_media_relay
+                    media_relay = get_media_relay()
+                except ImportError:
+                    pass
+                if not media_relay:
+                    try:
+                        from sipcore.media_relay import get_media_relay
+                        media_relay = get_media_relay()
+                    except ImportError:
+                        pass
+            if not media_relay:
+                self._send_json_response({
+                    'success': True,
+                    'relay_type': 'none',
+                    'server_ip': server_globals.get('SERVER_IP', 'N/A'),
+                    'port_stats': {},
+                    'sessions': [],
+                    'diagnosis_summary': '媒体中继未启用',
+                })
+                return
+            relay_type = 'rtpproxy' if 'rtpproxy' in type(media_relay).__name__.lower() else 'custom'
+            server_ip = getattr(media_relay, 'server_ip', server_globals.get('SERVER_IP', 'N/A'))
+            if hasattr(media_relay, 'get_all_stats'):
+                all_stats = media_relay.get_all_stats()
+                port_stats = all_stats.get('port_stats', {})
+                sessions_raw = all_stats.get('sessions', {})
+            else:
+                port_stats = {}
+                sessions_raw = {}
+            sessions = []
+            for call_id, st in sessions_raw.items():
+                if not st:
+                    continue
+                # 统一格式：主被叫、音视频 RTP/RTCP、上下行包数、诊断
+                audio_a = {
+                    'rtp_port': st.get('a_leg_rtp_port'),
+                    'rtcp_port': st.get('a_leg_rtcp_port'),
+                }
+                audio_b = {
+                    'rtp_port': st.get('b_leg_rtp_port'),
+                    'rtcp_port': st.get('b_leg_rtcp_port'),
+                }
+                video_a = {
+                    'rtp_port': st.get('a_leg_video_rtp_port'),
+                    'rtcp_port': st.get('a_leg_video_rtcp_port'),
+                } if st.get('a_leg_video_rtp_port') else None
+                video_b = {
+                    'rtp_port': st.get('b_leg_video_rtp_port'),
+                    'rtcp_port': st.get('b_leg_video_rtcp_port'),
+                } if st.get('b_leg_video_rtp_port') else None
+                uplink = st.get('a_to_b_packets')  # 主叫→被叫
+                downlink = st.get('b_to_a_packets')  # 被叫→主叫
+                sessions.append({
+                    'call_id': call_id,
+                    'caller': st.get('caller', 'N/A'),
+                    'callee': st.get('callee', 'N/A'),
+                    'audio': {'a_leg': audio_a, 'b_leg': audio_b},
+                    'video': {'a_leg': video_a, 'b_leg': video_b} if (video_a or video_b) else None,
+                    'uplink_packets': uplink,
+                    'downlink_packets': downlink,
+                    'duration_sec': st.get('duration_sec') or (st.get('duration') if st.get('duration') is not None else None),
+                    'diagnosis': st.get('diagnosis', ''),
+                })
+            # 整体诊断摘要
+            active = len(sessions)
+            if active == 0:
+                diagnosis_summary = '当前无媒体会话'
+            else:
+                problems = [s['diagnosis'] for s in sessions if s.get('diagnosis') and '未' in s['diagnosis']]
+                diagnosis_summary = f'活跃会话 {active} 个；' + ('存在异常: ' + '; '.join(problems[:3]) if problems else '暂无异常')
+            self._send_json_response({
+                'success': True,
+                'relay_type': relay_type,
+                'server_ip': server_ip,
+                'port_stats': port_stats,
+                'sessions': sessions,
+                'diagnosis_summary': diagnosis_summary,
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            self._send_json_response({
+                'success': False,
+                'message': str(e),
+                'sessions': [],
+                'diagnosis_summary': '获取媒体端点失败',
+            }, 500)
     
     def _handle_sip_messages_api(self):
         """处理SIP消息跟踪API"""

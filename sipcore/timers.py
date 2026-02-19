@@ -74,7 +74,9 @@ class SIPTimers:
                    transport=None,
                    server_ip=None,
                    server_port=5060,
-                   cancel_forwarded: Dict = None):
+                   cancel_forwarded: Dict = None,
+                   ack_forwarded: Dict = None,
+                   bye_forwarded: Dict = None):
         """
         启动所有定时器
 
@@ -100,6 +102,8 @@ class SIPTimers:
             self._cleanup_dialogs(dialogs)
         ))
         self._cancel_forwarded = cancel_forwarded or {}
+        self._ack_forwarded = ack_forwarded or {}
+        self._bye_forwarded = bye_forwarded or {}
         self._tasks.append(asyncio.create_task(
             self._cleanup_invite_branches(invite_branches)
         ))
@@ -267,6 +271,25 @@ class SIPTimers:
                         cancel_fwd.pop(k, None)
                     if stale:
                         self.log.debug(f"[TIMER-CLEANUP] CANCEL_FORWARDED cleaned: {len(stale)}")
+                
+                # 同时清理 ACK_FORWARDED 缓存（超过 32 秒的条目）
+                # 根据 RFC 3261，ACK 不应该重传，32 秒后清理记录
+                ack_fwd = self._ack_forwarded
+                if ack_fwd is not None:
+                    stale_ack = [k for k, t in ack_fwd.items() if now - t > TIMER_F]
+                    for k in stale_ack:
+                        ack_fwd.pop(k, None)
+                    if stale_ack:
+                        self.log.debug(f"[TIMER-CLEANUP] ACK_FORWARDED cleaned: {len(stale_ack)}")
+                
+                # 同时清理 BYE_FORWARDED 缓存（超过 32 秒的条目）
+                bye_fwd = self._bye_forwarded
+                if bye_fwd is not None:
+                    stale_bye = [k for k, t in bye_fwd.items() if now - t > TIMER_F]
+                    for k in stale_bye:
+                        bye_fwd.pop(k, None)
+                    if stale_bye:
+                        self.log.debug(f"[TIMER-CLEANUP] BYE_FORWARDED cleaned: {len(stale_bye)}")
 
             except asyncio.CancelledError:
                 break

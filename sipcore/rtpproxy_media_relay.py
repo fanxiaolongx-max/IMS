@@ -113,11 +113,13 @@ class RTPProxyMediaRelay:
                                   caller_addr: Tuple[str, int],
                                   caller_number: Optional[str] = None,
                                   callee_number: Optional[str] = None,
-                                  from_tag: Optional[str] = None) -> Tuple[str, Optional[MediaSession]]:
+                                  from_tag: Optional[str] = None,
+                                  forward_to_callee: bool = True) -> Tuple[str, Optional[MediaSession]]:
         """
-        处理转发给被叫的INVITE SDP
+        处理转发的 INVITE/re-INVITE SDP。
         
-        修改SDP指向服务器的B-leg端口，让被叫发送RTP到B-leg端口
+        - 转发给被叫时(forward_to_callee=True)：SDP 使用 B-leg 端口。
+        - 转发给主叫时(forward_to_callee=False，re-INVITE)：SDP 使用 A-leg 端口。
         
         RTPProxy两步协议：
         1. INVITE阶段：发送offer命令（V<call_id> <from_tag>）
@@ -130,6 +132,7 @@ class RTPProxyMediaRelay:
             caller_number: 主叫号码（可选）
             callee_number: 被叫号码（可选）
             from_tag: From标签（用于RTPProxy offer命令，可选）
+            forward_to_callee: True=转发给被叫用B-leg，False=转发给主叫用A-leg（re-INVITE）
         """
         session = self._sessions.get(call_id)
         if not session:
@@ -179,46 +182,61 @@ class RTPProxyMediaRelay:
                 print(f"[RTPProxyMediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}", file=sys.stderr, flush=True)
         
         # RTPProxy两步协议：INVITE阶段发送offer命令
-        if from_tag:
-            # 检查是否已经发送过offer
-            if call_id not in self._rtpproxy_sessions:
-                print(f"[RTPProxyMediaRelay] INVITE阶段：发送RTPProxy offer命令: {call_id}, from_tag={from_tag}", file=sys.stderr, flush=True)
-                offer_port = self.rtpproxy.create_offer(call_id, from_tag)
-                if offer_port:
-                    print(f"[RTPProxyMediaRelay] RTPProxy offer成功，端口: {offer_port}", file=sys.stderr, flush=True)
-                    # 保存offer端口和from_tag
-                    self._rtpproxy_sessions[call_id] = {
-                        'offer_port': offer_port,
-                        'from_tag': from_tag
-                    }
-                else:
-                    print(f"[RTPProxyMediaRelay] RTPProxy offer失败: {call_id}", file=sys.stderr, flush=True)
-            else:
-                print(f"[RTPProxyMediaRelay] RTPProxy offer已发送: {call_id}", file=sys.stderr, flush=True)
-        else:
-            print(f"[RTPProxyMediaRelay] 警告: INVITE阶段未提供from_tag，无法发送RTPProxy offer: {call_id}", file=sys.stderr, flush=True)
+        # 如果没有from_tag，生成一个临时tag（初始INVITE的From头可能没有tag）
+        if not from_tag:
+            # 使用call_id的前16个字符作为临时tag（RTPProxy要求tag不能为空）
+            from_tag = f"tag-{call_id[:16]}" if len(call_id) > 16 else f"tag-{call_id}"
+            print(f"[RTPProxyMediaRelay] INVITE阶段未提供from_tag，生成临时tag: {from_tag}", file=sys.stderr, flush=True)
         
-        # 修改SDP指向B-leg端口
+        # 检查是否已经发送过offer
+        if call_id not in self._rtpproxy_sessions:
+            print(f"[RTPProxyMediaRelay] INVITE阶段：发送RTPProxy offer命令: {call_id}, from_tag={from_tag}", file=sys.stderr, flush=True)
+            offer_port = self.rtpproxy.create_offer(call_id, from_tag)
+            if offer_port:
+                print(f"[RTPProxyMediaRelay] RTPProxy offer成功，端口: {offer_port}", file=sys.stderr, flush=True)
+                # 保存offer端口和from_tag（使用实际tag，如果200 OK时提供了真实tag会更新）
+                self._rtpproxy_sessions[call_id] = {
+                    'offer_port': offer_port,
+                    'from_tag': from_tag
+                }
+            else:
+                print(f"[RTPProxyMediaRelay] RTPProxy offer失败: {call_id}", file=sys.stderr, flush=True)
+                print(f"[RTPProxyMediaRelay] 将在200 OK阶段重试发送offer", file=sys.stderr, flush=True)
+        else:
+            print(f"[RTPProxyMediaRelay] RTPProxy offer已发送: {call_id}", file=sys.stderr, flush=True)
+        
+        # 按转发目标选择 A-leg 或 B-leg
+        if forward_to_callee:
+            audio_port, video_port = session.b_leg_rtp_port, session.b_leg_video_rtp_port
+            audio_rtcp, video_rtcp = session.b_leg_rtcp_port, session.b_leg_video_rtcp_port
+            leg_name = "B-leg"
+        else:
+            audio_port, video_port = session.a_leg_rtp_port, session.a_leg_video_rtp_port
+            audio_rtcp, video_rtcp = session.a_leg_rtcp_port, session.a_leg_video_rtcp_port
+            leg_name = "A-leg"
         new_sdp = self.sdp_processor.modify_sdp(
             sdp_body,
             self.server_ip,
-            session.b_leg_rtp_port,
-            new_video_port=session.b_leg_video_rtp_port  # 传递视频端口（如果有）
+            audio_port,
+            new_video_port=video_port,
+            new_audio_rtcp_port=audio_rtcp,
+            new_video_rtcp_port=video_rtcp,
         )
-        
-        print(f"[RTPProxyMediaRelay] INVITE转发给被叫，SDP修改为B-leg端口: 音频={session.b_leg_rtp_port}", end='', file=sys.stderr, flush=True)
-        if session.b_leg_video_rtp_port:
-            print(f", 视频={session.b_leg_video_rtp_port}", file=sys.stderr, flush=True)
+        print(f"[RTPProxyMediaRelay] INVITE SDP 修改为{leg_name}端口: 音频 RTP/RTCP={audio_port}/{audio_rtcp}", end='', file=sys.stderr, flush=True)
+        if video_port:
+            print(f", 视频 RTP/RTCP={video_port}/{video_rtcp}", file=sys.stderr, flush=True)
         else:
             print(file=sys.stderr, flush=True)
         return new_sdp, session
     
     def process_answer_sdp(self, call_id: str, sdp_body: str,
-                          callee_addr: Tuple[str, int]) -> Tuple[str, bool]:
+                          callee_addr: Tuple[str, int],
+                          response_to_caller: bool = True) -> Tuple[str, bool]:
         """
-        处理200 OK的SDP（被叫侧）
-        
-        修改SDP指向服务器的B-leg端口（与INVITE相同）
+        处理 200 OK 的 SDP。
+        - response_to_caller=True：200 OK 发给主叫，使用 A-leg 端口。
+        - response_to_caller=False：200 OK 发给被叫（如 re-INVITE 应答），使用 B-leg 端口。
+        若 SDP 含视频而会话尚未分配视频端口，会先分配再替换。
         """
         session = self._sessions.get(call_id)
         if not session:
@@ -228,30 +246,49 @@ class RTPProxyMediaRelay:
         session.b_leg_signaling_addr = callee_addr
         print(f"[RTPProxyMediaRelay] B-leg信令地址: {callee_addr}", file=sys.stderr, flush=True)
         
-        # 提取被叫媒体信息
         media_info = self.sdp_processor.extract_media_info(sdp_body)
         if media_info:
-            # 保存音频信息
             audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
             session.b_leg_remote_addr = (audio_ip, media_info['audio_port'])
             session.b_leg_sdp = sdp_body
             print(f"[RTPProxyMediaRelay] B-leg音频信息: {session.b_leg_remote_addr}", file=sys.stderr, flush=True)
             
-            # 检测并处理视频流
             if media_info.get('video_port'):
                 video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
                 session.b_leg_video_remote_addr = (video_ip, media_info['video_port'])
                 print(f"[RTPProxyMediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}", file=sys.stderr, flush=True)
+                # re-INVITE 场景：200 OK 带视频但会话尚未分配视频端口时在此补分配
+                if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
+                    a_video_ports = self.port_manager.allocate_port_pair(call_id)
+                    b_video_ports = self.port_manager.allocate_port_pair(call_id)
+                    if a_video_ports and b_video_ports:
+                        session.a_leg_video_rtp_port = a_video_ports[0]
+                        session.a_leg_video_rtcp_port = a_video_ports[1]
+                        session.b_leg_video_rtp_port = b_video_ports[0]
+                        session.b_leg_video_rtcp_port = b_video_ports[1]
+                        print(f"[RTPProxyMediaRelay] 200 OK 含视频，补分配视频端口 A-leg RTP={a_video_ports[0]} B-leg RTP={b_video_ports[0]}", file=sys.stderr, flush=True)
         
-        # 修改SDP指向B-leg端口
+        if response_to_caller:
+            audio_port, video_port = session.a_leg_rtp_port, session.a_leg_video_rtp_port
+            audio_rtcp, video_rtcp = session.a_leg_rtcp_port, session.a_leg_video_rtcp_port
+            leg_name = "A-leg"
+        else:
+            audio_port, video_port = session.b_leg_rtp_port, session.b_leg_video_rtp_port
+            audio_rtcp, video_rtcp = session.b_leg_rtcp_port, session.b_leg_video_rtcp_port
+            leg_name = "B-leg"
         new_sdp = self.sdp_processor.modify_sdp(
             sdp_body,
             self.server_ip,
-            session.b_leg_rtp_port,
-            new_video_port=session.b_leg_video_rtp_port  # 传递视频端口（如果有）
+            audio_port,
+            new_video_port=video_port,
+            new_audio_rtcp_port=audio_rtcp,
+            new_video_rtcp_port=video_rtcp,
         )
-        
-        print(f"[RTPProxyMediaRelay] 200OK发给主叫，SDP修改为B-leg端口: {session.b_leg_rtp_port}", file=sys.stderr, flush=True)
+        print(f"[RTPProxyMediaRelay] 200 OK SDP 修改为{leg_name}端口: 音频 RTP/RTCP={audio_port}/{audio_rtcp}", end='', file=sys.stderr, flush=True)
+        if video_port:
+            print(f", 视频 RTP/RTCP={video_port}/{video_rtcp}", file=sys.stderr, flush=True)
+        else:
+            print(file=sys.stderr, flush=True)
         return new_sdp, True
     
     def _extract_tags_from_sdp(self, sdp_body: str) -> Tuple[Optional[str], Optional[str]]:
@@ -336,18 +373,40 @@ class RTPProxyMediaRelay:
         # 检查是否已经发送过offer
         if call_id not in self._rtpproxy_sessions:
             # 如果INVITE阶段没有发送offer，这里尝试发送（可能from_tag在INVITE时不可用）
-            print(f"[RTPProxyMediaRelay] 警告: 200 OK阶段发现offer未发送，尝试发送offer: {call_id}", file=sys.stderr, flush=True)
+            print(f"[RTPProxyMediaRelay] 警告: 200 OK阶段发现offer未发送，尝试发送offer: {call_id}, from_tag={from_tag}", file=sys.stderr, flush=True)
+            if not from_tag:
+                print(f"[RTPProxyMediaRelay] 错误: 200 OK阶段from_tag为空，无法发送offer: {call_id}", file=sys.stderr, flush=True)
+                return False
             offer_port = self.rtpproxy.create_offer(call_id, from_tag)
             if offer_port:
                 print(f"[RTPProxyMediaRelay] RTPProxy offer成功，端口: {offer_port}", file=sys.stderr, flush=True)
                 self._rtpproxy_sessions[call_id] = {'offer_port': offer_port, 'from_tag': from_tag}
             else:
                 print(f"[RTPProxyMediaRelay] RTPProxy offer失败，无法继续answer: {call_id}", file=sys.stderr, flush=True)
+                print(f"[RTPProxyMediaRelay] 请检查RTPProxy服务是否运行，以及call_id/from_tag格式是否正确", file=sys.stderr, flush=True)
                 return False
+        else:
+            # offer已发送，检查from_tag是否匹配（RTPProxy要求offer和answer使用相同的from_tag）
+            saved_from_tag = self._rtpproxy_sessions[call_id].get('from_tag')
+            if saved_from_tag and from_tag and saved_from_tag != from_tag:
+                print(f"[RTPProxyMediaRelay] 警告: from_tag不匹配，offer使用={saved_from_tag}, answer使用={from_tag}", file=sys.stderr, flush=True)
+                print(f"[RTPProxyMediaRelay] 使用offer时的from_tag: {saved_from_tag}", file=sys.stderr, flush=True)
+                from_tag = saved_from_tag  # 使用offer时的from_tag
         
         # 发送answer命令（200 OK阶段）
         print(f"[RTPProxyMediaRelay] 200 OK阶段：发送RTPProxy answer命令: {call_id}, from_tag={from_tag}, to_tag={to_tag}", file=sys.stderr, flush=True)
         session_id = self.rtpproxy.create_answer(call_id, from_tag, to_tag)
+        
+        # V命令失败（E0=会话不存在, E1=其他错误）时回退到U命令（一次性创建会话，不依赖offer）
+        if not session_id:
+            print(f"[RTPProxyMediaRelay] V answer失败，尝试U命令（带A/B-leg地址）: {call_id}", file=sys.stderr, flush=True)
+            session_id_str = self.rtpproxy.create_session(
+                call_id, from_tag, to_tag,
+                from_addr=a_leg_target,
+                to_addr=b_leg_target,
+                flags="s",
+            )
+            session_id = int(session_id_str) if session_id_str and session_id_str.isdigit() else None
         
         if session_id:
             # 更新会话信息
@@ -370,7 +429,11 @@ class RTPProxyMediaRelay:
         else:
             print(f"[RTPProxyMediaRelay] 媒体转发启动失败: {call_id}", file=sys.stderr, flush=True)
             # 输出详细错误信息以便调试
-            print(f"[RTPProxyMediaRelay]  可能原因: RTPProxy协议格式错误或需要先发送offer命令", file=sys.stderr, flush=True)
+            print(f"[RTPProxyMediaRelay]  可能原因:", file=sys.stderr, flush=True)
+            print(f"[RTPProxyMediaRelay]    1. RTPProxy服务未运行（最常见）", file=sys.stderr, flush=True)
+            print(f"[RTPProxyMediaRelay]    2. RTPProxy协议格式错误", file=sys.stderr, flush=True)
+            print(f"[RTPProxyMediaRelay]    3. 需要先发送offer命令", file=sys.stderr, flush=True)
+            print(f"[RTPProxyMediaRelay]  注意: 如果RTPProxy未运行，RTP/RTCP报文将无法转发，导致音频双不通", file=sys.stderr, flush=True)
             return False
     
     def end_session(self, call_id: str,
@@ -421,22 +484,60 @@ class RTPProxyMediaRelay:
         return success
     
     def get_session_stats(self, call_id: str) -> Optional[Dict]:
-        """获取会话统计信息"""
+        """获取会话统计信息（含音视频 RTP/RTCP 端口及诊断，供 MML 媒体端点可视化）"""
         session = self._sessions.get(call_id)
         if not session:
             return None
-        
+
         rtpproxy_info = self._rtpproxy_sessions.get(call_id, {})
-        
+        has_rtpproxy = bool(rtpproxy_info.get('answer_port') or rtpproxy_info.get('offer_port'))
+        duration = (time.time() - session.started_at) if session.started_at else 0
+
+        diagnosis = []
+        if not session.started_at:
+            diagnosis.append("媒体转发未启动")
+        elif not has_rtpproxy:
+            diagnosis.append("RTPProxy 会话未建立，可能音频双不通")
+        else:
+            diagnosis.append("RTPProxy 会话已建立，RTP/RTCP 由 RTPProxy 转发")
+        if not session.a_leg_remote_addr or not session.b_leg_remote_addr:
+            diagnosis.append("媒体地址不完整")
+
         return {
             'call_id': call_id,
-            'caller': session.caller_number,
-            'callee': session.callee_number,
+            'caller': session.caller_number or 'N/A',
+            'callee': session.callee_number or 'N/A',
             'a_leg_rtp_port': session.a_leg_rtp_port,
+            'a_leg_rtcp_port': session.a_leg_rtcp_port,
             'b_leg_rtp_port': session.b_leg_rtp_port,
+            'b_leg_rtcp_port': session.b_leg_rtcp_port,
+            'a_leg_video_rtp_port': session.a_leg_video_rtp_port,
+            'a_leg_video_rtcp_port': session.a_leg_video_rtcp_port,
+            'b_leg_video_rtp_port': session.b_leg_video_rtp_port,
+            'b_leg_video_rtcp_port': session.b_leg_video_rtcp_port,
             'rtpproxy_session_id': rtpproxy_info.get('from_tag'),
             'started_at': session.started_at,
-            'ended_at': session.ended_at
+            'ended_at': session.ended_at,
+            'duration_sec': round(duration, 1),
+            'a_to_b_packets': session.a_to_b_packets,  # 主叫→被叫（上行）
+            'b_to_a_packets': session.b_to_a_packets,  # 被叫→主叫（下行）
+            'a_to_b_bytes': session.a_to_b_bytes,
+            'b_to_a_bytes': session.b_to_a_bytes,
+            'diagnosis': ' | '.join(diagnosis) if diagnosis else '正常',
+        }
+    
+    def get_all_stats(self) -> Dict:
+        """获取所有会话统计及端口使用情况（供 MML API）"""
+        port_stats = self.port_manager.get_stats()
+        sessions = {}
+        for cid in self._sessions:
+            st = self.get_session_stats(cid)
+            if st:
+                sessions[cid] = st
+        return {
+            'port_stats': port_stats,
+            'active_sessions': len(self._sessions),
+            'sessions': sessions,
         }
     
     def print_media_diagnosis(self, call_id: str):

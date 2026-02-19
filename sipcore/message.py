@@ -37,4 +37,44 @@ class SIPMessage:
 
     @staticmethod
     def _canon(k: str) -> str:
+        """
+        规范化SIP头字段名称，使用RFC 3261规定的标准格式
+        
+        RFC 3261规定的标准头字段名称：
+        - Call-ID (不是 Call-Id)
+        - CSeq (不是 Cseq)
+        - Record-Route (标准格式)
+        - 其他字段：每个单词首字母大写，用连字符连接
+        """
+        # RFC 3261标准头字段名称映射
+        standard_headers = {
+            "call-id": "Call-ID",
+            "cseq": "CSeq",
+            "www-authenticate": "WWW-Authenticate",
+            "max-forwards": "Max-Forwards",
+            "content-type": "Content-Type",
+            "content-length": "Content-Length",
+            "record-route": "Record-Route",
+            "contact": "Contact",
+            "user-agent": "User-Agent",
+            "allow": "Allow",
+            "supported": "Supported",
+            "require": "Require",
+            "proxy-require": "Proxy-Require",
+            "proxy-authorization": "Proxy-Authorization",
+            "authorization": "Authorization",
+            "from": "From",
+            "to": "To",
+            "via": "Via",
+            "route": "Route",
+            "rseq": "RSeq",
+            "rack": "RAck",
+        }
+        
+        # 转换为小写查找
+        k_lower = k.lower()
+        if k_lower in standard_headers:
+            return standard_headers[k_lower]
+        
+        # 对于不在标准列表中的字段，使用标准格式：每个单词首字母大写
         return "-".join(p.capitalize() for p in k.split("-"))

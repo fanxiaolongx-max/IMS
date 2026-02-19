@@ -1,5 +1,7 @@
 {
     "FORCE_LOCAL_ADDR": false,
+    "SERVER_ADDR": "113.44.149.111",
+    "SERVER_PORT": 5060,
     "USERS": {
         "1001": "1234",
         "1002": "1234",

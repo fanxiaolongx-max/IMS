@@ -10,6 +10,7 @@
 4. 媒体会话生命周期管理
 """
 
+import random
 import socket
 import threading
 import re
@@ -134,36 +135,34 @@ class MediaSession:
 
 
 class RTPPortManager:
-    """RTP端口管理器"""
-    
-    # RTP端口范围 (偶数端口给RTP，奇数端口给RTCP)，常规媒体端口 20000 起
+    """RTP端口管理器：从 20000～30000 随机分配 RTP/RTCP 端口对"""
+
     RTP_PORT_START = 20000
-    RTP_PORT_END = 30000
-    
+    RTP_PORT_END = 30000  # 不含 30000，即 20000～29998 的偶数
+
     def __init__(self):
         self._lock = threading.Lock()
+        # 可用 RTP 端口池（偶数），分配时随机取
         self._available_ports: List[int] = list(range(
             self.RTP_PORT_START, self.RTP_PORT_END, 2
         ))
         self._allocated_ports: Dict[int, str] = {}  # port -> call_id
-        
+
     def allocate_port_pair(self, call_id: str) -> Optional[Tuple[int, int]]:
         """
-        分配一对RTP/RTCP端口
-        
+        随机分配一对 RTP/RTCP 端口（RTP 为偶数，RTCP 为 RTP+1）
+
         Returns:
             (rtp_port, rtcp_port) 或 None（端口耗尽）
         """
         with self._lock:
             if not self._available_ports:
                 return None
-            
-            rtp_port = self._available_ports.pop(0)
+            idx = random.randrange(len(self._available_ports))
+            rtp_port = self._available_ports.pop(idx)
             rtcp_port = rtp_port + 1
-            
             self._allocated_ports[rtp_port] = call_id
             self._allocated_ports[rtcp_port] = call_id
-            
             return rtp_port, rtcp_port
     
     def release_port_pair(self, rtp_port: int, rtcp_port: int):
@@ -174,10 +173,8 @@ class RTPPortManager:
             if rtcp_port in self._allocated_ports:
                 del self._allocated_ports[rtcp_port]
             
-            # 归还到可用池
             if rtp_port not in self._available_ports:
                 self._available_ports.append(rtp_port)
-                self._available_ports.sort()
     
     def get_stats(self) -> Dict:
         """获取端口使用统计"""
@@ -285,75 +282,106 @@ class SDPProcessor:
         return result if result['audio_port'] else None
     
     @staticmethod
-    def modify_sdp(sdp_body: str, new_ip: str, new_audio_port: int, 
-                   new_video_port: Optional[int] = None, force_plain_rtp: bool = False) -> str:
+    def modify_sdp(sdp_body: str, new_ip: str, new_audio_port: int,
+                   new_video_port: Optional[int] = None,
+                   new_audio_rtcp_port: Optional[int] = None,
+                   new_video_rtcp_port: Optional[int] = None,
+                   force_plain_rtp: bool = False) -> str:
         """
-        修改SDP中的IP地址和端口（支持音频和视频）
+        修改SDP中的IP地址和端口（支持音频、视频及 a=rtcp）
         
         Args:
             sdp_body: 原始SDP
             new_ip: 新的IP地址
             new_audio_port: 新的音频RTP端口
-            new_video_port: 新的视频RTP端口（可选，如果SDP包含视频流）
+            new_video_port: 新的视频RTP端口（可选）
+            new_audio_rtcp_port: 新的音频RTCP端口（可选，默认 new_audio_port+1）
+            new_video_rtcp_port: 新的视频RTCP端口（可选，默认 new_video_port+1）
             force_plain_rtp: 是否强制使用普通RTP（移除SRTP加密行）
-                             默认 False: 保持原始的 RTP/SAVP 或 RTP/AVP 不变（推荐）
-                             True: 强制改为 RTP/AVP 并删除 crypto 行（会导致 SRTP 终端无法通话）
             
         Returns:
-            修改后的SDP
-            
-        业界最佳实践：
-        - B2BUA 做媒体中继时，只修改 c= (IP) 和 m= (端口号)，保持协议类型不变
-        - 保留 RTP/SAVP 和 a=crypto 行，让两端直接协商加密参数
-        - 服务器只做 UDP 包转发，不需要理解 SRTP 加密内容
-        - RTP 包头（SSRC、sequence、timestamp 等）也无需修改，直接透传
+            修改后的SDP（主被叫均能正确向中继发送 RTP 与 RTCP）
         """
         if not sdp_body:
             return sdp_body
-        
+        if new_audio_rtcp_port is None:
+            new_audio_rtcp_port = new_audio_port + 1
+        if new_video_rtcp_port is None and new_video_port is not None:
+            new_video_rtcp_port = new_video_port + 1
+
         lines = sdp_body.split('\r\n') if '\r\n' in sdp_body else sdp_body.split('\n')
         new_lines = []
-        
+        # 当前媒体块对应的 RTCP 端口（用于替换 a=rtcp）
+        pending_rtcp: Optional[int] = None
+
         for line in lines:
             line = line.rstrip()
             if not line:
                 continue
-            
-            # 修改 c= 行（只改 IP 地址）
+
+            # 修改 o= 行（origin，保持格式，只改 IP 地址）
+            # 格式: o=<username> <sess-id> <sess-version> <nettype> <addrtype> <unicast-address>
+            if line.startswith('o='):
+                parts = line[2:].split()
+                if len(parts) >= 6 and parts[4] == 'IP4':
+                    # 保持前5个字段不变，只修改最后一个 IP 地址字段
+                    line = f"o={' '.join(parts[:5])} {new_ip}"
+                new_lines.append(line)
+                continue
+
+            # 修改 c= 行（connection，只改 IP 地址）
             if line.startswith('c='):
                 parts = line[2:].split()
                 if len(parts) >= 3 and parts[1] == 'IP4':
                     line = f"c=IN IP4 {new_ip}"
-            
-            # 修改 m=audio 行（只改端口号，保留原始协议类型 RTP/AVP 或 RTP/SAVP）
-            elif line.startswith('m=audio '):
+                new_lines.append(line)
+                continue
+
+            # 修改 m=audio 行
+            if line.startswith('m=audio '):
+                if pending_rtcp is not None:
+                    new_lines.append(f"a=rtcp:{pending_rtcp} IN IP4 {new_ip}")
+                    pending_rtcp = new_audio_rtcp_port
                 parts = line.split()
                 if len(parts) >= 4:
-                    # 保持原始协议类型（RTP/AVP 或 RTP/SAVP），只修改端口
-                    proto = parts[2]  # 保留原始协议: RTP/AVP 或 RTP/SAVP
+                    proto = parts[2]
                     payloads = ' '.join(parts[3:])
                     if force_plain_rtp:
-                        proto = "RTP/AVP"  # 强制降级（不推荐）
+                        proto = "RTP/AVP"
                     line = f"m=audio {new_audio_port} {proto} {payloads}"
-            
-            # 修改 m=video 行（只改端口号，保留原始协议类型）
-            elif line.startswith('m=video '):
+                new_lines.append(line)
+                continue
+
+            # 修改 m=video 行
+            if line.startswith('m=video '):
+                if pending_rtcp is not None:
+                    new_lines.append(f"a=rtcp:{pending_rtcp} IN IP4 {new_ip}")
+                    pending_rtcp = new_video_rtcp_port if new_video_port is not None else None
                 parts = line.split()
                 if len(parts) >= 4 and new_video_port is not None:
-                    # 保持原始协议类型，只修改端口
-                    proto = parts[2]  # 保留原始协议: RTP/AVP 或 RTP/SAVP
+                    proto = parts[2]
                     payloads = ' '.join(parts[3:])
                     if force_plain_rtp:
-                        proto = "RTP/AVP"  # 强制降级（不推荐）
+                        proto = "RTP/AVP"
                     line = f"m=video {new_video_port} {proto} {payloads}"
-            
-            # 跳过 SRTP 加密属性行（仅在强制使用普通RTP时）
-            elif force_plain_rtp and (line.startswith('a=crypto:') or line.startswith('a=fingerprint:')):
+                new_lines.append(line)
                 continue
-            
+
+            # 替换 a=rtcp 行（RFC 3605: a=rtcp:port 或 a=rtcp:port nettype addrtype addr）——地址与 c= 一致
+            if line.startswith('a=rtcp:'):
+                if pending_rtcp is not None:
+                    new_lines.append(f"a=rtcp:{pending_rtcp} IN IP4 {new_ip}")
+                    pending_rtcp = None
+                continue
+
+            if force_plain_rtp and (line.startswith('a=crypto:') or line.startswith('a=fingerprint:')):
+                continue
+
             new_lines.append(line)
-        
-        # 确保使用 \r\n 作为行分隔符 (SIP标准)
+
+        if pending_rtcp is not None:
+            new_lines.append(f"a=rtcp:{pending_rtcp} IN IP4 {new_ip}")
+
         return '\r\n'.join(new_lines) + '\r\n'
 
 
@@ -808,33 +836,24 @@ class MediaRelay:
             session.a_leg_sdp = sdp_body
             print(f"[MediaRelay] A-leg媒体信息: {session.a_leg_remote_addr}")
         
-        # 修改SDP（指向A-leg端口，给主叫用的）
+        # 修改SDP（指向A-leg端口，给主叫用的；含 RTCP）
         new_sdp = self.sdp_processor.modify_sdp(
-            sdp_body, 
-            self.server_ip, 
-            session.a_leg_rtp_port
+            sdp_body,
+            self.server_ip,
+            session.a_leg_rtp_port,
+            new_audio_rtcp_port=session.a_leg_rtcp_port,
         )
-        
         return new_sdp, session
     
     def process_invite_to_callee(self, call_id: str, sdp_body: str,
                                   caller_addr: Tuple[str, int],
                                   caller_number: Optional[str] = None,
-                                  callee_number: Optional[str] = None) -> Tuple[str, Optional[MediaSession]]:
+                                  callee_number: Optional[str] = None,
+                                  from_tag: Optional[str] = None,
+                                  forward_to_callee: bool = True) -> Tuple[str, Optional[MediaSession]]:
         """
-        处理转发给被叫的INVITE SDP
-        修改SDP指向服务器的B-leg端口，让被叫发送RTP到B-leg端口
-        同时保存A-leg的媒体信息和信令地址
-        
-        Args:
-            call_id: 呼叫ID
-            sdp_body: 原始SDP
-            caller_addr: 主叫信令地址（NAT后的真实地址）
-            caller_number: 主叫号码 (A-leg)
-            callee_number: 被叫号码 (B-leg)
-            
-        Returns:
-            (修改后的SDP, MediaSession对象)
+        处理转发的 INVITE/re-INVITE SDP。
+        forward_to_callee=True 用 B-leg，False 用 A-leg（与 RTPProxy 实现一致）。
         """
         # 获取或创建会话
         session = self._sessions.get(call_id)
@@ -887,35 +906,31 @@ class MediaRelay:
                 session.a_leg_video_remote_addr = (video_ip, media_info['video_port'])
                 print(f"[MediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}")
         
-        # 修改SDP（指向B-leg端口，给被叫用的）
+        audio_port = session.b_leg_rtp_port if forward_to_callee else session.a_leg_rtp_port
+        video_port = session.b_leg_video_rtp_port if forward_to_callee else session.a_leg_video_rtp_port
+        audio_rtcp = session.b_leg_rtcp_port if forward_to_callee else session.a_leg_rtcp_port
+        video_rtcp = session.b_leg_video_rtcp_port if forward_to_callee else session.a_leg_video_rtcp_port
         new_sdp = self.sdp_processor.modify_sdp(
             sdp_body,
             self.server_ip,
-            session.b_leg_rtp_port,
-            new_video_port=session.b_leg_video_rtp_port  # 传递视频端口（如果有）
+            audio_port,
+            new_video_port=video_port,
+            new_audio_rtcp_port=audio_rtcp,
+            new_video_rtcp_port=video_rtcp,
         )
-        
-        print(f"[MediaRelay] INVITE转发给被叫，SDP修改为B-leg端口: 音频={session.b_leg_rtp_port}", end='')
-        if session.b_leg_video_rtp_port:
-            print(f", 视频={session.b_leg_video_rtp_port}")
+        leg = "B-leg" if forward_to_callee else "A-leg"
+        print(f"[MediaRelay] INVITE SDP 修改为{leg}端口: 音频={audio_port}", end='')
+        if video_port:
+            print(f", 视频={video_port}")
         else:
             print()
         return new_sdp, session
-    
+
     def process_answer_sdp(self, call_id: str, sdp_body: str,
-                          callee_addr: Tuple[str, int]) -> Tuple[str, bool]:
+                          callee_addr: Tuple[str, int],
+                          response_to_caller: bool = True) -> Tuple[str, bool]:
         """
-        处理200 OK的SDP（被叫侧）
-        修改SDP指向服务器的A-leg端口，让主叫发送RTP到A-leg端口
-        同时保存B-leg的信令地址
-        
-        Args:
-            call_id: 呼叫ID
-            sdp_body: 原始SDP
-            callee_addr: 被叫信令地址（NAT后的真实地址）
-            
-        Returns:
-            (修改后的SDP, 是否成功)
+        处理 200 OK 的 SDP。response_to_caller=True 用 A-leg，False 用 B-leg。
         """
         session = self._sessions.get(call_id)
         if not session:
@@ -935,24 +950,32 @@ class MediaRelay:
             session.b_leg_sdp = sdp_body
             print(f"[MediaRelay] B-leg音频信息: {session.b_leg_remote_addr}")
             
-            # 检测并处理视频流
             if media_info.get('video_port'):
                 video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
                 session.b_leg_video_remote_addr = (video_ip, media_info['video_port'])
                 print(f"[MediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}")
-        
-        # 修改SDP（使用B-leg端口——与INVITE SDP相同端口）
-        # 关键改进：主叫和被叫共享同一个RTP端口，避免A-leg端口被防火墙阻断
+                if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
+                    a_v = self.port_manager.allocate_port_pair(call_id)
+                    b_v = self.port_manager.allocate_port_pair(call_id)
+                    if a_v and b_v:
+                        session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port = a_v[0], a_v[1]
+                        session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port = b_v[0], b_v[1]
+        audio_port = session.a_leg_rtp_port if response_to_caller else session.b_leg_rtp_port
+        video_port = session.a_leg_video_rtp_port if response_to_caller else session.b_leg_video_rtp_port
+        audio_rtcp = session.a_leg_rtcp_port if response_to_caller else session.b_leg_rtcp_port
+        video_rtcp = session.a_leg_video_rtcp_port if response_to_caller else session.b_leg_video_rtcp_port
         new_sdp = self.sdp_processor.modify_sdp(
             sdp_body,
             self.server_ip,
-            session.b_leg_rtp_port,
-            new_video_port=session.b_leg_video_rtp_port  # 传递视频端口（如果有）
+            audio_port,
+            new_video_port=video_port,
+            new_audio_rtcp_port=audio_rtcp,
+            new_video_rtcp_port=video_rtcp,
         )
-        
-        print(f"[MediaRelay] 200OK发给主叫，SDP修改为共享端口: 音频={session.b_leg_rtp_port}", end='')
-        if session.b_leg_video_rtp_port:
-            print(f", 视频={session.b_leg_video_rtp_port}")
+        leg = "A-leg" if response_to_caller else "B-leg"
+        print(f"[MediaRelay] 200 OK SDP 修改为{leg}端口: 音频={audio_port}", end='')
+        if video_port:
+            print(f", 视频={video_port}")
         else:
             print()
         return new_sdp, True
@@ -1151,21 +1174,49 @@ class MediaRelay:
         print(f"[MediaRelay] 会话已清理（包含视频端口）: {call_id}")
     
     def get_session_stats(self, call_id: str) -> Optional[Dict]:
-        """获取会话统计信息"""
+        """获取会话统计信息（含音视频端口及诊断，供 MML 媒体端点可视化）"""
         session = self._sessions.get(call_id)
         if not session:
             return None
-        
+
         fwd = self._forwarders.get((call_id, 'single', 'rtp'))
-        
+        a_to_b = fwd.caller_to_callee_packets if fwd else 0
+        b_to_a = fwd.callee_to_caller_packets if fwd else 0
+        duration = time.time() - session.started_at if session.started_at else 0
+        diagnosis = []
+        if not session.started_at:
+            diagnosis.append("媒体转发未启动")
+        elif fwd:
+            if not fwd.caller_latched:
+                diagnosis.append("主叫 RTP 未 LATCH")
+            if not fwd.callee_latched:
+                diagnosis.append("被叫 RTP 未 LATCH")
+            if a_to_b == 0 and b_to_a == 0 and duration > 5:
+                diagnosis.append("长时间无包，可能双不通")
+            if not diagnosis:
+                diagnosis.append("正常转发")
+        else:
+            diagnosis.append("转发器未创建")
         return {
             'call_id': call_id,
+            'caller': session.caller_number or 'N/A',
+            'callee': session.callee_number or 'N/A',
             'shared_port': session.b_leg_rtp_port,
-            'a_to_b_packets': fwd.caller_to_callee_packets if fwd else 0,
-            'b_to_a_packets': fwd.callee_to_caller_packets if fwd else 0,
+            'a_leg_rtp_port': session.a_leg_rtp_port,
+            'a_leg_rtcp_port': session.a_leg_rtcp_port,
+            'b_leg_rtp_port': session.b_leg_rtp_port,
+            'b_leg_rtcp_port': session.b_leg_rtcp_port,
+            'a_leg_video_rtp_port': session.a_leg_video_rtp_port,
+            'a_leg_video_rtcp_port': session.a_leg_video_rtcp_port,
+            'b_leg_video_rtp_port': session.b_leg_video_rtp_port,
+            'b_leg_video_rtcp_port': session.b_leg_video_rtcp_port,
+            'a_to_b_packets': a_to_b,
+            'b_to_a_packets': b_to_a,
             'caller_latched': fwd.caller_latched if fwd else False,
             'callee_latched': fwd.callee_latched if fwd else False,
-            'duration': time.time() - session.started_at if session.started_at else 0
+            'duration': duration,
+            'duration_sec': round(duration, 1),
+            'diagnosis': ' | '.join(diagnosis),
         }
     
     def get_all_stats(self) -> Dict:

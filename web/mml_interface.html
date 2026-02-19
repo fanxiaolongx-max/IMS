@@ -309,6 +309,13 @@
             min-height: 0;
             background: #1e1e1e;
         }
+        #media-endpoints-content {
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            min-height: 0;
+            background: #1e1e1e;
+        }
 
         .sip-messages-controls {
             flex-shrink: 0;
@@ -351,6 +358,42 @@
             color: #4ec9b0;
             margin-left: auto;
         }
+
+        .media-endpoints-diagnosis {
+            padding: 12px 15px;
+            background: #252526;
+            border-bottom: 1px solid #3e3e42;
+            font-size: 13px;
+            color: #4ec9b0;
+        }
+        .media-endpoints-diagnosis.warn { color: #dcdcaa; }
+        .media-endpoints-diagnosis.err { color: #f48771; }
+        .media-endpoints-sessions {
+            flex: 1;
+            overflow: auto;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .media-session-card {
+            background: #2d2d30;
+            border: 1px solid #3e3e42;
+            border-radius: 6px;
+            padding: 12px 15px;
+            font-size: 12px;
+        }
+        .media-session-card h4 {
+            color: #4ec9b0;
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+        .media-session-card .diagnosis { color: #dcdcaa; margin-top: 8px; }
+        .media-session-card .diagnosis.ok { color: #4ec9b0; }
+        .media-session-card table.media-ports { width: 100%; border-collapse: collapse; margin-top: 6px; }
+        .media-session-card table.media-ports th, .media-session-card table.media-ports td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #3e3e42; }
+        .media-session-card table.media-ports th { color: #969696; }
+        .media-endpoints-sessions .empty { color: #969696; text-align: center; padding: 40px; }
 
         .sip-messages-table-container {
             flex: 1;
@@ -1166,6 +1209,7 @@
                     <button class="output-tab active" id="current-tab">当前回显</button>
                     <button class="output-tab" id="history-tab">历史记录</button>
                     <button class="output-tab" id="sip-messages-tab">📡 SIP消息跟踪</button>
+                    <button class="output-tab" id="media-endpoints-tab">📻 媒体端点可视化</button>
                 </div>
                 
                 <!-- 当前回显内容 -->
@@ -1192,6 +1236,19 @@
                     <div id="output-anchor" style="height: 1px;"></div>
                 </div>
                 
+                <!-- 媒体端点可视化内容 -->
+                <div id="media-endpoints-content" style="display: none;">
+                    <div class="sip-messages-controls">
+                        <div class="sip-messages-control-row">
+                            <button id="media-endpoints-refresh-btn" class="sip-messages-btn">刷新</button>
+                            <label><input type="checkbox" id="media-endpoints-auto-refresh" checked> 每 2 秒自动刷新</label>
+                            <span id="media-endpoints-summary" class="sip-messages-stats">加载中...</span>
+                        </div>
+                    </div>
+                    <div id="media-endpoints-diagnosis" class="media-endpoints-diagnosis"></div>
+                    <div id="media-endpoints-sessions" class="media-endpoints-sessions"></div>
+                </div>
+
                 <!-- SIP消息跟踪内容 -->
                 <div id="sip-messages-content" style="display: none;">
                     <div class="sip-messages-controls">
@@ -1249,31 +1306,17 @@
                                         </div>
                                         <div class="resize-handle"></div>
                                     </th>
-                                    <th data-column="src_ip">
+                                    <th data-column="udp_addr">
                                         <div class="table-header">
-                                            <span>源IP:端口</span>
-                                            <input type="text" class="column-filter" data-column="src_ip" placeholder="过滤源IP...">
+                                            <span>UDP IP层 (源→目标)</span>
+                                            <input type="text" class="column-filter" data-column="udp_addr" placeholder="过滤UDP地址...">
                                         </div>
                                         <div class="resize-handle"></div>
                                     </th>
-                                    <th data-column="dst_ip">
+                                    <th data-column="sip_addr">
                                         <div class="table-header">
-                                            <span>目标IP:端口</span>
-                                            <input type="text" class="column-filter" data-column="dst_ip" placeholder="过滤目标IP...">
-                                        </div>
-                                        <div class="resize-handle"></div>
-                                    </th>
-                                    <th data-column="src_ip_nat">
-                                        <div class="table-header">
-                                            <span>源IP:端口(NAT前)</span>
-                                            <input type="text" class="column-filter" data-column="src_ip_nat" placeholder="过滤NAT前源IP...">
-                                        </div>
-                                        <div class="resize-handle"></div>
-                                    </th>
-                                    <th data-column="dst_ip_nat">
-                                        <div class="table-header">
-                                            <span>目标IP:端口(NAT前)</span>
-                                            <input type="text" class="column-filter" data-column="dst_ip_nat" placeholder="过滤NAT前目标IP...">
+                                            <span>SIP协议层 (源→目标)</span>
+                                            <input type="text" class="column-filter" data-column="sip_addr" placeholder="过滤SIP地址...">
                                         </div>
                                         <div class="resize-handle"></div>
                                     </th>
@@ -2570,22 +2613,31 @@
         
         // 初始化
         // 页签切换
+        let mediaEndpointsIntervalId = null;
+
         function initOutputTabs() {
             const currentTab = document.getElementById('current-tab');
             const historyTab = document.getElementById('history-tab');
             const sipMessagesTab = document.getElementById('sip-messages-tab');
+            const mediaEndpointsTab = document.getElementById('media-endpoints-tab');
             const outputContent = document.getElementById('output-content');
             const historyContent = document.getElementById('history-content');
             const sipMessagesContent = document.getElementById('sip-messages-content');
+            const mediaEndpointsContent = document.getElementById('media-endpoints-content');
+            
+            function setActiveTab(active) {
+                [currentTab, historyTab, sipMessagesTab, mediaEndpointsTab].forEach(t => t.classList.remove('active'));
+                active.classList.add('active');
+                outputContent.style.display = active === currentTab ? 'block' : 'none';
+                historyContent.style.display = active === historyTab ? 'flex' : 'none';
+                sipMessagesContent.style.display = active === sipMessagesTab ? 'flex' : 'none';
+                mediaEndpointsContent.style.display = active === mediaEndpointsTab ? 'flex' : 'none';
+                if (sipMessagesPollIntervalId) { clearInterval(sipMessagesPollIntervalId); sipMessagesPollIntervalId = null; }
+                if (mediaEndpointsIntervalId) { clearInterval(mediaEndpointsIntervalId); mediaEndpointsIntervalId = null; }
+            }
             
             currentTab.addEventListener('click', () => {
-                currentTab.classList.add('active');
-                historyTab.classList.remove('active');
-                sipMessagesTab.classList.remove('active');
-                outputContent.style.display = 'block';
-                historyContent.style.display = 'none';
-                sipMessagesContent.style.display = 'none';
-                if (sipMessagesPollIntervalId) { clearInterval(sipMessagesPollIntervalId); sipMessagesPollIntervalId = null; }
+                setActiveTab(currentTab);
                 // 恢复 MML 输入区和补全框
                 const inputArea = document.getElementById('input-area');
                 const paramForm = document.getElementById('param-form');
@@ -2612,14 +2664,7 @@
             });
             
             historyTab.addEventListener('click', () => {
-                historyTab.classList.add('active');
-                currentTab.classList.remove('active');
-                sipMessagesTab.classList.remove('active');
-                historyContent.style.display = 'flex';
-                outputContent.style.display = 'none';
-                sipMessagesContent.style.display = 'none';
-                if (sipMessagesPollIntervalId) { clearInterval(sipMessagesPollIntervalId); sipMessagesPollIntervalId = null; }
-                // 恢复 MML 输入区和补全框
+                setActiveTab(historyTab);
                 const inputArea = document.getElementById('input-area');
                 const paramForm = document.getElementById('param-form');
                 const horizontalResizer = document.getElementById('horizontal-resizer');
@@ -2645,13 +2690,7 @@
             });
             
             sipMessagesTab.addEventListener('click', () => {
-                sipMessagesTab.classList.add('active');
-                currentTab.classList.remove('active');
-                historyTab.classList.remove('active');
-                sipMessagesContent.style.display = 'flex';
-                outputContent.style.display = 'none';
-                historyContent.style.display = 'none';
-                // 切换到SIP消息跟踪时彻底隐藏所有 MML 补全组件，释放空间
+                setActiveTab(sipMessagesTab);
                 const inputArea = document.getElementById('input-area');
                 const paramForm = document.getElementById('param-form');
                 const autocompleteDropdown = document.getElementById('autocomplete-dropdown');
@@ -2689,13 +2728,94 @@
                 // 添加滚动事件监听器，检测用户手动滚动
                 const scrollWrapper = document.querySelector('.sip-messages-table-scroll-wrapper');
                 if (scrollWrapper) {
-                    // 移除之前的监听器（如果存在）
                     scrollWrapper.removeEventListener('scroll', handleSipMessagesScroll);
-                    // 添加新的监听器
                     scrollWrapper.addEventListener('scroll', handleSipMessagesScroll);
                 }
             });
+
+            mediaEndpointsTab.addEventListener('click', () => {
+                setActiveTab(mediaEndpointsTab);
+                const inputArea = document.getElementById('input-area');
+                const paramForm = document.getElementById('param-form');
+                const horizontalResizer = document.getElementById('horizontal-resizer');
+                if (inputArea) {
+                    inputArea.style.display = 'none';
+                    inputArea.style.height = '0';
+                    inputArea.style.minHeight = '0';
+                    inputArea.style.maxHeight = '0';
+                    inputArea.style.padding = '0';
+                    inputArea.style.margin = '0';
+                }
+                if (paramForm) { paramForm.style.display = 'none'; paramForm.style.height = '0'; }
+                if (horizontalResizer) { horizontalResizer.style.display = 'none'; horizontalResizer.style.height = '0'; }
+                loadMediaEndpoints();
+                const autoRefresh = document.getElementById('media-endpoints-auto-refresh');
+                if (mediaEndpointsIntervalId) clearInterval(mediaEndpointsIntervalId);
+                if (autoRefresh && autoRefresh.checked) {
+                    mediaEndpointsIntervalId = setInterval(loadMediaEndpoints, 2000);
+                }
+            });
         }
+
+        async function loadMediaEndpoints() {
+            const summaryEl = document.getElementById('media-endpoints-summary');
+            const diagEl = document.getElementById('media-endpoints-diagnosis');
+            const sessionsEl = document.getElementById('media-endpoints-sessions');
+            if (!summaryEl || !diagEl || !sessionsEl) return;
+            try {
+                const res = await fetch('/api/media-endpoints');
+                const data = await res.json();
+                if (!data.success) {
+                    summaryEl.textContent = '加载失败: ' + (data.message || '未知错误');
+                    diagEl.textContent = '';
+                    diagEl.className = 'media-endpoints-diagnosis err';
+                    sessionsEl.innerHTML = '<div class="empty">无数据</div>';
+                    return;
+                }
+                const relayType = data.relay_type === 'rtpproxy' ? 'RTPProxy' : (data.relay_type === 'custom' ? '自定义转发器' : '无');
+                const portStats = data.port_stats || {};
+                summaryEl.textContent = `中继: ${relayType} | 服务器: ${data.server_ip || 'N/A'} | 活跃会话: ${(data.sessions || []).length} | 端口对: 已用 ${portStats.used_pairs ?? '-'} / 总 ${portStats.total_pairs ?? '-'}`;
+                diagEl.textContent = data.diagnosis_summary || '';
+                diagEl.className = 'media-endpoints-diagnosis' + (data.diagnosis_summary && (data.diagnosis_summary.indexOf('异常') >= 0 || data.diagnosis_summary.indexOf('未') >= 0) ? ' warn' : '');
+                const sessions = data.sessions || [];
+                if (sessions.length === 0) {
+                    sessionsEl.innerHTML = '<div class="empty">当前无媒体会话</div>';
+                    return;
+                }
+                sessionsEl.innerHTML = sessions.map(s => {
+                    const audio = s.audio || {};
+                    const aA = audio.a_leg || {}, aB = audio.b_leg || {};
+                    const video = s.video;
+                    let rows = [
+                        `<tr><th>主叫→被叫 (上行)</th><td>RTP/RTCP</td><td>A-leg: ${aA.rtp_port ?? '-'}/${aA.rtcp_port ?? '-'} → B-leg: ${aB.rtp_port ?? '-'}/${aB.rtcp_port ?? '-'}</td><td>${s.uplink_packets != null ? s.uplink_packets + ' 包' : '-'}</td></tr>`,
+                        `<tr><th>被叫→主叫 (下行)</th><td>RTP/RTCP</td><td>B-leg → A-leg</td><td>${s.downlink_packets != null ? s.downlink_packets + ' 包' : '-'}</td></tr>`,
+                    ];
+                    if (video && (video.a_leg || video.b_leg)) {
+                        const vA = video.a_leg || {}, vB = video.b_leg || {};
+                        rows.push(`<tr><th>视频</th><td>RTP/RTCP</td><td>A: ${vA.rtp_port ?? '-'}/${vA.rtcp_port ?? '-'} | B: ${vB.rtp_port ?? '-'}/${vB.rtcp_port ?? '-'}</td><td>-</td></tr>`);
+                    }
+                    const diagClass = (s.diagnosis && (s.diagnosis.indexOf('未') >= 0 || s.diagnosis.indexOf('异常') >= 0)) ? '' : ' ok';
+                    return `<div class="media-session-card">
+                        <h4>${s.caller} → ${s.callee} (${s.call_id}) ${s.duration_sec != null ? ' · ' + s.duration_sec + 's' : ''}</h4>
+                        <table class="media-ports"><tbody>${rows.join('')}</tbody></table>
+                        <div class="diagnosis${diagClass}">${s.diagnosis || '正常'}</div>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                summaryEl.textContent = '请求失败: ' + e.message;
+                diagEl.textContent = '';
+                sessionsEl.innerHTML = '<div class="empty">加载失败</div>';
+            }
+        }
+
+        document.getElementById('media-endpoints-refresh-btn')?.addEventListener('click', loadMediaEndpoints);
+        document.getElementById('media-endpoints-auto-refresh')?.addEventListener('change', function() {
+            if (mediaEndpointsIntervalId) { clearInterval(mediaEndpointsIntervalId); mediaEndpointsIntervalId = null; }
+            const mediaEndpointsContent = document.getElementById('media-endpoints-content');
+            if (this.checked && mediaEndpointsContent && mediaEndpointsContent.style.display === 'flex') {
+                mediaEndpointsIntervalId = setInterval(loadMediaEndpoints, 2000);
+            }
+        });
         
         // SIP消息跟踪功能
         let sipMessagesWebSocket = null;
@@ -3084,7 +3204,22 @@
             if (Object.keys(columnFilters).length > 0) {
                 filteredMessages = sipMessagesList.filter(msg => {
                     for (const [column, filterValue] of Object.entries(columnFilters)) {
-                        const msgValue = String(msg[column] || '').toLowerCase();
+                        let msgValue = '';
+                        // 处理虚拟列：UDP地址和SIP地址
+                        if (column === 'udp_addr') {
+                            // UDP IP层地址：源IP:端口 → 目标IP:端口
+                            msgValue = `${msg.src_ip || ''}:${msg.src_port || ''} → ${msg.dst_ip || ''}:${msg.dst_port || ''}`.toLowerCase();
+                        } else if (column === 'sip_addr') {
+                            // SIP协议层地址：源IP:端口 → 目标IP:端口
+                            const srcSip = msg.src_ip_nat || msg.src_ip || '';
+                            const srcPortSip = msg.src_port_nat || msg.src_port || '';
+                            const dstSip = msg.dst_ip_nat || msg.dst_ip || '';
+                            const dstPortSip = msg.dst_port_nat || msg.dst_port || '';
+                            msgValue = `${srcSip}${srcPortSip ? ':' + srcPortSip : ''} → ${dstSip}${dstPortSip ? ':' + dstPortSip : ''}`.toLowerCase();
+                        } else {
+                            // 普通列：直接使用消息对象的字段
+                            msgValue = String(msg[column] || '').toLowerCase();
+                        }
                         if (!msgValue.includes(filterValue.toLowerCase())) {
                             return false;
                         }
@@ -3115,11 +3250,11 @@
             tbody.innerHTML = '';
             
             if (filteredMessages.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="12" style="text-align: center; color: #858585; padding: 20px;">暂无消息</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; color: #858585; padding: 20px;">暂无消息</td></tr>';
                 // 即使没有消息，也添加空白行保持布局一致
                 const spacerRow = document.createElement('tr');
                 spacerRow.className = 'sip-messages-spacer-row';
-                spacerRow.innerHTML = '<td colspan="12"></td>';
+                spacerRow.innerHTML = '<td colspan="10"></td>';
                 tbody.appendChild(spacerRow);
                 return;
             }
@@ -3156,10 +3291,8 @@
                     <td>${escapeHtml(msg.registered_user || '')}</td>
                     <td>${escapeHtml(msg.from_user || '')}</td>
                     <td>${escapeHtml(msg.callee || msg.to_user || '')}</td>
-                    <td>${escapeHtml(msg.src_ip || '')}:${escapeHtml(String(msg.src_port || ''))}</td>
-                    <td>${escapeHtml(msg.dst_ip || '')}:${escapeHtml(String(msg.dst_port || ''))}</td>
-                    <td>${escapeHtml(msg.src_ip_nat || '')}${msg.src_ip_nat && msg.src_port_nat ? ':' + escapeHtml(String(msg.src_port_nat || '')) : ''}</td>
-                    <td>${escapeHtml(msg.dst_ip_nat || '')}${msg.dst_ip_nat && msg.dst_port_nat ? ':' + escapeHtml(String(msg.dst_port_nat || '')) : ''}</td>
+                    <td title="UDP IP层地址">${escapeHtml(msg.src_ip || '')}:${escapeHtml(String(msg.src_port || ''))} → ${escapeHtml(msg.dst_ip || '')}:${escapeHtml(String(msg.dst_port || ''))}</td>
+                    <td title="SIP协议层地址">${escapeHtml(msg.src_ip_nat || msg.src_ip || '')}${(msg.src_ip_nat || msg.src_ip) && (msg.src_port_nat || msg.src_port) ? ':' + escapeHtml(String(msg.src_port_nat || msg.src_port || '')) : ''} → ${escapeHtml(msg.dst_ip_nat || msg.dst_ip || '')}${(msg.dst_ip_nat || msg.dst_ip) && (msg.dst_port_nat || msg.dst_port) ? ':' + escapeHtml(String(msg.dst_port_nat || msg.dst_port || '')) : ''}</td>
                     <td title="${escapeHtml(msg.call_id || '')}">${escapeHtml((msg.call_id || '').substring(0, 20))}${(msg.call_id || '').length > 20 ? '...' : ''}</td>
                     <td title="${escapeHtml(msg.sdp_info || '')}">${escapeHtml(msg.sdp_info || '')}</td>
                 `;

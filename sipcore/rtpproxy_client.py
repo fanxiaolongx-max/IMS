@@ -60,9 +60,28 @@ class RTPProxyClient:
                 print(f"[RTPProxy] 已连接到Unix socket: {self.socket_path}", file=sys.stderr, flush=True)
             elif self.udp_addr:
                 # UDP连接（用于UDP控制socket）
+                # 注意：UDP socket的connect()不会真正建立连接，只是设置默认目标
+                # 真正的连接测试需要在发送命令时进行
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 self.sock.settimeout(self.timeout)
                 self.sock.connect(self.udp_addr)
+                # 测试连接：发送一个测试命令（空命令或ping命令）
+                try:
+                    # 发送一个简单的测试命令来验证RTPProxy是否运行
+                    test_cmd = b"V test-connection test-tag\n"
+                    self.sock.sendall(test_cmd)
+                    # 尝试接收响应（如果RTPProxy未运行，会超时或收到ICMP错误）
+                    self.sock.settimeout(1.0)  # 短暂超时用于测试
+                    try:
+                        response = self.sock.recv(4096)
+                        print(f"[RTPProxy] UDP连接测试成功: {self.udp_addr[0]}:{self.udp_addr[1]}", file=sys.stderr, flush=True)
+                    except socket.timeout:
+                        # 超时可能表示RTPProxy未运行，但继续尝试（可能是正常的，因为test命令可能无效）
+                        print(f"[RTPProxy] UDP socket已创建: {self.udp_addr[0]}:{self.udp_addr[1]} (RTPProxy连接将在首次命令时验证)", file=sys.stderr, flush=True)
+                    finally:
+                        self.sock.settimeout(self.timeout)  # 恢复原始超时
+                except Exception as test_e:
+                    print(f"[RTPProxy-WARN] UDP连接测试异常: {test_e}，将在首次命令时验证", file=sys.stderr, flush=True)
                 print(f"[RTPProxy] 已连接到UDP: {self.udp_addr[0]}:{self.udp_addr[1]}", file=sys.stderr, flush=True)
             elif self.tcp_addr:
                 # TCP连接
@@ -93,7 +112,10 @@ class RTPProxyClient:
             # 发送命令（ng协议需要以换行符结尾）
             if isinstance(command, str):
                 command = command.encode('utf-8')
-            self.sock.sendall(command + b'\n')
+            command_bytes = command + b'\n'
+            # 对于UDP socket，sendall()实际上调用sendto()
+            # 如果RTPProxy未运行，sendto()不会立即报错，但recv()会超时或收到ICMP错误
+            self.sock.sendall(command_bytes)
             
             # 接收响应（rtpproxy响应以换行符结尾）
             response = b''
@@ -110,16 +132,40 @@ class RTPProxyClient:
             return response.decode('utf-8', errors='ignore').strip()
         except socket.timeout:
             print(f"[RTPProxy-ERROR] 命令超时: {command[:50]}", file=sys.stderr, flush=True)
+            print(f"[RTPProxy-ERROR] RTPProxy可能未运行或未响应，请检查:", file=sys.stderr, flush=True)
+            if self.udp_addr:
+                print(f"[RTPProxy-ERROR]  启动命令: rtpproxy -l <server_ip> -s udp:{self.udp_addr[0]}:{self.udp_addr[1]} -F", file=sys.stderr, flush=True)
+            elif self.tcp_addr:
+                print(f"[RTPProxy-ERROR]  启动命令: rtpproxy -l <server_ip> -s tcp:{self.tcp_addr[0]}:{self.tcp_addr[1]} -F", file=sys.stderr, flush=True)
+            raise
+        except ConnectionRefusedError as e:
+            print(f"[RTPProxy-ERROR] 连接被拒绝: {command[:50]}, 错误: {e}", file=sys.stderr, flush=True)
+            print(f"[RTPProxy-ERROR] RTPProxy服务未运行！请启动RTPProxy:", file=sys.stderr, flush=True)
+            if self.udp_addr:
+                print(f"[RTPProxy-ERROR]  启动命令: rtpproxy -l <server_ip> -s udp:{self.udp_addr[0]}:{self.udp_addr[1]} -F", file=sys.stderr, flush=True)
+            elif self.tcp_addr:
+                print(f"[RTPProxy-ERROR]  启动命令: rtpproxy -l <server_ip> -s tcp:{self.tcp_addr[0]}:{self.tcp_addr[1]} -F", file=sys.stderr, flush=True)
             raise
         except Exception as e:
             print(f"[RTPProxy-ERROR] 命令执行失败: {command[:50]}, 错误: {e}", file=sys.stderr, flush=True)
+            # 对于UDP socket，ConnectionRefusedError可能不会立即抛出，而是在recv()时超时
+            # 检查是否是连接问题
+            if "Connection refused" in str(e) or "111" in str(e):
+                print(f"[RTPProxy-ERROR] RTPProxy服务未运行！请启动RTPProxy:", file=sys.stderr, flush=True)
+                if self.udp_addr:
+                    print(f"[RTPProxy-ERROR]  启动命令: rtpproxy -l <server_ip> -s udp:{self.udp_addr[0]}:{self.udp_addr[1]} -F", file=sys.stderr, flush=True)
+                elif self.tcp_addr:
+                    print(f"[RTPProxy-ERROR]  启动命令: rtpproxy -l <server_ip> -s tcp:{self.tcp_addr[0]}:{self.tcp_addr[1]} -F", file=sys.stderr, flush=True)
             # 尝试重连
             try:
                 self.sock.close()
             except:
                 pass
             self.sock = None
-            self._connect()
+            try:
+                self._connect()
+            except:
+                pass  # 重连失败，让上层处理
             raise
     
     def create_offer(self, call_id: str, from_tag: str) -> Optional[int]:
@@ -140,26 +186,25 @@ class RTPProxyClient:
         # RTPProxy rtpp协议格式（INVITE阶段）:
         # V<call_id> <from_tag>
         # 注意：RTPProxy 3.1.1对命令格式很严格，call_id和tag中不能包含空格
-        # 清理call_id和tag，移除可能导致解析错误的字符（空格、换行等）
-        clean_call_id = call_id.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', '')
-        clean_from_tag = from_tag.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', '')
+        # 清理call_id和tag，移除可能导致解析错误的字符（与 create_answer 保持一致）
+        import re
+        clean_call_id = re.sub(r'[^\w\-]', '_', call_id.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', ''))
+        clean_from_tag = re.sub(r'[^\w\-]', '_', from_tag.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', ''))
         # 确保命令格式正确：V后无空格，call_id和tag之间有空格
         cmd = f"V{clean_call_id} {clean_from_tag}".strip()
         print(f"[RTPProxy-DEBUG] Offer命令: {repr(cmd)}", file=sys.stderr, flush=True)
         try:
             response = self._send_command(cmd)
             print(f"[RTPProxy-DEBUG] Offer响应: {repr(response)}", file=sys.stderr, flush=True)
-            # rtpproxy返回格式:
-            # - 成功: <port_number> (分配的RTP端口)
-            # - 失败: V E<error_code>
-            
-            # 检查错误响应
+            # rtpproxy返回格式: 成功为 <port>，失败为 V E<code> 或 <callid_echo> E<code>
+            parts = response.split()
+            if len(parts) >= 2 and parts[-1].startswith('E') and len(parts[-1]) >= 2 and parts[-1][1:].isdigit():
+                print(f"[RTPProxy-ERROR] 创建offer失败: {call_id}, 响应={response} (错误码={parts[-1]})", file=sys.stderr, flush=True)
+                return None
             if response.startswith("V E") or response.startswith("U E"):
                 print(f"[RTPProxy-ERROR] 创建offer失败: {call_id}, 响应={response}", file=sys.stderr, flush=True)
                 return None
             
-            # 解析端口号
-            parts = response.split()
             if len(parts) >= 1:
                 try:
                     port = int(parts[0])
@@ -205,16 +250,18 @@ class RTPProxyClient:
             response = self._send_command(cmd)
             print(f"[RTPProxy-DEBUG] Answer响应: {repr(response)}", file=sys.stderr, flush=True)
             # rtpproxy返回格式:
-            # - 成功: <port_number> (分配的第二个RTP端口)
-            # - 失败: V E<error_code>
-            
-            # 检查错误响应
+            # - 成功: <port_number> 或 <port_number> ...
+            # - 失败: V E<code> 或 U E<code> 或 <call_id_echo> E<code>（如 VEOG88OnvqK E1）
+            parts = response.split()
+            if len(parts) >= 2 and parts[-1].startswith('E') and len(parts[-1]) >= 2 and parts[-1][1:].isdigit():
+                # 错误响应：最后一段为 E0/E1 等
+                print(f"[RTPProxy-ERROR] 创建answer失败: {call_id}, 响应={response} (错误码={parts[-1]})", file=sys.stderr, flush=True)
+                return None
             if response.startswith("V E") or response.startswith("U E"):
                 print(f"[RTPProxy-ERROR] 创建answer失败: {call_id}, 响应={response}", file=sys.stderr, flush=True)
                 return None
             
-            # 解析端口号
-            parts = response.split()
+            # 解析端口号（成功时第一段为数字端口）
             if len(parts) >= 1:
                 try:
                     port = int(parts[0])
@@ -283,10 +330,10 @@ class RTPProxyClient:
         Returns:
             会话ID（端口号），失败返回None
         """
-        # 清理call-id和tag
-        clean_call_id = call_id.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', '')
-        clean_from_tag = from_tag.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', '')
-        clean_to_tag = to_tag.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', '')
+        import re
+        clean_call_id = re.sub(r'[^\w\-]', '_', call_id.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', ''))
+        clean_from_tag = re.sub(r'[^\w\-]', '_', from_tag.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', ''))
+        clean_to_tag = re.sub(r'[^\w\-]', '_', to_tag.replace(' ', '_').replace('\n', '').replace('\r', '').replace('\t', ''))
         
         # U命令格式：U<call_id> <from_tag> <to_tag> <from_ip>:<from_port> <to_ip>:<to_port> <flags>
         cmd = f"U{clean_call_id} {clean_from_tag} {clean_to_tag} {from_addr[0]}:{from_addr[1]} {to_addr[0]}:{to_addr[1]} {flags}".strip()

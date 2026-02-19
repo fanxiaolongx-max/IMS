@@ -5,6 +5,8 @@ import time
 import re
 import socket
 import os
+import subprocess
+import shutil
 
 from sipcore.transport_udp import UDPServer
 from sipcore.transport_tcp import TCPServer
@@ -18,7 +20,14 @@ from sipcore.cdr import init_cdr, get_cdr
 from sipcore.user_manager import init_user_manager, get_user_manager
 from sipcore.sdp_parser import extract_sdp_info, modify_sdp_ip_only
 # 使用RTPProxy媒体中继（替代自定义媒体转发）
-from sipcore.rtpproxy_media_relay import init_media_relay, get_media_relay
+from sipcore.rtpproxy_media_relay import init_media_relay as init_rtpproxy_relay
+
+# 媒体中继实例（由 main() 根据 MEDIA_RELAY_BACKEND 设置为内置或 RTPProxy）
+_media_relay_instance = None
+
+def get_media_relay():
+    """返回当前使用的媒体中继（内置或 RTPProxy）"""
+    return _media_relay_instance
 from sipcore.stun_server import init_stun_server
 from sipcore.sip_message_tracker import init_tracker, get_tracker
 
@@ -47,30 +56,51 @@ def is_private_ip(ip: str) -> bool:
         return False
 
 def get_server_ip():
-    """获取服务器IP地址，优先级：环境变量 > 自动检测 > 默认值"""
+    """获取服务器IP地址，优先级：环境变量 > 配置文件 SERVER_ADDR > 自动检测 > 默认值"""
     # 1. 优先从环境变量读取
     server_ip = os.getenv("SERVER_IP")
     if server_ip:
         log.info(f"[CONFIG] SERVER_IP from environment: {server_ip}")
         return server_ip
     
-    # 2. 自动获取本机IP（连接到外部地址，获取本地IP）
+    # 2. 从配置文件读取 SERVER_ADDR（用于显示和对外宣告）
+    server_addr = None
+    try:
+        server_addr = config_mgr.get("SERVER_ADDR")
+        if server_addr:
+            log.info(f"[CONFIG] SERVER_ADDR from config: {server_addr}（将用于消息跟踪显示）")
+    except Exception as e:
+        log.debug(f"[CONFIG] Failed to read SERVER_ADDR from config: {e}")
+    
+    # 3. 自动获取本机IP（连接到外部地址，获取本地IP）
+    detected_ip = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        server_ip = s.getsockname()[0]
+        detected_ip = s.getsockname()[0]
         s.close()
-        
-        # 私网 IP：本地/内网部署，直接使用即可；公网 IP：多为云服务器
+    except Exception as e:
+        log.warning(f"[CONFIG] Failed to auto-detect IP: {e}")
+    
+    # 4. 决定使用哪个IP
+    if server_addr:
+        # 如果配置了 SERVER_ADDR，使用配置的公网地址（用于显示和对外宣告）
+        server_ip = server_addr
+        if detected_ip:
+            log.info(f"[CONFIG] 使用配置的公网地址: {server_ip}（内网IP: {detected_ip}）")
+        else:
+            log.info(f"[CONFIG] 使用配置的公网地址: {server_ip}")
+        return server_ip
+    elif detected_ip:
+        # 如果没有配置 SERVER_ADDR，使用检测到的IP
+        server_ip = detected_ip
         if is_private_ip(server_ip):
             log.info(f"[CONFIG] 使用本机内网 IP: {server_ip}（适合本地/内网部署）")
         else:
-            log.info(f"[CONFIG] SERVER_IP 自动检测为公网: {server_ip}；内网部署可设置 SERVER_IP=内网IP")
+            log.info(f"[CONFIG] SERVER_IP 自动检测为公网: {server_ip}；内网部署可设置 SERVER_ADDR=公网IP")
         return server_ip
-    except Exception as e:
-        log.warning(f"[CONFIG] Failed to auto-detect IP: {e}, using default")
     
-    # 3. 回退到默认值
+    # 5. 回退到默认值
     default_ip = "192.168.100.8"
     log.warning(f"[CONFIG] SERVER_IP using default: {default_ip}")
     return default_ip
@@ -87,14 +117,14 @@ def advertised_sip_port():
 
 def _is_our_via(host: str, port) -> bool:
     """是否为本机插入的 Via（含隧道 advertised 地址）"""
-    # 检查是否匹配服务器IP和端口
-    if host == SERVER_IP and port == SERVER_PORT:
+    # 优先检查 advertised 地址（公网地址或隧道地址）
+    if host == advertised_sip_host() and port == advertised_sip_port():
         return True
     # 检查是否匹配公网地址（Cloudflare隧道等）
     if SERVER_PUBLIC_HOST and host == SERVER_PUBLIC_HOST:
         return port == (SERVER_PUBLIC_PORT or SERVER_PORT)
-    # 检查是否匹配 advertised 地址
-    if host == advertised_sip_host() and port == advertised_sip_port():
+    # 检查是否匹配服务器IP和端口（内网IP，用于兼容性）
+    if host == SERVER_IP and port == SERVER_PORT:
         return True
     return False
 
@@ -105,7 +135,7 @@ def _server_uri():
 def _local_sip_uri():
     """本机实际监听的 SIP URI（SERVER_IP:SERVER_PORT），用于让主叫把 ACK 发到本机 UDP。与 _server_uri() 不同：隧道模式下 _server_uri 为 hostname:443，ACK 发往隧道收不到。"""
     return f"sip:{SERVER_IP}:{SERVER_PORT};lr"
-SERVER_URI = f"sip:{SERVER_IP}:{SERVER_PORT};lr"   # 默认，启动后若启用隧道会按 advertised 覆盖
+SERVER_URI = f"sip:{advertised_sip_host()}:{advertised_sip_port()};lr"   # 使用公网地址，启动后若启用隧道会按 advertised 覆盖
 ALLOW = "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE, REFER, NOTIFY, SUBSCRIBE, MESSAGE, REGISTER"
 
 # 网络环境配置
@@ -142,9 +172,23 @@ INVITE_BRANCHES: dict[str, str] = {}
 # 当收到 INVITE 的最终响应时，记录状态码，用于后续 ACK 类型判断
 LAST_RESPONSE_STATUS: dict[str, str] = {}
 
+# 200 OK Contact头追踪：Call-ID -> Contact头地址（用于确保ACK的Request-URI正确）
+# RFC 3261: 2xx ACK的Request-URI应该使用200 OK的Contact头地址
+LAST_200_OK_CONTACT: dict[str, str] = {}
+
 # CANCEL 转发去重：Call-ID -> 上次转发时间戳
 # 避免对同一 CANCEL 重传进行重复转发，产生无意义的流量
 CANCEL_FORWARDED: dict[str, float] = {}
+
+# ACK 转发去重：Call-ID + CSeq -> 上次转发时间戳
+# 根据 RFC 3261，ACK 消息不应该重传，限制重传次数为 0（只转发一次）
+# 使用 Call-ID + CSeq 作为唯一标识，因为同一个 Call-ID 可能有多个 ACK（例如 re-INVITE 的 ACK）
+ACK_FORWARDED: dict[str, float] = {}
+
+# BYE 转发去重：Call-ID + CSeq -> 上次转发时间戳
+# 根据 RFC 3261，BYE 请求可以重传，但限制重传次数（避免无限重传）
+# 使用 Call-ID + CSeq + 源地址作为唯一标识
+BYE_FORWARDED: dict[str, float] = {}
 
 
 def _track_tx_response(resp, addr, direction: str = "TX"):
@@ -163,21 +207,101 @@ def _track_tx_response(resp, addr, direction: str = "TX"):
         log.debug(f"[SIP-TRACKER] 记录 TX 失败: {e}")
 
 # B2BUA 媒体模式：
-#   "relay"    - 媒体中继模式：使用RTPProxy进行媒体转发（推荐）
-#   "passthrough" - 媒体透传模式：SDP 原样透传，RTP 直接在主被叫间传输（用于排查终端问题）
-#   False      - 禁用，使用普通 Proxy 模式
-MEDIA_MODE = "passthrough"  # relay=媒体中继(使用RTPProxy), passthrough=透传(仅同网段可用)
-ENABLE_MEDIA_RELAY = (MEDIA_MODE == "relay")  # 只有 relay 模式才启用媒体中继，passthrough 模式应该透传 SDP
+#   "relay"    - 媒体中继模式：RTP/RTCP 经服务器转发（需下面二选一）
+#   "passthrough" - 媒体透传模式：SDP 原样透传，RTP 直接在主被叫间传输（仅同网段可用）
+MEDIA_MODE = "relay"
+ENABLE_MEDIA_RELAY = (MEDIA_MODE == "relay")
 
-# RTPProxy配置
+# 媒体中继后端（仅 relay 模式有效）：
+#   "rtpproxy" - 使用外部 RTPProxy 进程做 RTP/RTCP 转发（需安装 rtpproxy）
+#   "builtin"  - 使用 IMS 内置转发（不依赖 RTPProxy，推荐）
+MEDIA_RELAY_BACKEND = os.getenv("MEDIA_RELAY_BACKEND", "builtin").strip().lower()
+if MEDIA_RELAY_BACKEND not in ("rtpproxy", "builtin"):
+    MEDIA_RELAY_BACKEND = "builtin"
+
+# RTPProxy配置（仅当 MEDIA_RELAY_BACKEND=rtpproxy 时使用）
 # 注意：RTPProxy使用UDP控制socket，不是TCP
 RTPPROXY_UDP_HOST = os.getenv("RTPPROXY_UDP_HOST", "127.0.0.1")
 RTPPROXY_UDP_PORT = int(os.getenv("RTPPROXY_UDP_PORT", "7722"))
 RTPPROXY_UDP = (RTPPROXY_UDP_HOST, RTPPROXY_UDP_PORT)
+# 是否随 IMS 主程序一起启动 RTPProxy（True=自动启动，False=需单独启动 rtpproxy）
+RTPPROXY_AUTO_START = os.getenv("RTPPROXY_AUTO_START", "1").strip().lower() in ("1", "true", "yes")
 # 保留TCP配置用于兼容性（如果将来需要）
 RTPPROXY_TCP_HOST = os.getenv("RTPPROXY_TCP_HOST", "127.0.0.1")
 RTPPROXY_TCP_PORT = int(os.getenv("RTPPROXY_TCP_PORT", "7722"))
 RTPPROXY_TCP = (RTPPROXY_TCP_HOST, RTPPROXY_TCP_PORT)
+
+
+def start_rtpproxy_if_needed(server_ip: str) -> subprocess.Popen | None:
+    """
+    若启用媒体中继且配置为自动启动，则启动 RTPProxy 子进程。
+    若 127.0.0.1:7722 已被占用则视为已有 RTPProxy 在运行，不重复启动。
+    返回已启动的进程（由本函数启动的），否则返回 None。
+    """
+    if not ENABLE_MEDIA_RELAY or MEDIA_RELAY_BACKEND != "rtpproxy" or not RTPPROXY_AUTO_START:
+        return None
+    host, port = RTPPROXY_UDP_HOST, RTPPROXY_UDP_PORT
+    # 检查控制端口是否已被占用（已有 rtpproxy 在跑）
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
+        s.connect((host, port))
+        s.send(b"V ping pong\n")
+        s.recv(256)
+        s.close()
+        log.info(f"[RTPProxy] 检测到已有 RTPProxy 在 {host}:{port} 运行，跳过自动启动")
+        return None
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        pass
+    # 查找 rtpproxy 可执行文件
+    rtpproxy_bin = shutil.which("rtpproxy")
+    if not rtpproxy_bin:
+        log.warning("[RTPProxy] 未找到 rtpproxy 可执行文件，请单独启动 RTPProxy 或安装 rtpproxy")
+        return None
+    cmd = [
+        rtpproxy_bin,
+        "-l", server_ip,
+        "-s", f"udp:{host}:{port}",
+        "-F",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        # 等待控制 socket 就绪
+        for _ in range(25):
+            time.sleep(0.2)
+            if proc.poll() is not None:
+                err = (proc.stderr.read() or b"").decode("utf-8", errors="ignore")
+                log.error(f"[RTPProxy] 进程已退出: {err or proc.returncode}")
+                return None
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.3)
+                s.connect((host, port))
+                s.send(b"V ping pong\n")
+                s.recv(256)
+                s.close()
+                break
+            except (socket.timeout, ConnectionRefusedError, OSError):
+                continue
+        else:
+            log.warning("[RTPProxy] 启动超时，请检查端口是否被占用")
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+            return None
+        log.info(f"[RTPProxy] 已随 IMS 启动: {rtpproxy_bin} -l {server_ip} -s udp:{host}:{port} -F")
+        return proc
+    except Exception as e:
+        log.error(f"[RTPProxy] 自动启动失败: {e}")
+        return None
+
 
 # ====== STUN 配置 ======
 # STUN 服务器配置（用于 NAT 穿透辅助）
@@ -527,7 +651,14 @@ def _is_initial_request(msg: SIPMessage) -> bool:
     to = msg.get("to") or ""
     has_tag = "tag=" in to
     routes = msg.headers.get("route", [])
-    targeted_us = any(SERVER_IP in r or str(SERVER_PORT) in r for r in routes)
+    # 检查Route头是否指向我们（公网地址或内网地址）
+    advertised_host = advertised_sip_host()
+    advertised_port = advertised_sip_port()
+    targeted_us = any(
+        SERVER_IP in r or str(SERVER_PORT) in r or 
+        advertised_host in r or str(advertised_port) in r 
+        for r in routes
+    )
     return (not has_tag) or targeted_us  # 宽松判断即可
 
 def _strip_our_top_route_and_get_next(msg: SIPMessage) -> None:
@@ -535,7 +666,11 @@ def _strip_our_top_route_and_get_next(msg: SIPMessage) -> None:
     if not routes:
         return
     top = routes[0]
-    if SERVER_IP in top or str(SERVER_PORT) in top:
+    advertised_host = advertised_sip_host()
+    advertised_port = advertised_sip_port()
+    # 检查Route头是否指向我们（公网地址或内网地址）
+    if (SERVER_IP in top or str(SERVER_PORT) in top or 
+        advertised_host in top or str(advertised_port) in top):
         routes.pop(0)
         if routes:
             msg.headers["route"] = routes
@@ -702,6 +837,46 @@ def _forward_request(msg: SIPMessage, addr, transport):
     call_id = msg.get("call-id")
     if method == "ACK":
         log.info(f"[ACK-FWD-ENTRY] Processing ACK, Call-ID: {call_id}, from: {addr}")
+        
+        # ACK 重传限制：根据 RFC 3261，ACK 消息不应该重传
+        # 使用 Call-ID + CSeq + 源地址作为唯一标识，因为同一个 Call-ID 可能有多个 ACK（例如 re-INVITE 的 ACK）
+        # 注意：只在成功转发后才记录，避免误判首次收到的 ACK 为重传
+        if call_id:
+            cseq = msg.get("cseq") or ""
+            # 使用源地址区分不同方向的 ACK（主叫->服务器->被叫 和 被叫->服务器->主叫）
+            ack_key = f"{call_id}:{cseq}:{addr[0]}:{addr[1]}"
+            now_ack = time.time()
+            last_fwd = ACK_FORWARDED.get(ack_key)
+            if last_fwd and (now_ack - last_fwd) < 32.0:
+                # 32秒内（Timer F）的重传，直接丢弃，不转发也不响应
+                # RFC 3261: ACK 是无状态消息，不需要响应
+                log.debug(f"[ACK-DEDUP] Suppressed ACK retransmission for Call-ID: {call_id}, CSeq: {cseq}, from: {addr}")
+                return
+            
+            # 清理过期的 ACK 记录（超过 32 秒的记录）
+            expired_keys = [k for k, t in ACK_FORWARDED.items() if (now_ack - t) >= 32.0]
+            for k in expired_keys:
+                del ACK_FORWARDED[k]
+    elif method == "BYE":
+        log.info(f"[BYE-FWD-ENTRY] Processing BYE, Call-ID: {call_id}, from: {addr}")
+        
+        # BYE 重传限制：根据 RFC 3261，BYE 请求可以重传，但限制重传次数（避免无限重传）
+        # 使用 Call-ID + CSeq + 源地址作为唯一标识
+        if call_id:
+            cseq = msg.get("cseq") or ""
+            bye_key = f"{call_id}:{cseq}:{addr[0]}:{addr[1]}"
+            now_bye = time.time()
+            last_fwd = BYE_FORWARDED.get(bye_key)
+            if last_fwd and (now_bye - last_fwd) < 32.0:
+                # 32秒内（Timer F）的重传，直接丢弃，不转发也不响应
+                # 如果200 OK响应字段不规范导致主叫重传BYE，这里会抑制重传
+                log.debug(f"[BYE-DEDUP] Suppressed BYE retransmission for Call-ID: {call_id}, CSeq: {cseq}, from: {addr}")
+                return
+            
+            # 清理过期的 BYE 记录（超过 32 秒的记录）
+            expired_keys = [k for k, t in BYE_FORWARDED.items() if (now_bye - t) >= 32.0]
+            for k in expired_keys:
+                del BYE_FORWARDED[k]
 
     # 忽略/丢弃 Max-Forwards<=0
     if not _decrement_max_forwards(msg):
@@ -1044,8 +1219,17 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 log.warning(f"[ACK-WARNING] Non-2xx ACK for Call-ID {call_id} but INVITE_BRANCHES not found! Cannot add server Via. This may cause the callee to not recognize the ACK.")
                 log.debug(f"[ACK-STATELESS] Non-2xx ACK: Forwarding without adding Via (INVITE_BRANCHES missing)")
         else:
-            # 2xx ACK：无状态转发，不修改 Via（正常对话建立后的 ACK，不需要匹配原始 INVITE）
-            log.debug(f"[ACK-STATELESS] 2xx ACK: Forwarding without adding Via (stateless proxy mode)")
+            # 2xx ACK：根据RFC 3261应该是无状态转发，但为了确保被叫能识别ACK来自代理，
+            # 我们也添加服务器Via头（使用INVITE的branch，如果存在）
+            if call_id and call_id in INVITE_BRANCHES:
+                branch = INVITE_BRANCHES[call_id]
+                _add_top_via(msg, branch)
+                log.info(f"[ACK-2XX-VIA] 2xx ACK: Added server Via with INVITE branch {branch} to help callee recognize ACK")
+            else:
+                # 如果没有INVITE branch，生成新的branch并添加Via
+                branch = f"z9hG4bK-{gen_tag(10)}"
+                _add_top_via(msg, branch)
+                log.info(f"[ACK-2XX-VIA] 2xx ACK: Added server Via with new branch {branch} (INVITE branch not found)")
 
     # 确定下一跳：优先 Route，否则用 Request-URI
     next_hop = None
@@ -1061,6 +1245,23 @@ def _forward_request(msg: SIPMessage, addr, transport):
     # RFC 3261: 2xx ACK 的 Request-URI 应该使用 200 OK 的 Contact 头地址
     # 但主叫可能使用错误的地址，所以优先使用 DIALOGS 中保存的实际被叫地址
     if method == "ACK" and is_2xx_ack and call_id:
+        # 确保ACK的Request-URI与200 OK的Contact头匹配
+        if call_id in LAST_200_OK_CONTACT:
+            contact_uri = LAST_200_OK_CONTACT[call_id]
+            current_ruri = msg.start_line.split()[1] if len(msg.start_line.split()) > 1 else ""
+            # 比较时忽略大小写和空格
+            current_ruri_normalized = current_ruri.lower().strip()
+            contact_uri_normalized = contact_uri.lower().strip()
+            if current_ruri_normalized != contact_uri_normalized:
+                # 修改Request-URI以匹配200 OK的Contact头
+                parts = msg.start_line.split()
+                original_ruri = parts[1]
+                parts[1] = contact_uri
+                msg.start_line = " ".join(parts)
+                log.info(f"[ACK-R-URI-FIX] Fixed ACK Request-URI to match 200 OK Contact: {original_ruri} -> {contact_uri}")
+            else:
+                log.debug(f"[ACK-R-URI-CHECK] ACK Request-URI already matches 200 OK Contact: {current_ruri}")
+        
         if call_id in DIALOGS:
             caller_addr, callee_addr = DIALOGS[call_id]
             # 发往“另一端”：ACK 来自 caller 则发往 callee，来自 callee 则发往 caller（避免 re-INVITE 200 的 ACK 被发回主叫导致 405）
@@ -1364,59 +1565,69 @@ def _forward_request(msg: SIPMessage, addr, transport):
             has_to_tag = "tag=" in to_header
             if not has_to_tag:  # 初始 INVITE
                 sdp_body = msg.body.decode('utf-8', errors='ignore') if isinstance(msg.body, bytes) else msg.body
+                # 提取原始SDP IP用于诊断
+                import re
+                original_ip_match = re.search(r'c=IN IP4 (\S+)', sdp_body)
+                original_ip = original_ip_match.group(1) if original_ip_match else "unknown"
                 # 将主叫的 SDP IP 改为信令地址（NAT 后地址），端口保持不变
                 new_sdp = modify_sdp_ip_only(sdp_body, addr[0])
                 msg.body = new_sdp.encode('utf-8') if isinstance(msg.body, bytes) else new_sdp
                 if 'content-length' in msg.headers:
                     msg.headers['content-length'] = [str(len(msg.body) if isinstance(msg.body, bytes) else len(msg.body.encode('utf-8')))]
-                log.debug(f"[PASSTHROUGH] INVITE SDP IP 改为信令地址: {addr[0]}（主被叫将直接互通）")
+                log.info(f"[PASSTHROUGH] INVITE SDP IP 修改: {original_ip} -> {addr[0]}（主叫信令地址），Call-ID: {call_id}")
+                log.info(f"[PASSTHROUGH] 注意：如果主被叫在不同NAT后，passthrough模式可能导致单通，建议使用relay模式")
         except Exception as e:
             log.warning(f"[PASSTHROUGH] INVITE SDP 修改失败: {e}")
 
-    # B2BUA 模式：转发 INVITE 前修改 SDP（确保被叫收到普通RTP SDP）
+    # B2BUA 模式：转发 INVITE/re-INVITE 前修改 SDP（初始指向B-leg，re-INVITE 按转发目标选 A/B-leg）
     if method == "INVITE" and call_id and ENABLE_MEDIA_RELAY and msg.body:
         try:
             to_header = msg.get("to") or ""
             has_to_tag = "tag=" in to_header
-            if not has_to_tag:
-                # 初始 INVITE：修改 SDP 为普通RTP并指向B2BUA媒体B-leg端口（被叫发媒体到这里）
-                media_relay = get_media_relay()
-                if media_relay:
-                    sdp_body = msg.body.decode('utf-8', errors='ignore') if isinstance(msg.body, bytes) else msg.body
+            # 初始 INVITE 或 re-INVITE 都走媒体中继 SDP 修改
+            media_relay = get_media_relay()
+            if media_relay:
+                sdp_body = msg.body.decode('utf-8', errors='ignore') if isinstance(msg.body, bytes) else msg.body
+                if not has_to_tag:
                     log.info(f"[B2BUA-DEBUG] 转发INVITE前原始SDP:\n{sdp_body[:500]}...")
-                    try:
-                        # 提取主被叫号码和from_tag
-                        from_header = msg.get("from") or ""
-                        caller_number = _extract_number_from_uri(from_header)
-                        callee_number = _extract_number_from_uri(to_header)
+                try:
+                    from_header = msg.get("from") or ""
+                    caller_number = _extract_number_from_uri(from_header)
+                    callee_number = _extract_number_from_uri(to_header)
+                    if not has_to_tag:
                         log.info(f"[B2BUA] 提取号码: 主叫={caller_number}, 被叫={callee_number}")
-                        
-                        # 提取from_tag用于RTPProxy offer命令
-                        from_tag = None
-                        if "tag=" in from_header:
-                            from_tag = from_header.split("tag=")[1].split(";")[0].split(">")[0].strip()
+                    from_tag = None
+                    if "tag=" in from_header:
+                        from_tag = from_header.split("tag=")[1].split(";")[0].split(">")[0].strip()
+                        if not has_to_tag:
                             log.info(f"[B2BUA] INVITE阶段提取from_tag: {from_tag}")
-                        
-                        # 使用 process_invite_to_callee 修改SDP指向B-leg端口，同时保存A-leg信息和号码
-                        # 在INVITE阶段发送RTPProxy offer命令
-                        new_sdp, session = media_relay.process_invite_to_callee(
-                            call_id, sdp_body, addr, 
-                            caller_number=caller_number, 
-                            callee_number=callee_number,
-                            from_tag=from_tag
-                        )
-                        if session:
-                            msg.body = new_sdp.encode('utf-8') if isinstance(msg.body, bytes) else new_sdp
-                            if 'content-length' in msg.headers:
-                                msg.headers['content-length'] = [str(len(msg.body) if isinstance(msg.body, bytes) else len(msg.body.encode('utf-8')))]
-                            log.info(f"[B2BUA] INVITE SDP 修改为普通RTP: {call_id} -> B-leg端口 {session.b_leg_rtp_port}")
+                    # 转发给被叫用 B-leg，转发给主叫用 A-leg（re-INVITE 时）
+                    forward_to_callee = True
+                    if has_to_tag and call_id in DIALOGS:
+                        caller_addr, callee_addr = DIALOGS[call_id]
+                        forward_to_callee = ((host, port) == (callee_addr[0], callee_addr[1]))
+                        log.info(f"[B2BUA] re-INVITE 转发目标: {host}:{port}, forward_to_callee={forward_to_callee}")
+                    new_sdp, session = media_relay.process_invite_to_callee(
+                        call_id, sdp_body, addr,
+                        caller_number=caller_number,
+                        callee_number=callee_number,
+                        from_tag=from_tag,
+                        forward_to_callee=forward_to_callee,
+                    )
+                    if session:
+                        msg.body = new_sdp.encode('utf-8') if isinstance(msg.body, bytes) else new_sdp
+                        if 'content-length' in msg.headers:
+                            msg.headers['content-length'] = [str(len(msg.body) if isinstance(msg.body, bytes) else len(msg.body.encode('utf-8')))]
+                        leg = "B-leg" if forward_to_callee else "A-leg"
+                        log.info(f"[B2BUA] INVITE SDP 修改为{leg}端口: {call_id} -> 音频 {session.b_leg_rtp_port if forward_to_callee else session.a_leg_rtp_port}")
+                        if not has_to_tag:
                             log.info(f"[B2BUA-DEBUG] 转发INVITE后SDP:\n{new_sdp[:500]}...")
-                        else:
-                            log.error(f"[B2BUA] 会话创建失败: {call_id}")
-                    except Exception as inner_e:
-                        log.error(f"[B2BUA] process_invite_to_callee异常: {inner_e}")
-                        import traceback
-                        log.error(traceback.format_exc())
+                    else:
+                        log.error(f"[B2BUA] 会话创建失败: {call_id}")
+                except Exception as inner_e:
+                    log.error(f"[B2BUA] process_invite_to_callee异常: {inner_e}")
+                    import traceback
+                    log.error(traceback.format_exc())
         except Exception as e:
             log.error(f"[B2BUA] 转发INVITE时SDP修改失败: {e}")
     
@@ -1435,8 +1646,28 @@ def _forward_request(msg: SIPMessage, addr, transport):
             log.debug(f"[FWD-FULL] Failed to decode message: {e}")
         
         msg_bytes = msg.to_bytes()
-        transport.sendto(msg_bytes, (host, port))
-        log.fwd(method, (host, port), f"R-URI={msg.start_line.split()[1]}")
+        try:
+            transport.sendto(msg_bytes, (host, port))
+            log.fwd(method, (host, port), f"R-URI={msg.start_line.split()[1]}")
+            
+            # ACK/BYE 转发成功后记录到对应的字典（用于重传检测）
+            # 注意：必须在成功转发后才记录，避免误判首次收到的消息为重传
+            if method == "ACK" and call_id:
+                cseq = msg.get("cseq") or ""
+                ack_key = f"{call_id}:{cseq}:{addr[0]}:{addr[1]}"
+                ACK_FORWARDED[ack_key] = time.time()
+                log.debug(f"[ACK-FWD-RECORD] Recorded ACK forwarding: Call-ID={call_id}, CSeq={cseq}, from={addr}, to={host}:{port}")
+            elif method == "BYE" and call_id:
+                cseq = msg.get("cseq") or ""
+                bye_key = f"{call_id}:{cseq}:{addr[0]}:{addr[1]}"
+                BYE_FORWARDED[bye_key] = time.time()
+                log.debug(f"[BYE-FWD-RECORD] Recorded BYE forwarding: Call-ID={call_id}, CSeq={cseq}, from={addr}, to={host}:{port}")
+        except OSError as e:
+            # 转发失败，不记录到 ACK_FORWARDED，允许重试
+            log.error(f"[FWD-ERROR] Failed to forward {method} to {host}:{port}: {e}")
+            if method == "ACK":
+                log.warning(f"[ACK-FWD-ERROR] ACK forwarding failed, will not record to ACK_FORWARDED (allowing retry)")
+            return
         
         # SIP 消息跟踪：记录转发的请求（包装在 try-except 中避免递归错误影响转发）
         # FWD 消息：源地址是服务器地址，目的地址是转发目标地址
@@ -1454,9 +1685,19 @@ def _forward_request(msg: SIPMessage, addr, transport):
                     # 打印 ACK 的关键信息
                     ack_ruri = msg.start_line.split()[1] if len(msg.start_line.split()) > 1 else ""
                     ack_routes = msg.headers.get("route", [])
-                    log.info(f"[ACK-FWD] ACK R-URI: {ack_ruri}, Route count: {len(ack_routes)}")
+                    ack_vias = msg.headers.get("via", [])
+                    ack_cseq = msg.get("cseq") or ""
+                    log.info(f"[ACK-FWD] ACK R-URI: {ack_ruri}, Route count: {len(ack_routes)}, Via count: {len(ack_vias)}, CSeq: {ack_cseq}")
                     if ack_routes:
                         log.info(f"[ACK-FWD] ACK Route headers: {ack_routes}")
+                    if ack_vias:
+                        log.info(f"[ACK-FWD] ACK Via headers: {ack_vias[:2]}")  # 只打印前2个Via头
+                    # 检查200 OK的Contact头是否匹配
+                    if call_id in LAST_200_OK_CONTACT:
+                        expected_contact = LAST_200_OK_CONTACT[call_id]
+                        log.info(f"[ACK-FWD] Expected 200 OK Contact: {expected_contact}, ACK R-URI: {ack_ruri}")
+                        if ack_ruri.lower().strip() != expected_contact.lower().strip():
+                            log.warning(f"[ACK-FWD] WARNING: ACK R-URI does not match 200 OK Contact! R-URI: {ack_ruri}, Contact: {expected_contact}")
                 tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg_bytes)
                 if method == "ACK":
                     log.info(f"[ACK-TRACKER] ACK recorded as FWD: Call-ID={call_id}, from={SERVER_IP}:{SERVER_PORT}, to={host}:{port}, is_2xx_ack={is_2xx_ack}")
@@ -1579,10 +1820,13 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 if call_id in INVITE_BRANCHES:
                     del INVITE_BRANCHES[call_id]
                     log.debug(f"[BRANCH-CLEANUP] Cleaned up INVITE_BRANCHES after forwarding non-2xx ACK for Call-ID: {call_id}")
-            # 清理最后响应状态
+            # 清理最后响应状态和200 OK Contact头
             if call_id in LAST_RESPONSE_STATUS:
                 del LAST_RESPONSE_STATUS[call_id]
                 log.debug(f"[LAST-RESP-STATUS] Cleaned up last response status for Call-ID: {call_id}")
+            if call_id in LAST_200_OK_CONTACT:
+                del LAST_200_OK_CONTACT[call_id]
+                log.debug(f"[LAST-200-OK-CONTACT] Cleaned up 200 OK Contact for Call-ID: {call_id}")
             
     except OSError as e:
         # 网络错误：目标主机不可达
@@ -1657,7 +1901,7 @@ def _forward_response(resp: SIPMessage, addr, transport):
     # 增强日志：记录完整的 Via 头内容
     log.debug(f"[RESP-VIA] Response {status_code} (Call-ID: {call_id_resp}) | Via count: {len(split_vias)} | Top Via: {top[:100]}")
     
-    if not top or (f"{SERVER_IP}:{SERVER_PORT}" not in top and (not SERVER_PUBLIC_HOST or f"{advertised_sip_host()}:{advertised_sip_port()}" not in top)):
+    if not top or (f"{advertised_sip_host()}:{advertised_sip_port()}" not in top and f"{SERVER_IP}:{SERVER_PORT}" not in top):
         # 调试：记录为什么不转发
         log.debug(f"[RESP-SKIP] Response {status_code} not forwarded: top Via '{top[:100] if top else 'EMPTY'}' does not match our Via | Call-ID: {call_id_resp}")
         return
@@ -1837,6 +2081,64 @@ def _forward_response(resp: SIPMessage, addr, transport):
             if not existing_route or existing_route[0] != local_uri:
                 resp.headers["route"] = [local_uri] + list(existing_route)
                 log.info(f"[ACK-WAIT] 200 OK 已插入 Route {local_uri}，便于主叫将 ACK 发往本机")
+            
+            # 200 OK SDP 修改必须在序列化并发送前执行，否则转发的 200 仍是原始 SDP
+            if resp.body:
+                # Passthrough 模式：修改 200 OK SDP IP 为被叫信令地址
+                if MEDIA_MODE == "passthrough":
+                    try:
+                        sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
+                        import re
+                        original_ip_match = re.search(r'c=IN IP4 (\S+)', sdp_body)
+                        original_ip = original_ip_match.group(1) if original_ip_match else "unknown"
+                        new_sdp = modify_sdp_ip_only(sdp_body, addr[0])
+                        resp.body = new_sdp.encode('utf-8') if isinstance(resp.body, bytes) else new_sdp
+                        if 'content-length' in resp.headers:
+                            resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
+                        log.info(f"[PASSTHROUGH] 200 OK SDP IP 修改: {original_ip} -> {addr[0]}（被叫信令地址），Call-ID: {call_id}")
+                    except Exception as e:
+                        log.warning(f"[PASSTHROUGH] 200 OK SDP 修改失败: {e}")
+                # B2BUA/relay 模式：修改 200 OK SDP 为服务器 B-leg 地址端口
+                elif ENABLE_MEDIA_RELAY:
+                    media_relay = get_media_relay()
+                    if media_relay:
+                        try:
+                            session = media_relay._sessions.get(call_id)
+                            already_started = session and session.started_at is not None
+                            sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
+                            # 200 OK 发给主叫用 A-leg，发给被叫用 B-leg（如 re-INVITE 的应答）
+                            response_to_caller = True
+                            if call_id in DIALOGS:
+                                caller_addr, callee_addr = DIALOGS[call_id]
+                                response_to_caller = ((nhost, nport) == (caller_addr[0], caller_addr[1]))
+                            new_sdp, success = media_relay.process_answer_sdp(
+                                call_id, sdp_body, addr, response_to_caller=response_to_caller
+                            )
+                            if success:
+                                resp.body = new_sdp.encode('utf-8') if isinstance(resp.body, bytes) else new_sdp
+                                if 'content-length' in resp.headers:
+                                    resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
+                                log.info(f"[B2BUA] 200 OK SDP 已修改为服务器地址端口（发送前），Call-ID: {call_id}")
+                                if not already_started:
+                                    try:
+                                        from_header = resp.get("from") or ""
+                                        to_header = resp.get("to") or ""
+                                        from_tag = from_header.split("tag=")[1].split(";")[0].split(">")[0].strip() if "tag=" in from_header else None
+                                        to_tag = to_header.split("tag=")[1].split(";")[0].split(">")[0].strip() if "tag=" in to_header else None
+                                        success = media_relay.start_media_forwarding(call_id, from_tag=from_tag, to_tag=to_tag)
+                                        if success:
+                                            log.info(f"[B2BUA] 媒体转发已启动: {call_id}")
+                                            media_relay.print_media_diagnosis(call_id)
+                                        else:
+                                            log.warning(f"[B2BUA] 媒体转发启动失败: {call_id} (RTPProxy answer 命令可能失败，请检查 RTPProxy 服务是否运行)")
+                                    except Exception as start_e:
+                                        log.error(f"[B2BUA] 启动媒体转发异常: {call_id}, error={start_e}")
+                                        import traceback
+                                        log.error(traceback.format_exc())
+                        except Exception as e:
+                            log.error(f"[B2BUA] 200 OK SDP 修改失败: {e}")
+                            import traceback
+                            log.error(traceback.format_exc())
         
         # 打印完整的 SIP 响应内容（转发前）
         try:
@@ -1846,6 +2148,24 @@ def _forward_response(resp: SIPMessage, addr, transport):
             log.debug(f"[FWD-RESP-FULL] Failed to decode response: {e}")
         
         resp_bytes = resp.to_bytes()
+        # 详细日志：记录200 OK转发的完整信息，用于诊断重传问题
+        if status_code == "200":
+            call_id_header = resp.get("call-id") or ""
+            cseq_header = resp.get("cseq") or ""
+            via_headers = resp.headers.get("via", [])
+            is_bye_response = "BYE" in cseq_header
+            log.info(f"[200-FWD-DEBUG] Forwarding 200 OK: Call-ID={call_id_header}, CSeq={cseq_header}, Via count={len(via_headers)}, to={nhost}:{nport}, is_INVITE={is_invite_response}, is_BYE={is_bye_response}")
+            if via_headers:
+                log.info(f"[200-FWD-DEBUG] Top Via: {via_headers[0] if via_headers else 'N/A'}")
+            # 检查Call-ID和CSeq头字段格式（确保规范化）
+            call_id_raw = resp.headers.get("call-id", [])
+            cseq_raw = resp.headers.get("cseq", [])
+            log.debug(f"[200-FWD-DEBUG] Call-ID header format: {call_id_raw}, CSeq header format: {cseq_raw}")
+            # 对于BYE的200 OK，检查From/To tag是否正确
+            if is_bye_response:
+                from_header = resp.get("from") or ""
+                to_header = resp.get("to") or ""
+                log.info(f"[200-FWD-DEBUG] BYE 200 OK From: {from_header}, To: {to_header}")
         transport.sendto(resp_bytes, (nhost, nport))
         log.fwd(f"RESP {resp.start_line}", (nhost, nport))
         
@@ -1879,13 +2199,38 @@ def _forward_response(resp: SIPMessage, addr, transport):
                 # 如果是 200 OK，提示等待 ACK
                 if status_code == "200":
                     log.info(f"[ACK-WAIT] Waiting for ACK for Call-ID {call_id} (200 OK sent to {nhost}:{nport})")
-                    # 打印 200 OK 的 Contact 头，用于调试 ACK 路由
+                    # 打印 200 OK 的关键信息，用于调试 ACK 路由
                     contact = resp.get("contact") or ""
+                    cseq_header = resp.get("cseq") or ""
+                    call_id_header = resp.get("call-id") or ""
                     log.info(f"[ACK-WAIT] 200 OK Contact header: {contact}")
+                    log.info(f"[ACK-WAIT] 200 OK CSeq: {cseq_header}, Call-ID: {call_id_header}")
+                    
+                    # 保存200 OK的Contact头，用于确保ACK的Request-URI正确
+                    if contact:
+                        # 提取Contact URI（保留完整URI，包括transport等参数）
+                        import re
+                        contact_match = re.search(r'<([^>]+)>', contact)
+                        if contact_match:
+                            contact_uri = contact_match.group(1).strip()
+                            # 保留完整URI（包括transport参数），确保ACK的Request-URI与200 OK的Contact头完全匹配
+                            LAST_200_OK_CONTACT[call_id] = contact_uri
+                            log.info(f"[ACK-WAIT] Saved 200 OK Contact URI for ACK: {contact_uri}")
+                        else:
+                            # 如果没有<>，直接使用（保留完整URI）
+                            contact_uri = contact.strip()
+                            LAST_200_OK_CONTACT[call_id] = contact_uri
+                            log.info(f"[ACK-WAIT] Saved 200 OK Contact URI for ACK: {contact_uri}")
+                    else:
+                        log.warning(f"[ACK-WAIT] 200 OK has no Contact header! Call-ID: {call_id}")
+                    
                     # 打印 Route 头（如果有）
                     routes_in_resp = resp.headers.get("record-route", [])
                     if routes_in_resp:
                         log.info(f"[ACK-WAIT] Record-Route headers in 200 OK: {routes_in_resp}")
+                    route_headers = resp.headers.get("route", [])
+                    if route_headers:
+                        log.info(f"[ACK-WAIT] Route headers in 200 OK: {route_headers}")
         
         # 清理追踪记录
         # RFC 3261: 对于 INVITE 的非 2xx 最终响应（如 487），需要等待 ACK
@@ -1917,68 +2262,10 @@ def _forward_response(resp: SIPMessage, addr, transport):
         # CDR: 记录呼叫应答和呼叫失败（只在第一次收到响应时记录，避免重传导致重复）
         if is_invite_response:
             if status_code == "200":
-                # 解析 200 OK 响应中的 SDP（被叫可能使用不同的编解码）
+                # 解析 200 OK 响应中的 SDP（用于 CDR/re-INVITE-OK；SDP 已在发送前修改）
                 call_type_answer, codec_answer = extract_sdp_info(resp.body)
                 
-                # Passthrough 模式：修改 200 OK SDP IP 为被叫信令地址（NAT 后地址）
-                if MEDIA_MODE == "passthrough" and resp.body:
-                    try:
-                        sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
-                        # 将被叫的 SDP IP 改为信令地址（NAT 后地址），端口保持不变
-                        new_sdp = modify_sdp_ip_only(sdp_body, addr[0])
-                        resp.body = new_sdp.encode('utf-8') if isinstance(resp.body, bytes) else new_sdp
-                        if 'content-length' in resp.headers:
-                            resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
-                        log.debug(f"[PASSTHROUGH] 200 OK SDP IP 改为信令地址: {addr[0]}（主被叫将直接互通）")
-                    except Exception as e:
-                        log.warning(f"[PASSTHROUGH] 200 OK SDP 修改失败: {e}")
-
-                # B2BUA 模式：修改 200 OK 中的 SDP 并启动媒体转发（同一呼叫只启动一次，避免重传 200 OK 导致主叫收两份 200 转圈）
-                if ENABLE_MEDIA_RELAY and resp.body:
-                    media_relay = get_media_relay()
-                    if media_relay:
-                        try:
-                            session = media_relay._sessions.get(call_id)
-                            already_started = session and session.started_at is not None
-                            log.info(f"[B2BUA] 检查媒体转发状态: {call_id}, session存在={session is not None}, started_at={session.started_at if session else None}, already_started={already_started}")
-                            sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
-                            if not already_started:
-                                log.info(f"[B2BUA-DEBUG] 原始200OK SDP:\n{sdp_body[:500]}...")
-                            new_sdp, success = media_relay.process_answer_sdp(call_id, sdp_body, addr)
-                            log.info(f"[B2BUA] process_answer_sdp结果: {call_id}, success={success}")
-                            if success:
-                                resp.body = new_sdp.encode('utf-8') if isinstance(resp.body, bytes) else new_sdp
-                                if 'content-length' in resp.headers:
-                                    resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
-                                log.info(f"[B2BUA] 200 OK SDP 修改: {call_id} -> 共享端口 {media_relay._sessions.get(call_id) and media_relay._sessions[call_id].b_leg_rtp_port}")
-                                if not already_started:
-                                    log.info(f"[B2BUA-DEBUG] 修改后200OK SDP:\n{new_sdp[:500]}...")
-                                    log.info(f"[B2BUA] 准备启动媒体转发: {call_id}, already_started={already_started}")
-                                    try:
-                                        # 提取from_tag和to_tag用于RTPProxy会话创建
-                                        from_header = resp.get("from") or ""
-                                        to_header = resp.get("to") or ""
-                                        from_tag = None
-                                        to_tag = None
-                                        if "tag=" in from_header:
-                                            from_tag = from_header.split("tag=")[1].split(";")[0].split(">")[0].strip()
-                                        if "tag=" in to_header:
-                                            to_tag = to_header.split("tag=")[1].split(";")[0].split(">")[0].strip()
-                                        
-                                        log.info(f"[B2BUA] 提取标签: from_tag={from_tag}, to_tag={to_tag}")
-                                        result = media_relay.start_media_forwarding(call_id, from_tag=from_tag, to_tag=to_tag)
-                                        log.info(f"[B2BUA] 媒体转发启动结果: {call_id}, result={result}")
-                                        media_relay.print_media_diagnosis(call_id)
-                                    except Exception as start_e:
-                                        log.error(f"[B2BUA] 启动媒体转发异常: {call_id}, error={start_e}")
-                                        import traceback
-                                        log.error(traceback.format_exc())
-                                else:
-                                    log.debug(f"[B2BUA] 200 OK 重传，媒体已启动，仅更新 SDP 并转发: {call_id}")
-                        except Exception as e:
-                            log.error(f"[B2BUA] 200 OK SDP 修改失败: {e}")
-                            import traceback
-                            log.error(traceback.format_exc())
+                # 200 OK SDP 修改（Passthrough/B2BUA）已移至发送前执行，此处仅做 CDR 等后续处理
                 
                 # 判断是初始 INVITE 还是 re-INVITE 的 200 OK
                 # 通过检查会话是否已有 answer_time 来判断
@@ -2219,17 +2506,58 @@ async def main():
         'SIP_TRACKER': sip_tracker,  # SIP 消息跟踪器
     }
     
-    # 初始化RTPProxy媒体中继（B2BUA 模式）
+    # 若启用媒体中继且配置为自动启动，则随 IMS 一起启动 RTPProxy
+    rtpproxy_proc = start_rtpproxy_if_needed(SERVER_IP)
+    server_globals["_RTPPROXY_PROC"] = rtpproxy_proc
+    if ENABLE_MEDIA_RELAY and MEDIA_RELAY_BACKEND == "rtpproxy":
+        if rtpproxy_proc:
+            log.info(f"[RTPProxy] 已随 IMS 自动启动，进程 PID: {rtpproxy_proc.pid}")
+        elif not RTPPROXY_AUTO_START:
+            log.warning(f"[RTPProxy] 自动启动已禁用（RTPPROXY_AUTO_START=0），请手动启动 RTPProxy")
+        else:
+            log.warning(f"[RTPProxy] 自动启动失败或检测到已有 RTPProxy 在运行")
+            log.info(f"[RTPProxy] 如需手动启动: rtpproxy -l {SERVER_IP} -s udp:{RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} -F")
+
+    # 初始化媒体中继（B2BUA）：builtin=内置转发，rtpproxy=外部 RTPProxy
     if ENABLE_MEDIA_RELAY:
         try:
-            media_relay = init_media_relay(SERVER_IP, rtpproxy_udp=RTPPROXY_UDP)
+            if MEDIA_RELAY_BACKEND == "builtin":
+                from sipcore.media_relay import init_media_relay as init_builtin_relay
+                media_relay = init_builtin_relay(SERVER_IP)
+                server_globals['MEDIA_RELAY'] = media_relay
+                log.info(f"[B2BUA] 内置媒体中继已初始化，服务器IP: {SERVER_IP}（不依赖 RTPProxy）")
+            else:
+                media_relay = init_rtpproxy_relay(SERVER_IP, rtpproxy_udp=RTPPROXY_UDP)
+                log.info(f"[B2BUA] RTPProxy媒体中继已初始化，服务器IP: {SERVER_IP}")
+                log.info(f"[B2BUA] RTPProxy地址: {RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} (UDP)")
+                if not rtpproxy_proc:
+                    log.info(f"[B2BUA] 请确保RTPProxy已启动: rtpproxy -l {SERVER_IP} -s udp:{RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} -F")
+            
+            # 设置全局实例（供 get_media_relay() 使用）
+            global _media_relay_instance
+            _media_relay_instance = media_relay
             server_globals['MEDIA_RELAY'] = media_relay
-            log.info(f"[B2BUA] RTPProxy媒体中继已初始化，服务器IP: {SERVER_IP}")
-            log.info(f"[B2BUA] RTPProxy地址: {RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} (UDP)")
-            log.info(f"[B2BUA] 请确保RTPProxy已启动: rtpproxy -l {SERVER_IP} -s udp:{RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} -F")
+            if MEDIA_RELAY_BACKEND == "rtpproxy":
+                try:
+                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    test_sock.settimeout(1.0)
+                    test_sock.connect(RTPPROXY_UDP)
+                    test_sock.send(b"V ping pong\n")
+                    response = test_sock.recv(256).decode('utf-8', errors='ignore').strip()
+                    test_sock.close()
+                    if response:
+                        if response.startswith("V E") or response.startswith("U E"):
+                            log.info(f"[B2BUA] RTPProxy服务已运行（测试命令响应: {response}）")
+                        else:
+                            log.info(f"[B2BUA] RTPProxy连接测试成功，响应: {response}")
+                    else:
+                        log.warning(f"[B2BUA] RTPProxy未返回响应，可能未运行")
+                except (socket.timeout, ConnectionRefusedError, OSError) as test_e:
+                    log.warning(f"[B2BUA] RTPProxy连接测试失败: {test_e}")
+                except Exception as test_e:
+                    log.warning(f"[B2BUA] RTPProxy连接测试异常: {test_e}")
         except Exception as e:
-            log.error(f"[B2BUA] RTPProxy媒体中继初始化失败: {e}")
-            log.error(f"[B2BUA] 请确保RTPProxy已启动: rtpproxy -l {SERVER_IP} -s udp:{RTPPROXY_UDP[0]}:{RTPPROXY_UDP[1]} -F")
+            log.error(f"[B2BUA] 媒体中继初始化失败: {e}")
             server_globals['MEDIA_RELAY'] = None
     else:
         log.info("[B2BUA] 媒体中继已禁用（Proxy模式）")
@@ -2305,7 +2633,9 @@ async def main():
         transport=udp.transport,  # 传入UDP transport用于NAT保活
         server_ip=SERVER_IP,
         server_port=SERVER_PORT,
-        cancel_forwarded=CANCEL_FORWARDED
+        cancel_forwarded=CANCEL_FORWARDED,
+        ack_forwarded=ACK_FORWARDED,
+        bye_forwarded=BYE_FORWARDED
     )
     log.info("[TIMERS] NAT keepalive enabled (interval: 25s)")
 
@@ -2384,6 +2714,18 @@ async def main():
                     proc.terminate()
             except Exception:
                 pass
+        # 6. 若由 IMS 启动的 RTPProxy，则一并退出
+        rtpproxy_proc = server_globals.get("_RTPPROXY_PROC")
+        if rtpproxy_proc is not None and rtpproxy_proc.poll() is None:
+            try:
+                rtpproxy_proc.terminate()
+                rtpproxy_proc.wait(timeout=5)
+                log.info("[RTPProxy] 已随 IMS 停止")
+            except subprocess.TimeoutExpired:
+                rtpproxy_proc.kill()
+                log.warning("[RTPProxy] 已强制结束")
+            except Exception as e:
+                log.warning(f"[RTPProxy] 停止时异常: {e}")
         log.info("服务已停止，进程即将退出")
 
 if __name__ == "__main__":
