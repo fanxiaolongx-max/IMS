@@ -26,6 +26,15 @@ import time
 from typing import Dict, Tuple, Callable
 import logging
 
+# 导入 SIP 消息跟踪器（可选，如果可用）
+try:
+    from sipcore.sip_message_tracker import get_tracker
+    TRACKER_AVAILABLE = True
+except ImportError:
+    TRACKER_AVAILABLE = False
+    def get_tracker():
+        return None
+
 # RFC 3261 定时器常量 (单位：秒)
 T1 = 0.5   # RTT estimate: 500ms
 T2 = 4.0   # Maximum retransmit interval: 4s
@@ -359,13 +368,14 @@ class SIPTimers:
                         # 尝试发送OPTIONS保活
                         try:
                             # 构造OPTIONS请求
+                            call_id_keepalive = f"{gen_tag()}@{self._server_ip}"
                             options_req = (
                                 f"OPTIONS {b['contact']} SIP/2.0\r\n"
                                 f"Via: SIP/2.0/UDP {self._server_ip}:{self._server_port};branch=z9hG4bK-{gen_tag()};rport\r\n"
                                 f"Max-Forwards: 70\r\n"
                                 f"To: {b['contact']}\r\n"
                                 f"From: <sip:keepalive@{self._server_ip}>;tag={gen_tag()}\r\n"
-                                f"Call-ID: {gen_tag()}@{self._server_ip}\r\n"
+                                f"Call-ID: {call_id_keepalive}\r\n"
                                 f"CSeq: 1 OPTIONS\r\n"
                                 f"Contact: <sip:{self._server_ip}:{self._server_port}>\r\n"
                                 f"Allow: INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE\r\n"
@@ -376,6 +386,28 @@ class SIPTimers:
 
                             self._transport.sendto(options_req, target_addr)
                             keepalive_count += 1
+                            
+                            # SIP 消息跟踪：记录服务器发送的 OPTIONS keepalive 请求
+                            if TRACKER_AVAILABLE:
+                                try:
+                                    tracker = get_tracker()
+                                    if tracker:
+                                        # 解析 OPTIONS 请求以便记录
+                                        from sipcore.parser import parse
+                                        try:
+                                            options_msg = parse(options_req)
+                                            tracker.record_message(
+                                                options_msg, 
+                                                "TX", 
+                                                (self._server_ip, self._server_port), 
+                                                dst_addr=target_addr, 
+                                                full_message_bytes=options_req
+                                            )
+                                            self.log.debug(f"[NAT-KEEPALIVE] OPTIONS keepalive recorded as TX: Call-ID={call_id_keepalive}, to={target_addr}")
+                                        except Exception as parse_err:
+                                            self.log.debug(f"[NAT-KEEPALIVE] Failed to parse OPTIONS for tracking: {parse_err}")
+                                except Exception as tracker_err:
+                                    self.log.debug(f"[NAT-KEEPALIVE] Failed to record OPTIONS keepalive: {tracker_err}")
                         except Exception as e:
                             self.log.debug(f"[NAT-KEEPALIVE] Failed to send OPTIONS to {target_addr}: {e}")
 

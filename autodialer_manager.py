@@ -41,8 +41,8 @@ class AutoDialerManager:
                 return False, "外呼服务已启动"
             
             try:
-                # 创建外呼客户端
-                self.client = AutoDialerClient(self.config_file)
+                # 创建外呼客户端（传入 server_globals，内嵌时用 127.0.0.1 注册以便服务器回送 INVITE）
+                self.client = AutoDialerClient(self.config_file, server_globals=self.server_globals)
                 
                 # 更新主端口配置（从客户端配置读取）
                 self.main_port = self.client.config.get("local_port", 10000)

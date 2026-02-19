@@ -39,8 +39,8 @@
 ### 新增文件
 
 - `web/packet_capture.py` - 数据包抓取模块
-- `web/PACKET_CAPTURE_GUIDE.md` - 使用指南
-- `web/PACKET_CAPTURE_INTEGRATION.md` - 本文档
+- [PACKET_CAPTURE_GUIDE.md](PACKET_CAPTURE_GUIDE.md) - 使用指南
+- 本文档：PACKET_CAPTURE_INTEGRATION.md
 
 ### 修改文件
 

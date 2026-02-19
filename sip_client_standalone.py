@@ -81,20 +81,21 @@ class SIPClient:
     基于 RFC 3261 标准实现
     """
     
-    def __init__(self, username: str, password: str, server_ip: str, 
+    def __init__(self, username: str, password: str, server_ip: str,
                  server_port: int = 5060, local_ip: str = None, local_port: int = 10000,
-                 sdp_ip: str = None):
+                 sdp_ip: str = None, sip_domain: str = None):
         """
         初始化 SIP 客户端
-        
+
         Args:
             username: SIP 用户名
             password: SIP 密码
-            server_ip: SIP 服务器 IP
+            server_ip: 连接目标（发送 UDP 的地址）
             server_port: SIP 服务器端口（默认 5060）
             local_ip: 本地 IP 地址（如果为 None，则自动检测）
             local_port: 本地端口（默认 10000）
             sdp_ip: SDP 中使用的 IP 地址（用于 NAT 场景，默认为 server_ip）
+            sip_domain: Request-URI/To/From 中的域（AOR 域）。不传则用 server_ip。内嵌时用 SERVER_IP 以便与 REG_BINDINGS 一致。
         """
         self.username = username
         self.password = password
@@ -102,12 +103,18 @@ class SIPClient:
         self.server_port = server_port
         self.local_port = local_port
         self.sdp_ip = sdp_ip  # SDP 中使用的 IP 地址
+        self.sip_domain = sip_domain if sip_domain else server_ip  # AOR 域，用于 INVITE/To/From 等查找
         
-        # 获取本地 IP
+        # 绑定地址：用于 socket.bind()
         if local_ip:
             self.local_ip = local_ip
         else:
             self.local_ip = self._get_local_ip()
+        # Via/Contact 中使用的地址：必须是服务器能访问到的 IP，不能是 0.0.0.0
+        if not self.local_ip or self.local_ip in ("", "0.0.0.0"):
+            self.contact_ip = "127.0.0.1"
+        else:
+            self.contact_ip = self.local_ip
         
         # Socket 延迟创建（在需要时创建）
         self.sock = None
@@ -534,12 +541,12 @@ class SIPClient:
             # 第一次 REGISTER（无认证）
             register_msg = (
                 f"REGISTER sip:{self.server_ip} SIP/2.0\r\n"
-                f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch}\r\n"
-                f"From: <sip:{self.username}@{self.server_ip}>;tag={from_tag}\r\n"
-                f"To: <sip:{self.username}@{self.server_ip}>\r\n"
+                f"Via: SIP/2.0/UDP {self.contact_ip}:{self.local_port};branch={branch}\r\n"
+                f"From: <sip:{self.username}@{self.sip_domain}>;tag={from_tag}\r\n"
+                f"To: <sip:{self.username}@{self.sip_domain}>\r\n"
                 f"Call-ID: {call_id}\r\n"
                 f"CSeq: 1 REGISTER\r\n"
-                f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>\r\n"
+                f"Contact: <sip:{self.username}@{self.contact_ip}:{self.local_port}>\r\n"
                 f"Expires: {expires}\r\n"
                 f"Max-Forwards: 70\r\n"
                 f"Content-Length: 0\r\n"
@@ -576,7 +583,7 @@ class SIPClient:
                 nonce = nonce_match.group(1)
                 qop = qop_match.group(1) if qop_match else ""
                 
-                # 第二次 REGISTER（带认证）
+                # 第二次 REGISTER（带认证，Digest uri 须与 Request-URI 一致）
                 uri = f"sip:{self.server_ip}"
                 
                 if qop:
@@ -592,13 +599,13 @@ class SIPClient:
                 
                 register_msg = (
                     f"REGISTER sip:{self.server_ip} SIP/2.0\r\n"
-                    f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={self._gen_branch()}\r\n"
-                    f"From: <sip:{self.username}@{self.server_ip}>;tag={from_tag}\r\n"
-                    f"To: <sip:{self.username}@{self.server_ip}>\r\n"
+                    f"Via: SIP/2.0/UDP {self.contact_ip}:{self.local_port};branch={self._gen_branch()}\r\n"
+                    f"From: <sip:{self.username}@{self.sip_domain}>;tag={from_tag}\r\n"
+                    f"To: <sip:{self.username}@{self.sip_domain}>\r\n"
                     f"Call-ID: {call_id}\r\n"
                     f"CSeq: 2 REGISTER\r\n"
                     f"Authorization: {auth_value}\r\n"
-                    f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>\r\n"
+                    f"Contact: <sip:{self.username}@{self.contact_ip}:{self.local_port}>\r\n"
                     f"Expires: {expires}\r\n"
                     f"Max-Forwards: 70\r\n"
                     f"Content-Length: 0\r\n"
@@ -665,7 +672,7 @@ class SIPClient:
         if self.sock:
             try:
                 temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                temp_sock.sendto(b"STOP", (self.local_ip, self.local_port))
+                temp_sock.sendto(b"STOP", (self.contact_ip, self.local_port))
                 temp_sock.close()
             except:
                 pass
@@ -767,7 +774,7 @@ class SIPClient:
         """创建 SDP Offer（RFC 4566）"""
         # 使用 sdp_ip（外部可路由地址）或 local_ip
         # sdp_ip 用于 NAT 场景，让对方知道该往哪个公网地址发送 RTP
-        sdp_ip = getattr(self, 'sdp_ip', None) or self.local_ip
+        sdp_ip = getattr(self, 'sdp_ip', None) or self.contact_ip
         # 如果 sdp_ip 是 0.0.0.0，使用 server_ip
         if sdp_ip == "0.0.0.0":
             sdp_ip = self.server_ip
@@ -821,8 +828,14 @@ class SIPClient:
                     break
             
             if connection_ip and rtp_port:
-                # NAT 修正：如果 SDP 中的 IP 是内网地址，但信令地址是公网地址，使用信令地址
-                if actual_remote_addr and self._is_private_ip(connection_ip):
+                # NAT 修正：仅当响应直接来自对端（非环回）时，用信令源替换 SDP 内网地址。
+                # 外呼场景下 200 OK 由服务器转发，信令源为 127.0.0.1，不能替换，否则 RTP 发错导致无声音。
+                use_signal_addr = (
+                    actual_remote_addr
+                    and actual_remote_addr[0] not in ("127.0.0.1", "::1")
+                    and self._is_private_ip(connection_ip)
+                )
+                if use_signal_addr:
                     print(f"[RTP] NAT 修正: SDP 中的 {connection_ip} 是内网地址，使用信令地址 {actual_remote_addr[0]}")
                     connection_ip = actual_remote_addr[0]
                 
@@ -865,13 +878,13 @@ class SIPClient:
         
         # 创建 INVITE 请求
         invite_msg = (
-            f"INVITE sip:{callee}@{self.server_ip} SIP/2.0\r\n"
-            f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch}\r\n"
-            f"From: <sip:{self.username}@{self.server_ip}>;tag={from_tag}\r\n"
-            f"To: <sip:{callee}@{self.server_ip}>\r\n"
+            f"INVITE sip:{callee}@{self.sip_domain} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {self.contact_ip}:{self.local_port};branch={branch}\r\n"
+            f"From: <sip:{self.username}@{self.sip_domain}>;tag={from_tag}\r\n"
+            f"To: <sip:{callee}@{self.sip_domain}>\r\n"
             f"Call-ID: {call_id}\r\n"
             f"CSeq: 1 INVITE\r\n"
-            f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>\r\n"
+            f"Contact: <sip:{self.username}@{self.contact_ip}:{self.local_port}>\r\n"
             f"Content-Type: application/sdp\r\n"
             f"Content-Length: {len(sdp_offer.encode('utf-8'))}\r\n"
             f"Max-Forwards: 70\r\n"
@@ -1066,7 +1079,7 @@ class SIPClient:
         # 如果还是没有，使用被叫号码@服务器地址（由服务器转发）
         if not ack_ruri:
             callee = self.current_call.callee or "unknown"
-            ack_ruri = f"sip:{callee}@{self.server_ip}"
+            ack_ruri = f"sip:{callee}@{self.sip_domain}"
             print(f"[SIP] 使用被叫号码@服务器作为 ACK Request-URI: {ack_ruri}")
         
         # 获取被叫号码（用于 To 头）
@@ -1075,9 +1088,9 @@ class SIPClient:
         # 构建 ACK 消息
         ack_lines = [
             f"ACK {ack_ruri} SIP/2.0",
-            f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={self._gen_branch()}",
-            f"From: <sip:{self.username}@{self.server_ip}>;tag={self.current_call.from_tag}",
-            f"To: <sip:{callee}@{self.server_ip}>;tag={to_tag}",
+            f"Via: SIP/2.0/UDP {self.contact_ip}:{self.local_port};branch={self._gen_branch()}",
+            f"From: <sip:{self.username}@{self.sip_domain}>;tag={self.current_call.from_tag}",
+            f"To: <sip:{callee}@{self.sip_domain}>;tag={to_tag}",
             f"Call-ID: {call_id}",
             f"CSeq: 1 ACK",
             f"Max-Forwards: 70",
@@ -1194,7 +1207,7 @@ class SIPClient:
         # 如果还是没有，使用被叫号码@服务器地址（由服务器转发）
         if not bye_ruri:
             callee = self.current_call.callee or "unknown"
-            bye_ruri = f"sip:{callee}@{self.server_ip}"
+            bye_ruri = f"sip:{callee}@{self.sip_domain}"
             print(f"[SIP] 使用被叫号码@服务器作为 BYE Request-URI: {bye_ruri}")
         
         # 获取被叫号码（用于 To 头）
@@ -1203,9 +1216,9 @@ class SIPClient:
         # 构建 BYE 消息
         bye_lines = [
             f"BYE {bye_ruri} SIP/2.0",
-            f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={self._gen_branch()}",
-            f"From: <sip:{self.username}@{self.server_ip}>;tag={self.current_call.from_tag}",
-            f"To: <sip:{callee}@{self.server_ip}>;tag={to_tag}",
+            f"Via: SIP/2.0/UDP {self.contact_ip}:{self.local_port};branch={self._gen_branch()}",
+            f"From: <sip:{self.username}@{self.sip_domain}>;tag={self.current_call.from_tag}",
+            f"To: <sip:{callee}@{self.sip_domain}>;tag={to_tag}",
             f"Call-ID: {call_id}",
             f"CSeq: {self.current_call.local_cseq} BYE",
             f"Max-Forwards: 70",
@@ -1237,140 +1250,115 @@ class SIPClient:
         
         return False
     
+    def _do_unregister_with_sock(self, sock) -> None:
+        """使用给定 socket 发送 Expires=0 的 REGISTER 并等待响应，成功后置 self.registered = False。"""
+        sock.settimeout(5.0)
+        call_id = self._gen_call_id()
+        from_tag = self._gen_tag()
+        branch = self._gen_branch()
+        register_msg = (
+            f"REGISTER sip:{self.server_ip} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {self.contact_ip}:{self.local_port};branch={branch}\r\n"
+            f"From: <sip:{self.username}@{self.sip_domain}>;tag={from_tag}\r\n"
+            f"To: <sip:{self.username}@{self.sip_domain}>\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: 1 REGISTER\r\n"
+            f"Contact: <sip:{self.username}@{self.contact_ip}:{self.local_port}>\r\n"
+            f"Expires: 0\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"Content-Length: 0\r\n"
+            f"\r\n"
+        )
+        sock.sendto(register_msg.encode('utf-8'), (self.server_ip, self.server_port))
+        try:
+            data, _ = sock.recvfrom(4096)
+            resp = self._parse_response(data)
+            status_code = resp.get('status_code', 0)
+            if status_code == 401:
+                auth_header = resp['headers'].get('www-authenticate', '')
+                realm_match = re.search(r'realm="([^"]+)"', auth_header)
+                nonce_match = re.search(r'nonce="([^"]+)"', auth_header)
+                qop_match = re.search(r'qop="([^"]+)"', auth_header)
+                if realm_match and nonce_match:
+                    realm = realm_match.group(1)
+                    nonce = nonce_match.group(1)
+                    qop = qop_match.group(1) if qop_match else ""
+                    uri = f"sip:{self.server_ip}"
+                    if qop:
+                        cnonce = f"{random.randint(100000, 999999)}"
+                        nc = "00000001"
+                        response = self._compute_response(self.username, realm, self.password,
+                                                          uri, "REGISTER", nonce, qop, cnonce, nc)
+                        auth_value = f'Digest username="{self.username}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}", qop={qop}, nc={nc}, cnonce="{cnonce}"'
+                    else:
+                        response = self._compute_response(self.username, realm, self.password, uri, "REGISTER", nonce)
+                        auth_value = f'Digest username="{self.username}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}"'
+                    register_msg = (
+                        f"REGISTER sip:{self.server_ip} SIP/2.0\r\n"
+                        f"Via: SIP/2.0/UDP {self.contact_ip}:{self.local_port};branch={self._gen_branch()}\r\n"
+                        f"From: <sip:{self.username}@{self.sip_domain}>;tag={from_tag}\r\n"
+                        f"To: <sip:{self.username}@{self.sip_domain}>\r\n"
+                        f"Call-ID: {call_id}\r\n"
+                        f"CSeq: 2 REGISTER\r\n"
+                        f"Authorization: {auth_value}\r\n"
+                        f"Contact: <sip:{self.username}@{self.contact_ip}:{self.local_port}>\r\n"
+                        f"Expires: 0\r\n"
+                        f"Max-Forwards: 70\r\n"
+                        f"Content-Length: 0\r\n"
+                        f"\r\n"
+                    )
+                    sock.sendto(register_msg.encode('utf-8'), (self.server_ip, self.server_port))
+                    try:
+                        data, _ = sock.recvfrom(4096)
+                        resp = self._parse_response(data)
+                        if resp.get('status_code', 0) == 200:
+                            self.registered = False
+                            print(f"[SIP] ✓ 注销成功")
+                            return
+                    except socket.timeout:
+                        pass
+            elif status_code == 200:
+                self.registered = False
+                print(f"[SIP] ✓ 注销成功（无需认证）")
+                return
+        except socket.timeout:
+            pass
+        self.registered = False
+        print(f"[SIP] 注销请求已发送（未收到响应）")
+    
     def unregister(self):
         """注销注册（发送 Expires=0 的 REGISTER）"""
         if not self.registered:
             return
-        
         try:
             print(f"[SIP] 正在注销用户 {self.username}...")
-            
-            # 创建临时 socket 用于注销
+            if self.sock is not None:
+                self._do_unregister_with_sock(self.sock)
+                return
             temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            
             try:
-                # 尝试使用当前端口，如果失败则使用临时端口
                 try:
                     temp_sock.bind((self.local_ip, self.local_port))
                 except OSError as e:
-                    if e.errno == 48 or e.errno == 98:  # Address already in use (macOS=48, Linux=98)
+                    if e.errno in (48, 98):
                         temp_sock.bind((self.local_ip, 0))
                     else:
                         raise
-                
-                temp_sock.settimeout(5.0)  # 5 秒超时
-                
-                call_id = self._gen_call_id()
-                from_tag = self._gen_tag()
-                branch = self._gen_branch()
-                
-                # 发送 REGISTER with Expires=0（注销）
-                register_msg = (
-                    f"REGISTER sip:{self.server_ip} SIP/2.0\r\n"
-                    f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={branch}\r\n"
-                    f"From: <sip:{self.username}@{self.server_ip}>;tag={from_tag}\r\n"
-                    f"To: <sip:{self.username}@{self.server_ip}>\r\n"
-                    f"Call-ID: {call_id}\r\n"
-                    f"CSeq: 1 REGISTER\r\n"
-                    f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>\r\n"
-                    f"Expires: 0\r\n"
-                    f"Max-Forwards: 70\r\n"
-                    f"Content-Length: 0\r\n"
-                    f"\r\n"
-                )
-                
-                # 发送 REGISTER
-                temp_sock.sendto(register_msg.encode('utf-8'), (self.server_ip, self.server_port))
-                
-                # 尝试接收响应（不阻塞太久）
-                try:
-                    data, addr = temp_sock.recvfrom(4096)
-                    resp = self._parse_response(data)
-                    status_code = resp.get('status_code', 0)
-                    if status_code == 401:
-                        # 如果需要认证，发送带认证的注销请求
-                        auth_header = resp['headers'].get('www-authenticate', '')
-                        
-                        realm_match = re.search(r'realm="([^"]+)"', auth_header)
-                        nonce_match = re.search(r'nonce="([^"]+)"', auth_header)
-                        qop_match = re.search(r'qop="([^"]+)"', auth_header)
-                        
-                        if realm_match and nonce_match:
-                            realm = realm_match.group(1)
-                            nonce = nonce_match.group(1)
-                            qop = qop_match.group(1) if qop_match else ""
-                            
-                            uri = f"sip:{self.server_ip}"
-                            
-                            if qop:
-                                cnonce = f"{random.randint(100000, 999999)}"
-                                nc = "00000001"
-                                response = self._compute_response(self.username, realm, self.password, 
-                                                                  uri, "REGISTER", nonce, qop, cnonce, nc)
-                                auth_value = f'Digest username="{self.username}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}", qop={qop}, nc={nc}, cnonce="{cnonce}"'
-                            else:
-                                response = self._compute_response(self.username, realm, self.password, 
-                                                                  uri, "REGISTER", nonce)
-                                auth_value = f'Digest username="{self.username}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}"'
-                            
-                            register_msg = (
-                                f"REGISTER sip:{self.server_ip} SIP/2.0\r\n"
-                                f"Via: SIP/2.0/UDP {self.local_ip}:{self.local_port};branch={self._gen_branch()}\r\n"
-                                f"From: <sip:{self.username}@{self.server_ip}>;tag={from_tag}\r\n"
-                                f"To: <sip:{self.username}@{self.server_ip}>\r\n"
-                                f"Call-ID: {call_id}\r\n"
-                                f"CSeq: 2 REGISTER\r\n"
-                                f"Authorization: {auth_value}\r\n"
-                                f"Contact: <sip:{self.username}@{self.local_ip}:{self.local_port}>\r\n"
-                                f"Expires: 0\r\n"
-                                f"Max-Forwards: 70\r\n"
-                                f"Content-Length: 0\r\n"
-                                f"\r\n"
-                            )
-                            
-                            temp_sock.sendto(register_msg.encode('utf-8'), (self.server_ip, self.server_port))
-                            
-                            # 接收最终响应
-                            try:
-                                data, addr = temp_sock.recvfrom(4096)
-                                resp = self._parse_response(data)
-                                final_status = resp.get('status_code', 0)
-                                if final_status == 200:
-                                    self.registered = False
-                                    print(f"[SIP] ✓ 注销成功")
-                                    return
-                            except socket.timeout:
-                                pass  # 超时也认为注销成功（已发送）
-                    elif status_code == 200:
-                        self.registered = False
-                        print(f"[SIP] ✓ 注销成功（无需认证）")
-                        return
-                except socket.timeout:
-                    # 超时也认为注销成功（已发送）
-                    pass
-                
-                # 即使没有收到响应，也标记为未注册（已发送注销请求）
-                self.registered = False
-                print(f"[SIP] 注销请求已发送（未收到响应）")
-                
+                self._do_unregister_with_sock(temp_sock)
             finally:
                 temp_sock.close()
-                
         except Exception as e:
-            # 注销失败不影响关闭流程
             print(f"[WARNING] 注销异常（已忽略）: {e}")
             self.registered = False
     
     def close(self):
         """关闭客户端"""
-        # 先注销注册
+        # 先停止监听，再注销（这样 unregister 可用 self.sock 收发，避免临时 socket 端口冲突导致未发送）
+        self.stop_listener()
         try:
             self.unregister()
         except Exception as e:
             print(f"[WARNING] 注销时异常（已忽略）: {e}")
-        
-        # 停止监听线程
-        self.stop_listener()
         
         # 关闭 socket
         if self.sock:
@@ -1408,7 +1396,14 @@ class RTPPlayer:
         self.symmetric_timeout = symmetric_timeout
         
         self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.rtp_sock.bind(("0.0.0.0", local_port))
+        self.rtp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.rtp_sock.bind(("0.0.0.0", local_port))
+        except OSError as e:
+            if e.errno in (48, 98):  # Address already in use (macOS=48, Linux=98)
+                self.rtp_sock.close()
+                raise OSError(e.errno, f"RTP 端口 {local_port} 已被占用，请稍后重试或重启外呼服务") from e
+            raise
         
         self.ssrc = int(time.time()) % (2**32)  # SSRC 也是 32-bit
         self.seq_num = 0
@@ -1898,14 +1893,23 @@ class AutoDialerClient:
     完全独立于服务器代码，可以单独运行
     """
     
-    def __init__(self, config_file: str = "sip_client_config.json"):
+    def __init__(self, config_file: str = "sip_client_config.json", server_globals: Optional[Dict] = None):
         """
         初始化自动外呼客户端
         
         Args:
             config_file: 配置文件路径
+            server_globals: 服务器全局变量（含 SERVER_IP）。内嵌在 IMS 进程时传入，用于改用 127.0.0.1 注册，确保服务器能把 INVITE 发回本机。
         """
+        self.server_globals = server_globals or {}
         self.config = self._load_config(config_file)
+        # 内嵌在 IMS 进程时：连接用 127.0.0.1，AOR 域用 SERVER_IP，以便 INVITE 查找 REG_BINDINGS 时能命中 sip:1001@SERVER_IP
+        if self.server_globals.get("SERVER_IP") is not None:
+            self.config["server_ip"] = "127.0.0.1"
+            self.config["local_ip"] = "127.0.0.1"
+            self.config["sip_domain"] = self.server_globals["SERVER_IP"]
+            if "sdp_ip" not in self.config or not self.config["sdp_ip"]:
+                self.config["sdp_ip"] = self.server_globals.get("SERVER_IP")  # SDP 仍用对外宣告的 IP
         self.client: Optional[SIPClient] = None
         self.tasks: List[CallTask] = []
         self.stats = {
@@ -1913,9 +1917,9 @@ class AutoDialerClient:
             "successful_calls": 0,
             "failed_calls": 0,
         }
-        self._rtp_port_counter = 20000  # RTP 端口计数器，确保每个呼叫使用不同的端口
+        self._rtp_port_counter = 30001  # RTP 端口 30001-40000，与 SIP 端口 20000-30000 错开
         self._active_calls = {}  # 保存活跃的呼叫状态：{call_id: call_info}
-        self._local_port_counter = 10000  # 本地 SIP 端口计数器（用于并发呼叫）
+        self._sip_port_range = (20000, 30000)  # 外呼 SIP 端口随机范围
         self._port_lock = threading.Lock()  # 端口分配锁（线程安全）
     
     def _load_config(self, config_file: str) -> Dict:
@@ -1965,7 +1969,8 @@ class AutoDialerClient:
             server_port=server_port,
             local_ip=local_ip,
             local_port=local_port,
-            sdp_ip=self.config.get("sdp_ip") or server_ip
+            sdp_ip=self.config.get("sdp_ip") or server_ip,
+            sip_domain=self.config.get("sip_domain"),
         )
         
         # 注册
@@ -1997,8 +2002,8 @@ class AutoDialerClient:
         # 分配唯一的 RTP 端口（避免端口冲突）
         rtp_port = self._rtp_port_counter
         self._rtp_port_counter += 1
-        if self._rtp_port_counter > 30000:
-            self._rtp_port_counter = 20000  # 重置端口范围
+        if self._rtp_port_counter > 40000:
+            self._rtp_port_counter = 30001  # 重置端口范围
         
         # 发起呼叫
         media_file_path = media_file or self.config.get("media_file")
@@ -2148,18 +2153,15 @@ class AutoDialerClient:
             server_port = self.config.get("server_port")
             local_ip = self.config.get("local_ip")
             
-            # 如果没有指定本地端口，使用线程安全的递增端口
-            # 注意：端口分配需要在创建客户端之前完成，避免竞争条件
+            # 如果没有指定本地端口，在 20000-30000 范围内随机（与 RTP 30001-40000 错开）
             if local_port is None:
-                with self._port_lock:
-                    local_port = self._local_port_counter
-                    self._local_port_counter += 1
-                    if self._local_port_counter > 15000:
-                        self._local_port_counter = 10000  # 重置端口范围
+                low, high = self._sip_port_range
+                local_port = random.randint(low, high)
             
             # 创建独立的客户端（使用分配的端口）
-            # 获取 sdp_ip 配置
+            # 获取 sdp_ip、sip_domain（内嵌时 sip_domain=SERVER_IP，否则 AOR 查找会失败）
             sdp_ip = self.config.get("sdp_ip") or server_ip
+            sip_domain = self.config.get("sip_domain")
             
             client = SIPClient(
                 username=username,
@@ -2168,7 +2170,8 @@ class AutoDialerClient:
                 server_port=server_port,
                 local_ip=local_ip,
                 local_port=local_port,  # 使用分配的端口
-                sdp_ip=sdp_ip
+                sdp_ip=sdp_ip,
+                sip_domain=sip_domain,
             )
             
             # 注册（如果端口被占用，会自动使用临时端口）
@@ -2182,12 +2185,12 @@ class AutoDialerClient:
             # 启动监听线程
             client.start_listener()
             
-            # 分配唯一的 RTP 端口（线程安全）
+            # 分配唯一的 RTP 端口（线程安全，30001-40000）
             with self._port_lock:
                 rtp_port = self._rtp_port_counter
                 self._rtp_port_counter += 1
-                if self._rtp_port_counter > 30000:
-                    self._rtp_port_counter = 20000  # 重置端口范围
+                if self._rtp_port_counter > 40000:
+                    self._rtp_port_counter = 30001  # 重置端口范围
             
             # 发起呼叫
             media_file_path = media_file or self.config.get("media_file")

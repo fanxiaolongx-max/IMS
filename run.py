@@ -1,8 +1,13 @@
 # run.py
-import asyncio, time, re, socket
+import asyncio
+import signal
+import time
+import re
+import socket
 import os
 
 from sipcore.transport_udp import UDPServer
+from sipcore.transport_tcp import TCPServer
 from sipcore.parser import parse
 from sipcore.message import SIPMessage
 from sipcore.utils import gen_tag, sip_date
@@ -11,10 +16,11 @@ from sipcore.logger import init_logging
 from sipcore.timers import create_timers
 from sipcore.cdr import init_cdr, get_cdr
 from sipcore.user_manager import init_user_manager, get_user_manager
-from sipcore.sdp_parser import extract_sdp_info
+from sipcore.sdp_parser import extract_sdp_info, modify_sdp_ip_only
 # 使用RTPProxy媒体中继（替代自定义媒体转发）
 from sipcore.rtpproxy_media_relay import init_media_relay, get_media_relay
 from sipcore.stun_server import init_stun_server
+from sipcore.sip_message_tracker import init_tracker, get_tracker
 
 # 初始化日志系统
 log = init_logging(level="DEBUG", log_file="logs/ims-sip-server.log")
@@ -55,13 +61,11 @@ def get_server_ip():
         server_ip = s.getsockname()[0]
         s.close()
         
-        # 检查是否是私网IP，给出警告
+        # 私网 IP：本地/内网部署，直接使用即可；公网 IP：多为云服务器
         if is_private_ip(server_ip):
-            log.warning(f"[CONFIG] Auto-detected PRIVATE IP: {server_ip}")
-            log.warning(f"[CONFIG] For cloud servers, set SERVER_IP env var to public IP")
-            log.warning(f"[CONFIG] Example: export SERVER_IP=113.44.149.111")
+            log.info(f"[CONFIG] 使用本机内网 IP: {server_ip}（适合本地/内网部署）")
         else:
-            log.info(f"[CONFIG] SERVER_IP auto-detected (public): {server_ip}")
+            log.info(f"[CONFIG] SERVER_IP 自动检测为公网: {server_ip}；内网部署可设置 SERVER_IP=内网IP")
         return server_ip
     except Exception as e:
         log.warning(f"[CONFIG] Failed to auto-detect IP: {e}, using default")
@@ -73,9 +77,35 @@ def get_server_ip():
 
 SERVER_IP = get_server_ip()
 SERVER_PORT = 5060
-# UDP 绑定地址：始终使用 0.0.0.0（监听所有接口），但对外宣告使用 SERVER_IP
+# 公网信令地址（Cloudflare 隧道启用时由隧道 host:port 覆盖，用于 Via/Contact/Record-Route）
+SERVER_PUBLIC_HOST = None  # 例如 xxx.trycloudflare.com
+SERVER_PUBLIC_PORT = None  # 隧道 TCP 端口
+def advertised_sip_host():
+    return SERVER_PUBLIC_HOST or SERVER_IP
+def advertised_sip_port():
+    return SERVER_PUBLIC_PORT or SERVER_PORT
+
+def _is_our_via(host: str, port) -> bool:
+    """是否为本机插入的 Via（含隧道 advertised 地址）"""
+    # 检查是否匹配服务器IP和端口
+    if host == SERVER_IP and port == SERVER_PORT:
+        return True
+    # 检查是否匹配公网地址（Cloudflare隧道等）
+    if SERVER_PUBLIC_HOST and host == SERVER_PUBLIC_HOST:
+        return port == (SERVER_PUBLIC_PORT or SERVER_PORT)
+    # 检查是否匹配 advertised 地址
+    if host == advertised_sip_host() and port == advertised_sip_port():
+        return True
+    return False
+
+# UDP 绑定地址：始终使用 0.0.0.0（监听所有接口），但对外宣告使用 advertised 地址
 UDP_BIND_IP = "0.0.0.0"
-SERVER_URI = f"sip:{SERVER_IP}:{SERVER_PORT};lr"   # 用于Record-Route
+def _server_uri():
+    return f"sip:{advertised_sip_host()}:{advertised_sip_port()};lr"
+def _local_sip_uri():
+    """本机实际监听的 SIP URI（SERVER_IP:SERVER_PORT），用于让主叫把 ACK 发到本机 UDP。与 _server_uri() 不同：隧道模式下 _server_uri 为 hostname:443，ACK 发往隧道收不到。"""
+    return f"sip:{SERVER_IP}:{SERVER_PORT};lr"
+SERVER_URI = f"sip:{SERVER_IP}:{SERVER_PORT};lr"   # 默认，启动后若启用隧道会按 advertised 覆盖
 ALLOW = "INVITE, ACK, CANCEL, BYE, OPTIONS, PRACK, UPDATE, REFER, NOTIFY, SUBSCRIBE, MESSAGE, REGISTER"
 
 # 网络环境配置
@@ -115,6 +145,22 @@ LAST_RESPONSE_STATUS: dict[str, str] = {}
 # CANCEL 转发去重：Call-ID -> 上次转发时间戳
 # 避免对同一 CANCEL 重传进行重复转发，产生无意义的流量
 CANCEL_FORWARDED: dict[str, float] = {}
+
+
+def _track_tx_response(resp, addr, direction: str = "TX"):
+    """
+    统一记录已发送的 SIP 响应到跟踪器。
+    任意请求方法、任意响应状态码均自动解析并记录，无需写死类型。
+    """
+    try:
+        tracker = get_tracker()
+        if tracker:
+            resp_bytes = resp.to_bytes() if hasattr(resp, "to_bytes") else None
+            tracker.record_message(
+                resp, direction, (SERVER_IP, SERVER_PORT), dst_addr=addr, full_message_bytes=resp_bytes
+            )
+    except Exception as e:
+        log.debug(f"[SIP-TRACKER] 记录 TX 失败: {e}")
 
 # B2BUA 媒体模式：
 #   "relay"    - 媒体中继模式：使用RTPProxy进行媒体转发（推荐）
@@ -391,7 +437,7 @@ def _decrement_max_forwards(msg: SIPMessage) -> bool:
     return True
 
 def _add_top_via(msg: SIPMessage, branch: str):
-    via = f"SIP/2.0/UDP {SERVER_IP}:{SERVER_PORT};branch={branch};rport"
+    via = f"SIP/2.0/UDP {advertised_sip_host()}:{advertised_sip_port()};branch={branch};rport"
     # 插入为第一条 Via
     old = msg.headers.get("via", [])
     msg.headers["via"] = [via] + old
@@ -498,7 +544,7 @@ def _strip_our_top_route_and_get_next(msg: SIPMessage) -> None:
 
 def _add_record_route_for_initial(msg: SIPMessage):
     # 在初始请求上插入 RR
-    msg.add_header("record-route", f"<{SERVER_URI}>")
+    msg.add_header("record-route", f"<{_server_uri()}>")
 
 def _make_response(req: SIPMessage, code: int, reason: str, extra_headers: dict | None = None, body: bytes = b"") -> SIPMessage:
     r = SIPMessage(start_line=f"SIP/2.0 {code} {reason}")
@@ -543,8 +589,10 @@ def handle_register(msg: SIPMessage, addr, transport):
             log.debug(f"[TX-RESP-FULL] {addr} <- 401 Unauthorized Full SIP response:\n{resp_content}")
         except Exception as e:
             log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
-        transport.sendto(resp.to_bytes(), addr)
+        resp_bytes = resp.to_bytes()
+        transport.sendto(resp_bytes, addr)
         log.tx(addr, resp.start_line, extra="Auth failed")
+        _track_tx_response(resp, addr)
         # CDR: 401 是正常的 SIP 认证挑战流程，不记录为失败
         # 只有当客户端多次尝试后仍失败，或返回其他错误码时才记录失败
         return
@@ -552,8 +600,10 @@ def handle_register(msg: SIPMessage, addr, transport):
     aor = _aor_from_to(msg.get("to"))
     if not aor:
         resp = _make_response(msg, 400, "Bad Request")
-        transport.sendto(resp.to_bytes(), addr)
+        resp_bytes = resp.to_bytes()
+        transport.sendto(resp_bytes, addr)
         log.tx(addr, resp.start_line)
+        _track_tx_response(resp, addr)
         return
 
     binds = _parse_contacts(msg)
@@ -573,6 +623,9 @@ def handle_register(msg: SIPMessage, addr, transport):
     now = int(time.time())
     lst = REG_BINDINGS.setdefault(aor, [])
     lst[:] = [b for b in lst if b["expires"] > now]
+    # 终端更换 IP 重新注册时：清理该 AOR 下其它地址的绑定，只保留本次注册地址，避免同一号码多 IP 并存导致误路由
+    if binds and any(b.get("expires", 0) > 0 for b in binds):
+        lst[:] = [x for x in lst if _host_port_from_sip_uri(x["contact"]) == (addr[0], addr[1])]
     for b in binds:
         if b["expires"] == 0:
             lst[:] = [x for x in lst if x["contact"] != b["contact"]]
@@ -604,9 +657,10 @@ def handle_register(msg: SIPMessage, addr, transport):
     except Exception as e:
         log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
     
-    transport.sendto(resp.to_bytes(), addr)
+    resp_bytes = resp.to_bytes()
+    transport.sendto(resp_bytes, addr)
     log.tx(addr, resp.start_line, extra=f"bindings={len(lst)}")
-    
+    _track_tx_response(resp, addr)
     # CDR: 记录注册/注销事件
     if binds and binds[0]["expires"] == 0:
         # 注销
@@ -645,12 +699,16 @@ def _forward_request(msg: SIPMessage, addr, transport):
     - 统一：加顶层 Via、递减 Max-Forwards
     """
     method = _method_of(msg)
+    call_id = msg.get("call-id")
+    if method == "ACK":
+        log.info(f"[ACK-FWD-ENTRY] Processing ACK, Call-ID: {call_id}, from: {addr}")
 
     # 忽略/丢弃 Max-Forwards<=0
     if not _decrement_max_forwards(msg):
         resp = _make_response(msg, 483, "Too Many Hops")
         transport.sendto(resp.to_bytes(), addr)
         log.tx(addr, resp.start_line)
+        _track_tx_response(resp, addr)
         return
 
     # 在删除 Route 之前，先保存 Route 信息（用于 ACK 类型判断）
@@ -674,7 +732,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
             
             if has_to_tag:
                 # re-INVITE：对话内的媒体协商（hold/resume/add video 等）
-                log.info(f"[re-INVITE] Detected for Call-ID: {call_id}")
+                log.info(f"[re-INVITE] Detected for Call-ID: {call_id}, from: {addr}")
                 # 继续处理，不 return
             else:
                 # 重发的初始 INVITE：返回 100 Trying，不转发
@@ -682,6 +740,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 resp = _make_response(msg, 100, "Trying")
                 transport.sendto(resp.to_bytes(), addr)
                 log.tx(addr, resp.start_line, extra="duplicate INVITE handling")
+                _track_tx_response(resp, addr)
                 return
         # 其他 in-dialog 请求（BYE, UPDATE等）继续处理
         log.debug(f"[REQ-TRACK] Call-ID {call_id} is in DIALOGS, treating as in-dialog {method} request")
@@ -703,6 +762,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 resp = _make_response(msg, 200, "OK")
                 transport.sendto(resp.to_bytes(), addr)
                 log.debug(f"[CANCEL-DEDUP] Suppressed retransmission for Call-ID: {cancel_call_id}")
+                _track_tx_response(resp, addr)
                 return
             CANCEL_FORWARDED[cancel_call_id] = now_f
 
@@ -839,8 +899,10 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 log.debug(f"[TX-RESP-FULL] {addr} <- 100 Trying Full SIP response:\n{resp_content}")
             except Exception as e:
                 log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
-            transport.sendto(trying.to_bytes(), addr)
+            trying_bytes = trying.to_bytes()
+            transport.sendto(trying_bytes, addr)
             log.tx(addr, trying.start_line, extra="immediate 100 Trying")
+            _track_tx_response(trying, addr)
 
         if not targets:
             log.warning(f"[{method}-INITIAL] No valid bindings for AOR: {aor}")
@@ -853,8 +915,10 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 if count >= SECURITY_CONFIG["RATE_LIMIT_THRESHOLD"]:
                     log.warning(f"[SECURITY] IP {client_ip} 请求未注册用户 {aor} 达到 {count} 次，可能被攻击")
             resp = _make_response(msg, 480, "Temporarily Unavailable")
-            transport.sendto(resp.to_bytes(), addr)
+            resp_bytes = resp.to_bytes()
+            transport.sendto(resp_bytes, addr)
             log.tx(addr, resp.start_line, extra=f"aor={aor}")
+            _track_tx_response(resp, addr)
             return
 
         # ---- 选择最优绑定（优先最近注册的） ----
@@ -962,7 +1026,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
         _ensure_header(msg, "from", msg.get("from") or "<sip:unknown@localhost>;tag=" + gen_tag())
         _ensure_header(msg, "to", msg.get("to") or "<sip:unknown@localhost>")
         _ensure_header(msg, "call-id", msg.get("call-id") or gen_tag() + "@localhost")
-        _ensure_header(msg, "via", f"SIP/2.0/UDP {SERVER_IP}:{SERVER_PORT};branch={branch};rport")
+        _ensure_header(msg, "via", f"SIP/2.0/UDP {advertised_sip_host()}:{advertised_sip_port()};branch={branch};rport")
     else:
         # ACK 请求：根据 ACK 类型处理 Via
         # 注意：此时 is_2xx_ack 已经在上面判断过了
@@ -993,26 +1057,71 @@ def _forward_request(msg: SIPMessage, addr, transport):
         _strip_our_top_route_and_get_next(msg)
         routes = msg.headers.get("route", [])
     
-    if routes:
-        # 取首个 Route 的 URI
-        r = routes[0]
-        if "<" in r and ">" in r:
-            ruri = r[r.find("<")+1:r.find(">")]
+    # 对于 2xx ACK，优先使用 DIALOGS 中保存的被叫地址（最可靠）
+    # RFC 3261: 2xx ACK 的 Request-URI 应该使用 200 OK 的 Contact 头地址
+    # 但主叫可能使用错误的地址，所以优先使用 DIALOGS 中保存的实际被叫地址
+    if method == "ACK" and is_2xx_ack and call_id:
+        if call_id in DIALOGS:
+            caller_addr, callee_addr = DIALOGS[call_id]
+            # 发往“另一端”：ACK 来自 caller 则发往 callee，来自 callee 则发往 caller（避免 re-INVITE 200 的 ACK 被发回主叫导致 405）
+            if (addr[0], addr[1]) == (caller_addr[0], caller_addr[1]):
+                next_hop = callee_addr
+                log.info(f"[ACK-2XX-DIALOGS] 2xx ACK from caller -> callee: Call-ID={call_id}, to={callee_addr}")
+            else:
+                next_hop = caller_addr
+                log.info(f"[ACK-2XX-DIALOGS] 2xx ACK from callee -> caller: Call-ID={call_id}, to={caller_addr}")
+            # 仍然记录 Route 和 Request-URI 用于调试
+            log.info(f"[ACK-2XX-DIALOGS] ACK Route count={len(routes)}, R-URI={msg.start_line.split()[1] if len(msg.start_line.split()) > 1 else 'N/A'}")
+            if routes:
+                log.info(f"[ACK-2XX-DIALOGS] ACK Route headers: {routes}")
         else:
-            ruri = r.split(":", 1)[-1]
-        nh = _host_port_from_sip_uri(ruri)
-        next_hop = nh
-        log.debug(f"[ROUTE] Using Route header: {ruri} -> {next_hop}")
-    else:
-        # 用 Request-URI
-        ruri = msg.start_line.split()[1]
-        next_hop = _host_port_from_sip_uri(ruri)
-        log.debug(f"[ROUTE] Using Request-URI: {ruri} -> {next_hop}")
+            # DIALOGS 中没有 Call-ID，尝试从 REG_BINDINGS 查找被叫地址
+            log.warning(f"[ACK-2XX-DIALOGS] Call-ID {call_id} not in DIALOGS, trying REG_BINDINGS")
+            to_aor = _aor_from_to(msg.get("to"))
+            if to_aor:
+                targets = REG_BINDINGS.get(to_aor, [])
+                now = int(time.time())
+                targets = [t for t in targets if t["expires"] > now]
+                if targets:
+                    b_uri = targets[0]["contact"]
+                    real_host, real_port = _host_port_from_sip_uri(b_uri)
+                    if real_host and real_port:
+                        next_hop = (real_host, real_port)
+                        log.info(f"[ACK-2XX-DIALOGS] 2xx ACK routing via REG_BINDINGS: Call-ID={call_id}, callee_addr={next_hop} (AOR: {to_aor})")
+                    else:
+                        log.warning(f"[ACK-2XX-DIALOGS] Invalid contact address for AOR {to_aor}: {b_uri}, will use Route/R-URI")
+                else:
+                    log.warning(f"[ACK-2XX-DIALOGS] No valid bindings for AOR {to_aor}, will use Route/R-URI")
+            else:
+                log.warning(f"[ACK-2XX-DIALOGS] Cannot extract AOR from To header, will use Route/R-URI")
+    
+    # 如果 next_hop 还没有被设置（非 2xx ACK 或 2xx ACK 但 DIALOGS/REG_BINDINGS 中都没有找到），使用 Route 或 Request-URI
+    if next_hop is None:
+        if routes:
+            # 取首个 Route 的 URI
+            r = routes[0]
+            if "<" in r and ">" in r:
+                ruri = r[r.find("<")+1:r.find(">")]
+            else:
+                ruri = r.split(":", 1)[-1]
+            nh = _host_port_from_sip_uri(ruri)
+            next_hop = nh
+            log.debug(f"[ROUTE] Using Route header: {ruri} -> {next_hop}")
+            if method == "ACK":
+                log.info(f"[ACK-ROUTE] ACK routing via Route: {ruri} -> {next_hop}")
+        else:
+            # 用 Request-URI
+            ruri = msg.start_line.split()[1]
+            next_hop = _host_port_from_sip_uri(ruri)
+            log.debug(f"[ROUTE] Using Request-URI: {ruri} -> {next_hop}")
+            if method == "ACK":
+                log.info(f"[ACK-ROUTE] ACK routing via Request-URI: {ruri} -> {next_hop}")
 
     if not next_hop or next_hop == ("", 0):
         resp = _make_response(msg, 502, "Bad Gateway")
         transport.sendto(resp.to_bytes(), addr)
         log.tx(addr, resp.start_line, extra="no next hop")
+        _track_tx_response(resp, addr)
         return
 
     host, port = next_hop
@@ -1020,10 +1129,22 @@ def _forward_request(msg: SIPMessage, addr, transport):
     # 如果是已知对话的请求且检测到环路，尝试从 REG_BINDINGS 获取正确的目标
     is_in_dialog = call_id and call_id in DIALOGS if 'call_id' in locals() else False
     
-    # === 🔒 防止自环 ===
-    # 注意：ACK 请求的 R-URI 可能是 sip:user@127.0.0.1，会被误判为环路
-    # 所以需要检查是否是真正的环路（明确指定了端口 5060）
-    if (host == SERVER_IP and port == SERVER_PORT):
+    # === 🔒 防止自环 / 防止 ACK 发回发送方 ===
+    # 对于 2xx ACK：若 Route/R-URI 解析出的目标指向我们或就是 ACK 发送方，改为发往 DIALOGS 的另一端
+    if method == "ACK" and is_2xx_ack and call_id and call_id in DIALOGS:
+        caller_addr, callee_addr = DIALOGS[call_id]
+        other_leg = callee_addr if (addr[0], addr[1]) == (caller_addr[0], caller_addr[1]) else caller_addr
+        if _is_our_via(host, port):
+            host, port = other_leg
+            log.info(f"[ACK-2XX-DIALOGS] 2xx ACK loop detected, using DIALOGS other leg: {other_leg}")
+        elif (host, port) == (addr[0], addr[1]):
+            host, port = other_leg
+            log.warning(f"[ACK-2XX-DIALOGS] 2xx ACK was targeting sender {addr}, corrected to other leg: {other_leg}")
+        elif (host, port) != other_leg:
+            log.warning(f"[ACK-2XX-DIALOGS] 2xx ACK routing mismatch: Route/R-URI={host}:{port}, using DIALOGS other leg: {other_leg}")
+            host, port = other_leg
+    
+    if _is_our_via(host, port):
         # ACK 请求优先使用 ACK 专用处理逻辑（无论是 2xx 还是非 2xx）
         if method == "ACK":
             # 非 2xx ACK：使用 DIALOGS 或 REG_BINDINGS 找到被叫地址
@@ -1060,44 +1181,116 @@ def _forward_request(msg: SIPMessage, addr, transport):
                                     log.info(f"[ACK-NON2XX] ✓ Routing to callee from REG_BINDINGS: {host}:{port} (AOR: {to_aor})")
                                 else:
                                     log.error(f"[ACK-NON2XX] ✗ Invalid contact address for AOR {to_aor}: {b_uri}, cannot route ACK")
-                                    return
+                                # 记录 ACK 失败转发（用于调试）
+                                tracker = get_tracker()
+                                if tracker:
+                                    try:
+                                        tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                        log.warning(f"[ACK-TRACKER] ACK recorded as FWD (failed routing): Call-ID={call_id}")
+                                    except:
+                                        pass
+                                return
                             else:
                                 log.error(f"[ACK-NON2XX] ✗ No valid bindings for AOR {to_aor}, cannot route ACK")
                                 log.info(f"[ACK-NON2XX] All bindings: {REG_BINDINGS.get(to_aor, [])}")
+                                # 记录 ACK 失败转发（用于调试）
+                                tracker = get_tracker()
+                                if tracker:
+                                    try:
+                                        tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                        log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no bindings): Call-ID={call_id}")
+                                    except:
+                                        pass
                                 return
                         else:
                             log.error(f"[ACK-NON2XX] ✗ Cannot extract AOR from To header: {to_header}, cannot route ACK")
+                            # 记录 ACK 失败转发（用于调试）
+                            tracker = get_tracker()
+                            if tracker:
+                                try:
+                                    tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                    log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no AOR): Call-ID={call_id}")
+                                except:
+                                    pass
                             return
                     except Exception as e:
                         log.error(f"[ACK-NON2XX] ✗ Failed to find callee address: {e}, cannot route ACK")
                         import traceback
                         log.error(f"[ACK-NON2XX] Traceback: {traceback.format_exc()}")
+                        # 记录 ACK 失败转发（用于调试）
+                        tracker = get_tracker()
+                        if tracker:
+                            try:
+                                tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                log.warning(f"[ACK-TRACKER] ACK recorded as FWD (exception): Call-ID={call_id}, error={e}")
+                            except:
+                                pass
                         return
             else:
-                # 2xx ACK：尝试使用注册表中的 contact 地址
+                # 2xx ACK：目标仍指向我们时，用 DIALOGS 的另一端（谁发 ACK 就发给对方）
                 try:
                     to_aor = _aor_from_to(msg.get("to"))
                     ruri = msg.start_line.split()[1]
-                    log.debug(f"[ACK-2XX-CHECK] To AOR: {to_aor} | R-URI: {ruri} | Detected loop: {host}:{port}")
+                    log.info(f"[ACK-2XX-CHECK] 2xx ACK loop detected, trying to find other leg. To AOR: {to_aor} | R-URI: {ruri} | Current target: {host}:{port}")
                     
-                    if to_aor:
+                    if call_id and call_id in DIALOGS:
+                        caller_addr, callee_addr = DIALOGS[call_id]
+                        other_leg = callee_addr if (addr[0], addr[1]) == (caller_addr[0], caller_addr[1]) else caller_addr
+                        host, port = other_leg
+                        log.info(f"[ACK-2XX-CHECK] ✓ Using DIALOGS other leg: {host}:{port}")
+                    elif to_aor:
                         targets = REG_BINDINGS.get(to_aor, [])
                         if targets:
                             b_uri = targets[0]["contact"]
                             real_host, real_port = _host_port_from_sip_uri(b_uri)
                             if real_host and real_port:
                                 host, port = real_host, real_port
-                                log.debug(f"ACK (2xx) using contact address: {b_uri} -> {host}:{port}")
+                                log.info(f"[ACK-2XX-CHECK] ✓ Found callee address from REG_BINDINGS: {host}:{port} (AOR: {to_aor})")
                             else:
-                                log.drop(f"ACK (2xx) loop detected: skipping self-forward to {host}:{port}")
+                                log.error(f"[ACK-2XX-CHECK] ✗ Invalid contact address for AOR {to_aor}: {b_uri}")
+                                # 即使找不到有效地址，也记录 ACK（用于调试）
+                                tracker = get_tracker()
+                                if tracker:
+                                    try:
+                                        tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                        log.warning(f"[ACK-TRACKER] ACK recorded as FWD (invalid contact): Call-ID={call_id}")
+                                    except:
+                                        pass
                                 return
+                        else:
+                            log.error(f"[ACK-2XX-CHECK] ✗ No bindings for AOR {to_aor}")
+                            # 即使找不到绑定，也记录 ACK（用于调试）
+                            tracker = get_tracker()
+                            if tracker:
+                                try:
+                                    tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                    log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no bindings): Call-ID={call_id}")
+                                except:
+                                    pass
+                            return
                     else:
-                        log.warning(f"ACK (2xx): No To AOR found, R-URI: {ruri}")
-                        log.drop(f"ACK (2xx) loop detected: skipping self-forward to {host}:{port}")
+                        log.error(f"[ACK-2XX-CHECK] ✗ No To AOR found, R-URI: {ruri}")
+                        # 即使找不到 AOR，也记录 ACK（用于调试）
+                        tracker = get_tracker()
+                        if tracker:
+                            try:
+                                tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no To AOR): Call-ID={call_id}")
+                            except:
+                                pass
                         return
                 except Exception as e:
-                    log.warning(f"ACK (2xx) loop check failed: {e}")
-                    log.drop(f"Loop detected: skipping self-forward to {host}:{port}")
+                    log.error(f"[ACK-2XX-CHECK] ✗ Exception while finding callee address: {e}")
+                    import traceback
+                    log.error(f"[ACK-2XX-CHECK] Traceback: {traceback.format_exc()}")
+                    # 即使发生异常，也记录 ACK（用于调试）
+                    tracker = get_tracker()
+                    if tracker:
+                        try:
+                            tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                            log.warning(f"[ACK-TRACKER] ACK recorded as FWD (exception): Call-ID={call_id}, error={e}")
+                        except:
+                            pass
                     return
         # 如果是已知对话的请求且目标指向服务器，尝试使用注册表中的地址（非 ACK）
         elif is_in_dialog:
@@ -1157,13 +1350,30 @@ def _forward_request(msg: SIPMessage, addr, transport):
                         resp = _make_response(msg, 480, "Temporarily Unavailable")
                         transport.sendto(resp.to_bytes(), addr)
                         log.tx(addr, resp.start_line, extra=f"aor={aor}")
+                        _track_tx_response(resp, addr)
                         return
         except Exception as e:
             log.warning(f"NAT fix skipped: {e}")
     # -------------------------------------------------------------------------------
 
-    # B2BUA 模式：转发 INVITE 前修改 SDP（确保被叫收到普通RTP SDP）
+    # Passthrough 模式：修改 SDP IP 为信令地址（NAT 后地址），让主被叫直接互通
     call_id = msg.get("call-id")
+    if method == "INVITE" and call_id and MEDIA_MODE == "passthrough" and msg.body:
+        try:
+            to_header = msg.get("to") or ""
+            has_to_tag = "tag=" in to_header
+            if not has_to_tag:  # 初始 INVITE
+                sdp_body = msg.body.decode('utf-8', errors='ignore') if isinstance(msg.body, bytes) else msg.body
+                # 将主叫的 SDP IP 改为信令地址（NAT 后地址），端口保持不变
+                new_sdp = modify_sdp_ip_only(sdp_body, addr[0])
+                msg.body = new_sdp.encode('utf-8') if isinstance(msg.body, bytes) else new_sdp
+                if 'content-length' in msg.headers:
+                    msg.headers['content-length'] = [str(len(msg.body) if isinstance(msg.body, bytes) else len(msg.body.encode('utf-8')))]
+                log.debug(f"[PASSTHROUGH] INVITE SDP IP 改为信令地址: {addr[0]}（主被叫将直接互通）")
+        except Exception as e:
+            log.warning(f"[PASSTHROUGH] INVITE SDP 修改失败: {e}")
+
+    # B2BUA 模式：转发 INVITE 前修改 SDP（确保被叫收到普通RTP SDP）
     if method == "INVITE" and call_id and ENABLE_MEDIA_RELAY and msg.body:
         try:
             to_header = msg.get("to") or ""
@@ -1224,8 +1434,44 @@ def _forward_request(msg: SIPMessage, addr, transport):
         except Exception as e:
             log.debug(f"[FWD-FULL] Failed to decode message: {e}")
         
-        transport.sendto(msg.to_bytes(), (host, port))
+        msg_bytes = msg.to_bytes()
+        transport.sendto(msg_bytes, (host, port))
         log.fwd(method, (host, port), f"R-URI={msg.start_line.split()[1]}")
+        
+        # SIP 消息跟踪：记录转发的请求（包装在 try-except 中避免递归错误影响转发）
+        # FWD 消息：源地址是服务器地址，目的地址是转发目标地址
+        try:
+            tracker = get_tracker()
+            if tracker:
+                # 添加调试日志，特别是对于 RE-INVITE 和 ACK
+                if method == "INVITE":
+                    to_header = msg.get("to") or ""
+                    has_to_tag = "tag=" in to_header
+                    if has_to_tag:
+                        log.debug(f"[SIP-TRACKER] 记录 RE-INVITE 转发: Call-ID={call_id}, from={SERVER_IP}:{SERVER_PORT}, to={host}:{port}")
+                elif method == "ACK":
+                    log.info(f"[ACK-FWD] ACK forwarded: Call-ID={call_id}, from={SERVER_IP}:{SERVER_PORT}, to={host}:{port}, is_2xx_ack={is_2xx_ack}")
+                    # 打印 ACK 的关键信息
+                    ack_ruri = msg.start_line.split()[1] if len(msg.start_line.split()) > 1 else ""
+                    ack_routes = msg.headers.get("route", [])
+                    log.info(f"[ACK-FWD] ACK R-URI: {ack_ruri}, Route count: {len(ack_routes)}")
+                    if ack_routes:
+                        log.info(f"[ACK-FWD] ACK Route headers: {ack_routes}")
+                tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg_bytes)
+                if method == "ACK":
+                    log.info(f"[ACK-TRACKER] ACK recorded as FWD: Call-ID={call_id}, from={SERVER_IP}:{SERVER_PORT}, to={host}:{port}, is_2xx_ack={is_2xx_ack}")
+        except RecursionError as re:
+            log.error(f"[SIP-TRACKER] 记录转发消息时发生递归错误: {re}，跳过记录")
+            import traceback
+            log.debug(f"[SIP-TRACKER] 递归错误详情: {traceback.format_exc()}")
+            if method == "ACK":
+                log.error(f"[ACK-TRACKER] ACK FWD 记录失败（递归错误）: Call-ID={call_id}")
+        except Exception as e:
+            log.warning(f"[SIP-TRACKER] 记录转发消息失败: {e}")
+            import traceback
+            log.debug(f"[SIP-TRACKER] 记录失败详情: {traceback.format_exc()}")
+            if method == "ACK":
+                log.error(f"[ACK-TRACKER] ACK FWD 记录失败: Call-ID={call_id}, error={e}")
         
         # 记录请求映射：Call-ID -> 原始请求发送者地址（用于响应转发）
         # 注意：这里记录的是 addr（请求发送者），而非 (host, port)（转发目标）
@@ -1351,12 +1597,13 @@ def _forward_request(msg: SIPMessage, addr, transport):
                 resp = _make_response(msg, 480, "Temporarily Unavailable")
                 transport.sendto(resp.to_bytes(), addr)
                 log.tx(addr, resp.start_line, extra=f"target unreachable")
+                _track_tx_response(resp, addr)
             elif method == "BYE":
                 # BYE 失败，返回 408 Request Timeout
                 resp = _make_response(msg, 408, "Request Timeout")
                 transport.sendto(resp.to_bytes(), addr)
                 log.tx(addr, resp.start_line, extra=f"target unreachable")
-                
+                _track_tx_response(resp, addr)
                 # 清理 DIALOGS，防止重传 BYE 时重复记录 CDR
                 if call_id and call_id in DIALOGS:
                     del DIALOGS[call_id]
@@ -1368,12 +1615,14 @@ def _forward_request(msg: SIPMessage, addr, transport):
             resp = _make_response(msg, 503, "Service Unavailable")
             transport.sendto(resp.to_bytes(), addr)
             log.tx(addr, resp.start_line, extra=f"network error")
+            _track_tx_response(resp, addr)
     except Exception as e:
         # 其他异常
         log.error(f"[ERROR] Forward failed: {e}")
         resp = _make_response(msg, 502, "Bad Gateway")
         transport.sendto(resp.to_bytes(), addr)
         log.tx(addr, resp.start_line, extra=f"forward error")
+        _track_tx_response(resp, addr)
 
 def _forward_response(resp: SIPMessage, addr, transport):
     """
@@ -1408,14 +1657,21 @@ def _forward_response(resp: SIPMessage, addr, transport):
     # 增强日志：记录完整的 Via 头内容
     log.debug(f"[RESP-VIA] Response {status_code} (Call-ID: {call_id_resp}) | Via count: {len(split_vias)} | Top Via: {top[:100]}")
     
-    if not top or f"{SERVER_IP}:{SERVER_PORT}" not in top:
+    if not top or (f"{SERVER_IP}:{SERVER_PORT}" not in top and (not SERVER_PUBLIC_HOST or f"{advertised_sip_host()}:{advertised_sip_port()}" not in top)):
         # 调试：记录为什么不转发
-        log.debug(f"[RESP-SKIP] Response {status_code} not forwarded: top Via '{top[:100] if top else 'EMPTY'}' does not contain '{SERVER_IP}:{SERVER_PORT}' | Call-ID: {call_id_resp}")
+        log.debug(f"[RESP-SKIP] Response {status_code} not forwarded: top Via '{top[:100] if top else 'EMPTY'}' does not match our Via | Call-ID: {call_id_resp}")
+        return
+    
+    # RFC 3261: 100 Trying 是临时响应，应该只发送给请求的发起者，不应该被转发
+    # 100 Trying 由代理服务器自己生成并发送给请求发起者，不需要转发
+    status_code = resp.start_line.split()[1] if len(resp.start_line.split()) > 1 else ""
+    if status_code == "100":
+        call_id_resp = resp.get("call-id")
+        log.debug(f"[RESP-SKIP] 100 Trying response should not be forwarded (RFC 3261): Call-ID: {call_id_resp}")
         return
     
     # 如果是错误响应（如 482 Loop Detected），不应该继续转发
     # 这些响应应该直接返回给当前接收方
-    status_code = resp.start_line.split()[1] if len(resp.start_line.split()) > 1 else ""
     if status_code in ("482", "483", "502", "503", "504"):
         call_id_resp = resp.get("call-id")
         vias_resp = resp.headers.get("via", [])
@@ -1514,7 +1770,7 @@ def _forward_response(resp: SIPMessage, addr, transport):
 
     # ========== 防止自环 ==========
     # 如果最终地址指向服务器自己，回退到Via头解析的地址
-    if (nhost == SERVER_IP and nport == SERVER_PORT):
+    if _is_our_via(nhost, nport):
         log.warning(f"[RPORT] 回退: rport地址指向服务器({nhost}:{nport})，使用Via地址")
         vias = resp.headers.get("via", [])
         if vias:
@@ -1529,7 +1785,7 @@ def _forward_response(resp: SIPMessage, addr, transport):
         log.debug(f"Using fallback address: {addr}")
 
     # 防止自环
-    if (nhost == SERVER_IP and nport == SERVER_PORT):
+    if _is_our_via(nhost, nport):
         log.drop(f"Prevented response loop to self ({nhost}:{nport})")
         return
 
@@ -1565,6 +1821,23 @@ def _forward_response(resp: SIPMessage, addr, transport):
     log.debug(f"[VIA-ROUTE] Response {status_code} ({cseq_header}) → {nhost}:{nport}")
 
     try:
+        # 200 OK 转发给主叫前：强制 ACK 发往本机实际监听地址（Record-Route + Route 用本机 IP:5060）
+        # 若用 _server_uri()（隧道时为 hostname:443），主叫会把 ACK 发往隧道，隧道不转发 UDP，本机收不到 ACK
+        if status_code == "200" and is_invite_response and call_id:
+            local_uri = f"<{_local_sip_uri()}>"
+            rr = resp.headers.get("record-route") or []
+            # 若当前 Record-Route 是隧道地址，主叫会按它发 ACK 到隧道，收不到。统一改为本机地址。
+            if rr and local_uri not in rr:
+                resp.headers["record-route"] = [local_uri]
+                log.info(f"[ACK-WAIT] 200 OK Record-Route 改为本机 {local_uri}，便于主叫将 ACK 发往本机")
+            elif not rr:
+                resp.headers["record-route"] = [local_uri]
+                log.info(f"[ACK-WAIT] 200 OK 缺少 Record-Route，已插入 {local_uri}")
+            existing_route = resp.headers.get("route") or []
+            if not existing_route or existing_route[0] != local_uri:
+                resp.headers["route"] = [local_uri] + list(existing_route)
+                log.info(f"[ACK-WAIT] 200 OK 已插入 Route {local_uri}，便于主叫将 ACK 发往本机")
+        
         # 打印完整的 SIP 响应内容（转发前）
         try:
             resp_content = resp.to_bytes().decode('utf-8', errors='ignore')
@@ -1572,8 +1845,47 @@ def _forward_response(resp: SIPMessage, addr, transport):
         except Exception as e:
             log.debug(f"[FWD-RESP-FULL] Failed to decode response: {e}")
         
-        transport.sendto(resp.to_bytes(), (nhost, nport))
+        resp_bytes = resp.to_bytes()
+        transport.sendto(resp_bytes, (nhost, nport))
         log.fwd(f"RESP {resp.start_line}", (nhost, nport))
+        
+        # SIP 消息跟踪：记录转发的响应
+        # 记录为 FWD（从被叫转发到主叫），与请求转发保持一致
+        # FWD 响应：源地址是服务器地址，目的地址是转发目标地址（主叫）
+        # addr 是收到响应的地址（被叫），(nhost, nport) 是转发目标（主叫）
+        try:
+            tracker = get_tracker()
+            if tracker:
+                cseq_header = resp.get("cseq") or ""
+                log.debug(f"[RESP-FWD-TRACKER] Recording {status_code} FWD: Call-ID={call_id}, CSeq={cseq_header}, to={nhost}:{nport}")
+                tracker.record_message(resp, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(nhost, nport), full_message_bytes=resp_bytes)
+                log.debug(f"[RESP-FWD-TRACKER] Successfully recorded {status_code} FWD: Call-ID={call_id}")
+        except RecursionError as re:
+            log.error(f"[SIP-TRACKER] 记录转发响应时发生递归错误: {re}，跳过记录")
+            import traceback
+            log.debug(f"[SIP-TRACKER] 递归错误详情: {traceback.format_exc()}")
+        except Exception as e:
+            log.warning(f"[SIP-TRACKER] 记录转发响应失败: {e}")
+            import traceback
+            log.debug(f"[SIP-TRACKER] 记录失败详情: {traceback.format_exc()}")
+        
+        # 记录最后响应状态（用于 ACK 类型判断）
+        # 只记录最终响应（非 1xx），用于 ACK 类型判断
+        if call_id and is_invite_response:
+            # 只记录最终响应（非 1xx）
+            if status_code and not status_code.startswith("1"):
+                LAST_RESPONSE_STATUS[call_id] = status_code
+                log.info(f"[LAST-RESP-STATUS] Recorded last response status for Call-ID {call_id}: {status_code} (sent to {nhost}:{nport})")
+                # 如果是 200 OK，提示等待 ACK
+                if status_code == "200":
+                    log.info(f"[ACK-WAIT] Waiting for ACK for Call-ID {call_id} (200 OK sent to {nhost}:{nport})")
+                    # 打印 200 OK 的 Contact 头，用于调试 ACK 路由
+                    contact = resp.get("contact") or ""
+                    log.info(f"[ACK-WAIT] 200 OK Contact header: {contact}")
+                    # 打印 Route 头（如果有）
+                    routes_in_resp = resp.headers.get("record-route", [])
+                    if routes_in_resp:
+                        log.info(f"[ACK-WAIT] Record-Route headers in 200 OK: {routes_in_resp}")
         
         # 清理追踪记录
         # RFC 3261: 对于 INVITE 的非 2xx 最终响应（如 487），需要等待 ACK
@@ -1608,6 +1920,19 @@ def _forward_response(resp: SIPMessage, addr, transport):
                 # 解析 200 OK 响应中的 SDP（被叫可能使用不同的编解码）
                 call_type_answer, codec_answer = extract_sdp_info(resp.body)
                 
+                # Passthrough 模式：修改 200 OK SDP IP 为被叫信令地址（NAT 后地址）
+                if MEDIA_MODE == "passthrough" and resp.body:
+                    try:
+                        sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
+                        # 将被叫的 SDP IP 改为信令地址（NAT 后地址），端口保持不变
+                        new_sdp = modify_sdp_ip_only(sdp_body, addr[0])
+                        resp.body = new_sdp.encode('utf-8') if isinstance(resp.body, bytes) else new_sdp
+                        if 'content-length' in resp.headers:
+                            resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
+                        log.debug(f"[PASSTHROUGH] 200 OK SDP IP 改为信令地址: {addr[0]}（主被叫将直接互通）")
+                    except Exception as e:
+                        log.warning(f"[PASSTHROUGH] 200 OK SDP 修改失败: {e}")
+
                 # B2BUA 模式：修改 200 OK 中的 SDP 并启动媒体转发（同一呼叫只启动一次，避免重传 200 OK 导致主叫收两份 200 转圈）
                 if ENABLE_MEDIA_RELAY and resp.body:
                     media_relay = get_media_relay()
@@ -1762,6 +2087,7 @@ def _forward_response(resp: SIPMessage, addr, transport):
             try:
                 transport.sendto(resp.to_bytes(), original_sender_addr)
                 log.fwd(f"RESP {resp.start_line} (retry)", original_sender_addr)
+                _track_tx_response(resp, original_sender_addr, "FWD")
             except Exception as e2:
                 log.error(f"Retry also failed: {e2}")
     except Exception as e:
@@ -1772,6 +2098,11 @@ def on_datagram(data: bytes, addr, transport):
     # 忽略 UA keepalive 空包
     if not data or data.strip() in (b"", b"\r\n", b"\r\n\r\n"):
         return
+    
+    # 在解析前检测 ACK 包：若本机从未收到 ACK，主叫可能把 ACK 发往 Contact（被叫）而非本机
+    if data.strip().startswith(b"ACK "):
+        first_line = data.split(b'\r\n')[0][:120]
+        log.info(f"[ACK-RAW] 收到 ACK 原始包 from {addr}, 首行: {first_line!r}")
     
     # 安全检查：IP 黑名单和速率限制
     client_ip = addr[0]
@@ -1792,11 +2123,22 @@ def on_datagram(data: bytes, addr, transport):
         if is_req:
             method = _method_of(msg)
             log.info(f"[RX] {addr} -> {msg.start_line} | Call-ID: {call_id} | To tag: {'YES' if 'tag=' in (to_val or '') else 'NO'} | Via: {len(vias)} hops")
+            # 特别记录 ACK 消息
+            if method == "ACK":
+                log.info(f"[ACK-RX] ACK received from {addr}, Call-ID: {call_id}, To: {to_val}")
         else:
             status = msg.start_line.split()[1] if len(msg.start_line.split()) > 1 else ""
             log.info(f"[RX] {addr} -> {msg.start_line} | Call-ID: {call_id} | Via: {len(vias)} hops")
         
         log.rx(addr, msg.start_line)
+        
+        # SIP 消息跟踪：记录接收的消息（含 ACK，任意方法/状态码均会记录）
+        # RX 消息：源地址是终端地址（addr），目的地址是服务器地址
+        tracker = get_tracker()
+        if tracker:
+            tracker.record_message(msg, "RX", addr, dst_addr=(SERVER_IP, SERVER_PORT), full_message_bytes=data)
+            if is_req and _method_of(msg) == "ACK":
+                log.info(f"[ACK-TRACKER] ACK recorded as RX: Call-ID={call_id}, from={addr}, to={SERVER_IP}:{SERVER_PORT}")
         
         # 打印完整的 SIP 消息内容
         try:
@@ -1817,8 +2159,10 @@ def on_datagram(data: bytes, addr, transport):
                     log.debug(f"[TX-RESP-FULL] {addr} <- 200 OK (OPTIONS) Full SIP response:\n{resp_content}")
                 except Exception as e:
                     log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
-                transport.sendto(resp.to_bytes(), addr)
+                resp_bytes = resp.to_bytes()
+                transport.sendto(resp_bytes, addr)
                 log.tx(addr, resp.start_line)
+                _track_tx_response(resp, addr)
                 # CDR: 记录 OPTIONS 请求（心跳/能力查询）
                 cdr.record_options(
                     caller_uri=msg.get("from") or "",
@@ -1840,16 +2184,29 @@ def on_datagram(data: bytes, addr, transport):
                     log.debug(f"[TX-RESP-FULL] {addr} <- 405 Method Not Allowed Full SIP response:\n{resp_content}")
                 except Exception as e:
                     log.debug(f"[TX-RESP-FULL] Failed to decode response: {e}")
-                transport.sendto(resp.to_bytes(), addr)
+                resp_bytes = resp.to_bytes()
+                transport.sendto(resp_bytes, addr)
                 log.tx(addr, resp.start_line)
+                _track_tx_response(resp, addr)
         else:
             # 响应：转发
             _forward_response(msg, addr, transport)
 
+    except RecursionError as re:
+        log.error(f"parse/send failed: 递归深度超限 - {re}")
+        import traceback
+        log.error(f"递归错误堆栈:\n{traceback.format_exc()}")
     except Exception as e:
         log.error(f"parse/send failed: {e}")
+        import traceback
+        log.debug(f"详细错误堆栈:\n{traceback.format_exc()}")
 
 async def main():
+    global SERVER_PUBLIC_HOST, SERVER_PUBLIC_PORT, SERVER_URI
+    # 初始化 SIP 消息跟踪器
+    sip_tracker = init_tracker(max_records=10000)
+    log.info("[SIP-TRACKER] SIP 消息跟踪已启用")
+    
     # 准备服务器全局状态
     server_globals = {
         'SERVER_IP': SERVER_IP,
@@ -1859,6 +2216,7 @@ async def main():
         'DIALOGS': DIALOGS,
         'PENDING_REQUESTS': PENDING_REQUESTS,
         'INVITE_BRANCHES': INVITE_BRANCHES,
+        'SIP_TRACKER': sip_tracker,  # SIP 消息跟踪器
     }
     
     # 初始化RTPProxy媒体中继（B2BUA 模式）
@@ -1890,10 +2248,14 @@ async def main():
         log.warning(f"外呼管理器初始化失败: {e}")
         server_globals['AUTO_DIALER_MANAGER'] = None
     
-    # 启动 MML 管理界面
+    # 启动 MML 管理界面（必须在隧道启动之前）
     try:
         from web.mml_server import init_mml_interface
         init_mml_interface(port=8888, server_globals=server_globals)
+        # 等待 MML 服务启动
+        import time
+        time.sleep(1.0)
+        log.info("[MML] MML 服务已启动，等待就绪...")
     except Exception as e:
         log.warning(f"MML interface failed to start: {e}")
 
@@ -1926,6 +2288,13 @@ async def main():
     await udp.start()
     # UDP server listening 日志已在 transport_udp.py 中输出，此处不再重复
 
+    # Cloudflare 隧道已禁用：避免 Record-Route/Route 使用隧道 host:443 导致 ACK/信令不到本机、跟踪不全。
+    # 若需公网访问请用端口映射或 VPN，勿用 ENABLE_CF_TUNNEL。
+    tcp_server = None
+    cf_tunnel_procs = []
+    server_globals["_TCP_SERVER"] = None
+    server_globals["_CF_TUNNEL_PROCS"] = cf_tunnel_procs
+
     # 创建并启动定时器
     timers = create_timers(log)
     await timers.start(
@@ -1939,20 +2308,83 @@ async def main():
         cancel_forwarded=CANCEL_FORWARDED
     )
     log.info("[TIMERS] NAT keepalive enabled (interval: 25s)")
-    
-    try:
-        # 等待服务器运行
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        log.info("Shutting down server...")
-    finally:
-        # 停止 STUN 服务器
-        if stun_server:
-            await stun_server.stop()
-            log.info("[STUN] STUN服务器已停止")
 
-        # 停止定时器
-        await timers.stop()
+    # 优雅停止：SIGTERM/SIGINT 时设置此事件，主循环退出后执行 finally 清理
+    shutdown_event = asyncio.Event()
+
+    def _on_shutdown_signal():
+        log.info("收到停止信号，正在优雅退出...")
+        shutdown_event.set()
+
+    try:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _on_shutdown_signal)
+            except (NotImplementedError, OSError, ValueError, AttributeError):
+                break
+    except Exception:
+        pass
+    # Windows 或 add_signal_handler 不可用时的回退
+    try:
+        signal.signal(signal.SIGINT, lambda s, f: _on_shutdown_signal())
+    except (ValueError, OSError):
+        pass
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, lambda s, f: _on_shutdown_signal())
+        except (ValueError, OSError):
+            pass
+
+    try:
+        await shutdown_event.wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        log.info("正在停止服务...")
+        # 1. 停止外呼管理器（先注销，释放端口）
+        dialer_mgr = server_globals.get("AUTO_DIALER_MANAGER")
+        if dialer_mgr and dialer_mgr.is_running:
+            try:
+                ok, msg = dialer_mgr.stop()
+                log.info(f"[外呼] {msg}")
+            except Exception as e:
+                log.warning(f"[外呼] 停止时异常: {e}")
+        # 2. 停止 STUN 服务器
+        if stun_server:
+            try:
+                await stun_server.stop()
+                log.info("[STUN] STUN服务器已停止")
+            except Exception as e:
+                log.warning(f"[STUN] 停止时异常: {e}")
+        # 3. 停止定时器
+        try:
+            await timers.stop()
+        except Exception as e:
+            log.warning(f"[TIMERS] 停止时异常: {e}")
+        # 4. 关闭 UDP 传输
+        if getattr(udp, "transport", None):
+            try:
+                udp.transport.close()
+                log.info("[UDP] SIP 端口已关闭")
+            except Exception as e:
+                log.warning(f"[UDP] 关闭时异常: {e}")
+        # 5. 关闭 TCP 与 Cloudflare 隧道
+        tcp_srv = server_globals.get("_TCP_SERVER")
+        if tcp_srv:
+            try:
+                tcp_srv.close()
+                await tcp_srv.wait_closed()
+                log.info("[SIP/TCP] 已关闭")
+            except Exception as e:
+                log.warning(f"[SIP/TCP] 关闭时异常: {e}")
+        for proc in server_globals.get("_CF_TUNNEL_PROCS", []):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        log.info("服务已停止，进程即将退出")
 
 if __name__ == "__main__":
     asyncio.run(main())

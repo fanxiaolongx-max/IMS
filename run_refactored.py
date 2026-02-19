@@ -74,10 +74,9 @@ def get_server_ip():
         s.close()
         
         if is_private_ip(server_ip):
-            log.warning(f"[CONFIG] Auto-detected PRIVATE IP: {server_ip}")
-            log.warning(f"[CONFIG] For cloud servers, set SERVER_IP env var to public IP")
+            log.info(f"[CONFIG] 使用本机内网 IP: {server_ip}（适合本地/内网部署）")
         else:
-            log.info(f"[CONFIG] SERVER_IP auto-detected (public): {server_ip}")
+            log.info(f"[CONFIG] SERVER_IP 自动检测为公网: {server_ip}；内网部署可设置 SERVER_IP=内网IP")
         return server_ip
     except Exception as e:
         log.warning(f"[CONFIG] Failed to auto-detect IP: {e}, using default")

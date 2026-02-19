@@ -29,13 +29,13 @@ except ImportError:
     print("[WARNING] websockets not installed, real-time logs disabled")
     print("Install: pip install websockets")
 
-# 数据包抓取支持
+# SIP 消息跟踪支持
 try:
-    from web.packet_capture import get_capture, create_capture, start_capture, stop_capture, get_capture_stats
-    PACKET_CAPTURE_AVAILABLE = True
+    from sipcore.sip_message_tracker import get_tracker
+    SIP_TRACKER_AVAILABLE = True
 except ImportError:
-    PACKET_CAPTURE_AVAILABLE = False
-    print("[WARNING] packet_capture module not available")
+    SIP_TRACKER_AVAILABLE = False
+    print("[WARNING] sip_message_tracker module not available")
 
 # 导入认证模块
 try:
@@ -2563,9 +2563,9 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
             self._check_auth_status()
         elif parsed_path.path == '/api/logout':
             self._handle_logout()
-        elif parsed_path.path == '/api/packet-capture':
+        elif parsed_path.path == '/api/sip-messages':
             if self._require_auth():
-                self._handle_packet_capture_api()
+                self._handle_sip_messages_api()
         else:
             self.send_error(404)
     
@@ -2732,12 +2732,12 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
     
-    def _handle_packet_capture_api(self):
-        """处理数据包抓取API"""
-        if not PACKET_CAPTURE_AVAILABLE:
+    def _handle_sip_messages_api(self):
+        """处理SIP消息跟踪API"""
+        if not SIP_TRACKER_AVAILABLE:
             result = {
                 "success": False,
-                "message": "Packet capture not available"
+                "message": "SIP message tracker not available"
             }
             self._send_json_response(result, 503)
             return
@@ -2747,55 +2747,77 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
             query_params = parse_qs(parsed_path.query)
             action = query_params.get('action', [''])[0]
             
-            print(f"[MML-DEBUG] 抓包API请求: action={action}", file=sys.stderr, flush=True)
-            
-            if action == 'start':
-                interface = query_params.get('interface', ['any'])[0]
-                filter_expr = query_params.get('filter', [''])[0]
-                print(f"[MML-DEBUG] 启动抓包: interface={interface}, filter={filter_expr}", file=sys.stderr, flush=True)
-                success = start_capture(interface, filter_expr)
+            tracker = get_tracker()
+            if not tracker:
                 result = {
-                    "success": success,
-                    "message": "抓包已启动" if success else "抓包启动失败"
+                    "success": False,
+                    "message": "SIP tracker not initialized"
                 }
-            elif action == 'stop':
-                print(f"[MML-DEBUG] 停止抓包", file=sys.stderr, flush=True)
-                try:
-                    stop_capture()
+                self._send_json_response(result, 503)
+                return
+            
+            if action == 'list':
+                # 获取消息列表（支持分页和过滤）
+                limit = int(query_params.get('limit', ['1000'])[0])
+                offset = int(query_params.get('offset', ['0'])[0])
+                
+                # 解析过滤条件
+                filters = {}
+                for key in ['method', 'direction', 'from_user', 'to_user', 'call_id', 'src_ip', 'dst_ip', 'registered_user', 'callee']:
+                    if key in query_params:
+                        filters[key] = query_params[key][0]
+                
+                records, total = tracker.get_records(limit=limit, offset=offset, filters=filters if filters else None)
+                result = {
+                    "success": True,
+                    "records": records,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset
+                }
+            elif action == 'get':
+                # 根据ID获取单条消息
+                msg_id = int(query_params.get('id', ['0'])[0])
+                record = tracker.get_message_by_id(msg_id)
+                if record:
                     result = {
                         "success": True,
-                        "message": "抓包已停止"
+                        "record": record
                     }
-                    print(f"[MML-DEBUG] 抓包已停止", file=sys.stderr, flush=True)
-                except Exception as stop_e:
-                    print(f"[MML-ERROR] 停止抓包异常: {stop_e}", file=sys.stderr, flush=True)
-                    import traceback
-                    traceback.print_exc()
+                else:
                     result = {
                         "success": False,
-                        "message": f"停止抓包失败: {str(stop_e)}"
+                        "message": "Message not found"
                     }
             elif action == 'stats':
-                stats = get_capture_stats()
+                # 获取统计信息
+                stats = tracker.get_stats()
                 result = {
                     "success": True,
                     "stats": stats
                 }
+            elif action == 'clear':
+                # 清空所有记录
+                tracker.clear()
+                result = {
+                    "success": True,
+                    "message": "All records cleared"
+                }
             else:
                 result = {
                     "success": False,
-                    "message": f"未知操作: {action}"
+                    "message": f"Unknown action: {action}"
                 }
             
             self._send_json_response(result)
             
         except Exception as e:
-            print(f"[MML-ERROR] 抓包API处理异常: {e}", file=sys.stderr, flush=True)
+            print(f"[MML-ERROR] SIP消息API处理异常: {e}", file=sys.stderr, flush=True)
             import traceback
             traceback.print_exc()
             result = {
                 "success": False,
-                "message": f"抓包操作失败: {str(e)}"
+                "message": f"SIP消息操作失败: {str(e)}"
             }
             self._send_json_response(result, 500)
 
@@ -2810,10 +2832,27 @@ def init_mml_interface(port=8888, server_globals=None):
     # 创建执行器并传递服务器状态
     MMLHTTPHandler.executor = MMLCommandExecutor(server_globals)
     
+    # HTTP 服务器监听在指定端口，WebSocket 服务器监听在端口+1
+    # 注意：Cloudflare 隧道只转发 HTTP 流量到 8888，WebSocket 服务器运行在 8889
+    # WebSocket 无法通过 Cloudflare 隧道访问，只能在本机访问
+    # TODO: 使用支持 WebSocket 升级的 HTTP 服务器（如 aiohttp）来同时处理 HTTP 和 WebSocket
+    http_port = port
+    ws_port = port + 1 if WEBSOCKET_AVAILABLE else None
+    
     def run_server():
         try:
-            server = HTTPServer(('0.0.0.0', port), MMLHTTPHandler)
-            print(f"[MML] MML 管理界面已启动: http://0.0.0.0:{port}", flush=True)
+            server = HTTPServer(('0.0.0.0', http_port), MMLHTTPHandler)
+            print(f"[MML] MML 管理界面已启动: http://0.0.0.0:{http_port}", flush=True)
+            # 验证服务器已就绪
+            import socket
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.settimeout(1)
+            result = test_sock.connect_ex(('127.0.0.1', http_port))
+            test_sock.close()
+            if result == 0:
+                print(f"[MML] MML 服务已就绪，端口 {http_port} 可访问", flush=True)
+            else:
+                print(f"[MML] 警告: 端口 {http_port} 可能未就绪", flush=True)
             server.serve_forever()
         except Exception as e:
             print(f"[MML] ERROR: {e}", flush=True)
@@ -2823,8 +2862,9 @@ def init_mml_interface(port=8888, server_globals=None):
     thread.start()
     
     # 启动 WebSocket 日志推送服务器（如果可用）
+    # 隧道模式：WebSocket 服务器监听在 HTTP 端口（8888），Cloudflare 隧道会将 WebSocket 流量转发到这里
+    # 正常模式：WebSocket 服务器监听在 HTTP 端口+1（8889）
     if WEBSOCKET_AVAILABLE:
-        ws_port = port + 1  # WebSocket 端口 = HTTP 端口 + 1
         start_websocket_server(ws_port)
         
         # 添加日志处理器，将日志推送到队列
@@ -2868,11 +2908,11 @@ def init_mml_interface(port=8888, server_globals=None):
 
 # WebSocket 日志推送（可选）
 if WEBSOCKET_AVAILABLE:
-    # 数据包抓取订阅者
-    packet_subscribers: Set = set()
-    packet_callbacks: Dict = {}  # websocket -> callback映射
-    # 数据包队列（用于线程安全的异步发送）
-    packet_queue: queue.Queue = queue.Queue(maxsize=1000)
+    # SIP消息跟踪订阅者
+    sip_message_subscribers: Set = set()
+    sip_message_callbacks: Dict = {}  # websocket -> callback映射
+    # SIP消息队列（用于线程安全的异步发送）
+    sip_message_queue: queue.Queue = queue.Queue(maxsize=1000)
     
     async def log_push_handler(websocket):
         """WebSocket 处理器（支持多路径）"""
@@ -2898,89 +2938,94 @@ if WEBSOCKET_AVAILABLE:
             finally:
                 log_subscribers.discard(websocket)
                 print(f"[MML-DEBUG] 已移除日志订阅者，剩余: {len(log_subscribers)}", file=sys.stderr, flush=True)
-        elif path == '/ws/packets':
-            # 数据包抓取WebSocket
-            packet_subscribers.add(websocket)
+        elif path == '/ws/sip-messages':
+            # SIP消息跟踪WebSocket
+            sip_message_subscribers.add(websocket)
             callback_ref = None
             
-            print(f"[MML-DEBUG] WebSocket连接建立: /ws/packets, 订阅者数量: {len(packet_subscribers)}", file=sys.stderr, flush=True)
+            print(f"[MML-DEBUG] WebSocket连接建立: /ws/sip-messages, 订阅者数量: {len(sip_message_subscribers)}", file=sys.stderr, flush=True)
             
             try:
                 # 发送欢迎消息（使用type字段标识，前端会过滤掉）
-                welcome_msg = {"type": "connected", "message": "数据包WebSocket连接已建立"}
+                welcome_msg = {"type": "connected", "message": "SIP消息跟踪WebSocket连接已建立"}
                 await websocket.send(json.dumps(welcome_msg, ensure_ascii=False))
                 print(f"[MML-DEBUG] 已发送欢迎消息", file=sys.stderr, flush=True)
                 
-                # 如果正在抓包，订阅数据包通知
-                if PACKET_CAPTURE_AVAILABLE:
-                    capture = get_capture()
-                    if capture:
-                        print(f"[MML-DEBUG] 找到抓包实例，订阅数据包通知", file=sys.stderr, flush=True)
-                        def packet_callback(packet_info):
-                            # 线程安全的回调：将数据包放入队列
-                            # 数据包读取在独立线程中，没有事件循环，所以使用队列机制
+                # 订阅SIP消息通知
+                if SIP_TRACKER_AVAILABLE:
+                    tracker = get_tracker()
+                    if tracker:
+                        print(f"[MML-DEBUG] 找到tracker实例，订阅SIP消息通知", file=sys.stderr, flush=True)
+                        def sip_message_callback(message_record):
+                            # 线程安全的回调：将消息放入队列
+                            # 消息记录在独立线程中，没有事件循环，所以使用队列机制
                             try:
-                                # 将数据包和websocket引用放入队列
-                                packet_queue.put_nowait((websocket, packet_info))
+                                # 将消息和websocket引用放入队列
+                                sip_message_queue.put_nowait((websocket, message_record))
                             except queue.Full:
-                                # 队列满了，丢弃最老的数据包
+                                # 队列满了，丢弃最老的消息
                                 try:
-                                    packet_queue.get_nowait()
-                                    packet_queue.put_nowait((websocket, packet_info))
+                                    sip_message_queue.get_nowait()
+                                    sip_message_queue.put_nowait((websocket, message_record))
                                 except:
                                     pass
                             except Exception as e:
                                 print(f"[MML-ERROR] 回调执行失败: {e}", file=sys.stderr, flush=True)
                         
-                        callback_ref = packet_callback
-                        packet_callbacks[websocket] = callback_ref
-                        capture.subscribe(callback_ref)
-                        print(f"[MML-DEBUG] 已订阅数据包通知，订阅者数量: {len(capture.subscribers)}", file=sys.stderr, flush=True)
+                        callback_ref = sip_message_callback
+                        sip_message_callbacks[websocket] = callback_ref
+                        tracker.subscribe(callback_ref)
+                        print(f"[MML-DEBUG] 已订阅SIP消息通知，订阅者数量: {len(tracker._subscribers)}", file=sys.stderr, flush=True)
                     else:
-                        print(f"[MML-DEBUG] 抓包实例不存在，可能未启动抓包", file=sys.stderr, flush=True)
-                        await websocket.send(json.dumps({"type": "warning", "message": "抓包未启动"}, ensure_ascii=False))
+                        print(f"[MML-DEBUG] tracker实例不存在，可能未初始化", file=sys.stderr, flush=True)
+                        await websocket.send(json.dumps({"type": "warning", "message": "SIP tracker未初始化"}, ensure_ascii=False))
                 else:
-                    print(f"[MML-DEBUG] 抓包功能不可用", file=sys.stderr, flush=True)
-                    await websocket.send(json.dumps({"type": "error", "message": "抓包功能不可用"}, ensure_ascii=False))
+                    print(f"[MML-DEBUG] SIP tracker功能不可用", file=sys.stderr, flush=True)
+                    await websocket.send(json.dumps({"type": "error", "message": "SIP tracker功能不可用"}, ensure_ascii=False))
                 
                 # 保持连接
                 await websocket.wait_closed()
-                print(f"[MML-DEBUG] WebSocket连接已关闭: /ws/packets", file=sys.stderr, flush=True)
+                print(f"[MML-DEBUG] WebSocket连接已关闭: /ws/sip-messages", file=sys.stderr, flush=True)
             except websockets.exceptions.ConnectionClosed:
-                print(f"[MML-DEBUG] WebSocket连接正常关闭: /ws/packets", file=sys.stderr, flush=True)
+                print(f"[MML-DEBUG] WebSocket连接正常关闭: /ws/sip-messages", file=sys.stderr, flush=True)
             except Exception as e:
                 print(f"[MML-ERROR] WebSocket处理异常: {e}", file=sys.stderr, flush=True)
                 import traceback
                 traceback.print_exc()
             finally:
-                packet_subscribers.discard(websocket)
+                sip_message_subscribers.discard(websocket)
                 # 取消订阅
-                if PACKET_CAPTURE_AVAILABLE and callback_ref:
-                    capture = get_capture()
-                    if capture:
-                        capture.unsubscribe(callback_ref)
-                        print(f"[MML-DEBUG] 已取消订阅，订阅者数量: {len(capture.subscribers)}", file=sys.stderr, flush=True)
-                if websocket in packet_callbacks:
-                    del packet_callbacks[websocket]
-                print(f"[MML-DEBUG] 已移除数据包订阅者，剩余: {len(packet_subscribers)}", file=sys.stderr, flush=True)
+                if SIP_TRACKER_AVAILABLE and callback_ref:
+                    tracker = get_tracker()
+                    if tracker:
+                        tracker.unsubscribe(callback_ref)
+                        print(f"[MML-DEBUG] 已取消订阅，订阅者数量: {len(tracker._subscribers)}", file=sys.stderr, flush=True)
+                if websocket in sip_message_callbacks:
+                    del sip_message_callbacks[websocket]
+                print(f"[MML-DEBUG] 已移除SIP消息订阅者，剩余: {len(sip_message_subscribers)}", file=sys.stderr, flush=True)
         else:
             # 未知路径，关闭连接
             await websocket.close()
     
-    async def _send_packet(websocket, packet_info):
-        """发送数据包到WebSocket"""
+    async def _send_sip_message(websocket, message_record):
+        """发送SIP消息到WebSocket"""
         try:
-            if websocket in packet_subscribers:
-                packet_json = json.dumps(packet_info, ensure_ascii=False)
-                await websocket.send(packet_json)
-                # 减少日志输出频率（每100个包打印一次）
-                if packet_info.get('packet_num', 0) % 100 == 0:
-                    print(f"[MML-DEBUG] 发送数据包到WebSocket: {len(packet_json)} bytes", file=sys.stderr, flush=True)
+            if websocket in sip_message_subscribers:
+                message_json = json.dumps(message_record, ensure_ascii=False)
+                await websocket.send(message_json)
+                # 对于 ACK FWD，总是打印日志（便于调试最后一条消息丢失问题）
+                method = message_record.get('method') or message_record.get('status_code') or ''
+                direction = message_record.get('direction', '')
+                if method == 'ACK' and direction == 'FWD':
+                    print(f"[MML-DEBUG] 发送ACK FWD到WebSocket: ID={message_record.get('id')}, Call-ID={message_record.get('call_id', '')[:20]}", file=sys.stderr, flush=True)
+                # 减少日志输出频率（每100个消息打印一次）
+                elif message_record.get('id', 0) % 100 == 0:
+                    print(f"[MML-DEBUG] 发送SIP消息到WebSocket: {len(message_json)} bytes", file=sys.stderr, flush=True)
         except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
             # WebSocket连接已关闭，这是正常的
             pass
         except Exception as e:
-            print(f"[MML-ERROR] 发送数据包失败: {e}", file=sys.stderr, flush=True)
+            print(f"[MML-ERROR] 发送SIP消息失败: {e}", file=sys.stderr, flush=True)
     
     async def broadcast_logs():
         """从队列中读取日志并广播给所有客户端"""
@@ -3010,44 +3055,44 @@ if WEBSOCKET_AVAILABLE:
                 print(f"[MML] 日志广播错误: {e}")
                 await asyncio.sleep(1)
     
-    async def broadcast_packets():
-        """从队列中读取数据包并发送给对应的WebSocket客户端"""
+    async def broadcast_sip_messages():
+        """从队列中读取SIP消息并发送给对应的WebSocket客户端"""
         while True:
             try:
                 # 非阻塞地检查队列
                 await asyncio.sleep(0.01)  # 更短的延迟，保证实时性
                 
-                # 批量获取数据包（最多100个）
-                packets_to_send = []
-                while not packet_queue.empty() and len(packets_to_send) < 100:
+                # 批量获取消息（最多100个）
+                messages_to_send = []
+                while not sip_message_queue.empty() and len(messages_to_send) < 100:
                     try:
-                        packets_to_send.append(packet_queue.get_nowait())
+                        messages_to_send.append(sip_message_queue.get_nowait())
                     except queue.Empty:
                         break
                 
-                # 发送数据包给对应的WebSocket
-                for ws, packet_info in packets_to_send:
+                # 发送消息给对应的WebSocket
+                for ws, message_record in messages_to_send:
                     try:
                         # 检查WebSocket是否还在订阅列表中
-                        if ws in packet_subscribers:
-                            await _send_packet(ws, packet_info)
+                        if ws in sip_message_subscribers:
+                            await _send_sip_message(ws, message_record)
                         else:
                             # WebSocket已断开，跳过
                             pass
                     except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK):
                         # 连接已关闭，移除订阅者
-                        packet_subscribers.discard(ws)
-                        if ws in packet_callbacks:
-                            callback_ref = packet_callbacks[ws]
-                            if PACKET_CAPTURE_AVAILABLE:
-                                capture = get_capture()
-                                if capture:
-                                    capture.unsubscribe(callback_ref)
-                            del packet_callbacks[ws]
+                        sip_message_subscribers.discard(ws)
+                        if ws in sip_message_callbacks:
+                            callback_ref = sip_message_callbacks[ws]
+                            if SIP_TRACKER_AVAILABLE:
+                                tracker = get_tracker()
+                                if tracker:
+                                    tracker.unsubscribe(callback_ref)
+                            del sip_message_callbacks[ws]
                     except Exception as e:
-                        print(f"[MML-ERROR] 发送数据包失败: {e}", file=sys.stderr, flush=True)
+                        print(f"[MML-ERROR] 发送SIP消息失败: {e}", file=sys.stderr, flush=True)
             except Exception as e:
-                print(f"[MML-ERROR] 数据包广播错误: {e}", file=sys.stderr, flush=True)
+                print(f"[MML-ERROR] SIP消息广播错误: {e}", file=sys.stderr, flush=True)
                 await asyncio.sleep(0.1)
     
     def start_websocket_server(port=8889):
@@ -3069,12 +3114,12 @@ if WEBSOCKET_AVAILABLE:
             async with websockets.serve(handler, "0.0.0.0", port):
                 print(f"[MML] WebSocket 服务已启动: ws://0.0.0.0:{port}")
                 print(f"[MML]   - 日志推送: ws://0.0.0.0:{port}/ws/logs")
-                if PACKET_CAPTURE_AVAILABLE:
-                    print(f"[MML]   - 数据包抓取: ws://0.0.0.0:{port}/ws/packets")
+                if SIP_TRACKER_AVAILABLE:
+                    print(f"[MML]   - SIP消息跟踪: ws://0.0.0.0:{port}/ws/sip-messages")
                 # 启动日志广播任务
                 asyncio.create_task(broadcast_logs())
-                # 启动数据包广播任务
-                asyncio.create_task(broadcast_packets())
+                # 启动SIP消息广播任务
+                asyncio.create_task(broadcast_sip_messages())
                 await asyncio.Future()  # 永久运行
         
         def run():

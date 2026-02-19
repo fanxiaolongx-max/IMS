@@ -121,10 +121,10 @@ WebSocket连接
 ### 新增文件
 
 - `web/packet_capture.py` - 抓包模块
-- `web/PACKET_CAPTURE_GUIDE.md` - 使用指南
-- `web/PACKET_CAPTURE_QUICKSTART.md` - 快速开始
-- `web/PACKET_CAPTURE_INTEGRATION.md` - 集成说明
-- `web/PACKET_CAPTURE_SUMMARY.md` - 本文档
+- [PACKET_CAPTURE_GUIDE.md](PACKET_CAPTURE_GUIDE.md) - 使用指南
+- [PACKET_CAPTURE_QUICKSTART.md](PACKET_CAPTURE_QUICKSTART.md) - 快速开始
+- [PACKET_CAPTURE_INTEGRATION.md](PACKET_CAPTURE_INTEGRATION.md) - 集成说明
+- 本文档：PACKET_CAPTURE_SUMMARY.md
 
 ### 修改文件
 

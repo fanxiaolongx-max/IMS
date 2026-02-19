@@ -135,7 +135,7 @@ log = init_logging(level="INFO", log_file="logs/ims-sip-server.log")
 
 ## 📚 相关文档
 
-- [日志系统文档](../docs/SIP_CORE_README.md#日志系统)
+- [日志系统文档](SIP_CORE_README.md#日志系统)
 - [故障排查指南](../README.md#常见问题)
 
 ---

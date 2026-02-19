@@ -79,8 +79,8 @@ CONFIG_DEFINITIONS = {
 
 ## 📚 相关文档
 
-- [配置编辑指南](../docs/WEB_CONFIG_EDIT_GUIDE.md)
-- [配置编辑快速指南](../docs/CONFIG_EDIT_QUICKSTART.md)
+- [配置编辑指南](WEB_CONFIG_EDIT_GUIDE.md)
+- [配置编辑快速指南](CONFIG_EDIT_QUICKSTART.md)
 
 ---
 

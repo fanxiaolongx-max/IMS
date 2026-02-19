@@ -301,48 +301,29 @@
         }
         
         /* 历史记录区域 */
-        /* 数据包抓取面板 */
-        #packet-content {
+        /* SIP消息跟踪面板 */
+        #sip-messages-content {
             display: flex;
             flex-direction: column;
-            height: 100%;
+            flex: 1;
+            min-height: 0;
             background: #1e1e1e;
         }
 
-        .packet-controls {
+        .sip-messages-controls {
+            flex-shrink: 0;
             padding: 15px;
             background: #2d2d30;
             border-bottom: 1px solid #3e3e42;
         }
 
-        .packet-control-row {
+        .sip-messages-control-row {
             display: flex;
             align-items: center;
             gap: 10px;
-            margin-bottom: 10px;
         }
 
-        .packet-control-row:last-child {
-            margin-bottom: 0;
-        }
-
-        .packet-control-row label {
-            font-size: 12px;
-            color: #cccccc;
-            white-space: nowrap;
-        }
-
-        .packet-control-row select,
-        .packet-control-row input {
-            background: #3c3c3c;
-            border: 1px solid #4ec9b0;
-            color: #d4d4d4;
-            padding: 5px 10px;
-            border-radius: 3px;
-            font-size: 12px;
-        }
-
-        .packet-btn {
+        .sip-messages-btn {
             background: #0e639c;
             color: white;
             border: none;
@@ -353,86 +334,216 @@
             transition: background 0.2s;
         }
 
-        .packet-btn:hover:not(:disabled) {
+        .sip-messages-btn:hover {
             background: #1177bb;
         }
-
-        .packet-btn:disabled {
-            background: #3c3c3c;
-            color: #666;
-            cursor: not-allowed;
+        
+        .sip-messages-btn.paused {
+            background: #d32f2f;
+        }
+        
+        .sip-messages-btn.paused:hover {
+            background: #f44336;
         }
 
-        #packet-stats {
+        #sip-messages-stats {
             font-size: 12px;
             color: #4ec9b0;
             margin-left: auto;
         }
 
-        .packet-list {
+        .sip-messages-table-container {
             flex: 1;
-            overflow-y: auto;
-            padding: 10px;
-            font-family: 'Consolas', 'Monaco', monospace;
+            display: flex;
+            flex-direction: column;
+            background: #1e1e1e;
+            min-height: 0; /* 确保 flex 子元素可以正确滚动 */
+            overflow: hidden; /* 外层容器不滚动，由内层容器滚动 */
+        }
+
+        .sip-messages-table-scroll-wrapper {
+            flex: 1;
+            overflow: auto;
+            min-height: 0;
+            /* 添加底部 padding，确保最后几条消息可见 */
+            padding-bottom: 50px;
+        }
+
+        .sip-messages-table {
+            width: 100%;
+            border-collapse: collapse;
             font-size: 11px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            table-layout: auto; /* 允许列宽自适应 */
         }
 
-        .packet-entry {
+        .sip-messages-table thead {
+            position: sticky;
+            top: 0;
+            background: #2d2d30;
+            z-index: 10;
+        }
+
+        .sip-messages-spacer-row td {
+            padding: 6px 8px !important;
+            border: none !important;
+            background: transparent !important;
+            height: auto;
+        }
+
+        .sip-messages-table th {
             padding: 8px;
-            margin-bottom: 5px;
-            background: #252526;
-            border-left: 3px solid #4ec9b0;
-            border-radius: 3px;
-            cursor: pointer;
-            transition: background 0.2s;
+            text-align: left;
+            border-bottom: 2px solid #3e3e42;
+            color: #cccccc;
+            font-weight: bold;
+            background: #2d2d30;
+            position: relative;
+            white-space: nowrap; /* 防止表头文字换行 */
+            min-width: 80px; /* 最小列宽 */
+        }
+        
+        /* 列宽调整手柄 */
+        .sip-messages-table th .resize-handle {
+            position: absolute;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+            cursor: col-resize;
+            background: transparent;
+            z-index: 11;
+        }
+        
+        .sip-messages-table th .resize-handle:hover {
+            background: #007acc;
+        }
+        
+        .sip-messages-table th.resizing {
+            user-select: none;
         }
 
-        .packet-entry:hover {
+        .sip-messages-table td {
+            padding: 6px 8px;
+            border-bottom: 1px solid #2d2d30;
+            color: #d4d4d4;
+            white-space: nowrap; /* 防止单元格内容换行 */
+            overflow: hidden;
+            text-overflow: ellipsis; /* 超出部分显示省略号 */
+        }
+
+        .sip-messages-table tbody tr {
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .sip-messages-table tbody tr:hover {
             background: #2d2d30;
         }
 
-        .packet-entry.sip {
-            border-left-color: #4ec9b0;
+        .sip-messages-table tbody tr.selected {
+            background: #0e639c;
         }
 
-        .packet-entry.udp {
-            border-left-color: #ce9178;
-        }
-
-        .packet-entry.tcp {
-            border-left-color: #569cd6;
-        }
-
-        .packet-entry.icmp {
-            border-left-color: #c586c0;
-        }
-
-        .packet-header {
+        .table-header {
             display: flex;
-            justify-content: space-between;
-            margin-bottom: 5px;
+            flex-direction: column;
+            gap: 4px;
         }
 
-        .packet-time {
-            color: #858585;
-            font-size: 10px;
-        }
-
-        .packet-protocol {
-            color: #4ec9b0;
+        .table-header span {
             font-weight: bold;
         }
 
-        .packet-info {
+        .column-filter {
+            background: #3c3c3c;
+            border: 1px solid #4ec9b0;
             color: #d4d4d4;
-            margin-bottom: 3px;
+            padding: 3px 6px;
+            border-radius: 2px;
+            font-size: 10px;
+            width: 100%;
+            box-sizing: border-box;
         }
 
-        .packet-raw {
-            color: #858585;
-            font-size: 10px;
+        .column-filter:focus {
+            outline: none;
+            border-color: #4ec9b0;
+            background: #3e3e42;
+        }
+
+        /* 消息详情对话框 */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+        }
+
+        .modal-content {
+            background-color: #1e1e1e;
+            margin: 5% auto;
+            padding: 0;
+            border: 1px solid #3e3e42;
+            width: 80%;
+            max-width: 1000px;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+            border-radius: 4px;
+        }
+
+        .modal-header {
+            padding: 15px 20px;
+            background: #2d2d30;
+            border-bottom: 1px solid #3e3e42;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-header h3 {
+            margin: 0;
+            color: #d4d4d4;
+            font-size: 16px;
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: #d4d4d4;
+            font-size: 28px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            line-height: 30px;
+            text-align: center;
+        }
+
+        .modal-close:hover {
+            color: #fff;
+            background: #3e3e42;
+            border-radius: 3px;
+        }
+
+        .modal-body {
+            flex: 1;
+            overflow: auto;
+            padding: 20px;
+        }
+
+        .modal-body pre {
+            margin: 0;
+            color: #d4d4d4;
             font-family: 'Consolas', 'Monaco', monospace;
-            word-break: break-all;
+            font-size: 12px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
         }
 
         #history-content {
@@ -1054,7 +1165,7 @@
                 <div id="output-tabs">
                     <button class="output-tab active" id="current-tab">当前回显</button>
                     <button class="output-tab" id="history-tab">历史记录</button>
-                    <button class="output-tab" id="packet-tab">📡 数据包抓取</button>
+                    <button class="output-tab" id="sip-messages-tab">📡 SIP消息跟踪</button>
                 </div>
                 
                 <!-- 当前回显内容 -->
@@ -1081,30 +1192,125 @@
                     <div id="output-anchor" style="height: 1px;"></div>
                 </div>
                 
-                <!-- 数据包抓取内容 -->
-                <div id="packet-content" style="display: none;">
-                    <div class="packet-controls">
-                        <div class="packet-control-row">
-                            <label>网络接口:</label>
-                            <select id="packet-interface">
-                                <option value="any">any (所有接口)</option>
-                                <option value="eth0">eth0</option>
-                                <option value="eth1">eth1</option>
-                                <option value="lo">lo (本地回环)</option>
-                            </select>
-                            <label>过滤表达式:</label>
-                            <input type="text" id="packet-filter" placeholder="例如: port 5060, host 192.168.1.1" style="flex: 1;">
-                            <button id="packet-start-btn" class="packet-btn">开始抓包</button>
-                            <button id="packet-stop-btn" class="packet-btn" disabled>停止抓包</button>
-                            <button id="packet-clear-btn" class="packet-btn">清空</button>
-                        </div>
-                        <div class="packet-control-row">
-                            <label>显示过滤:</label>
-                            <input type="text" id="packet-display-filter" placeholder="过滤显示的数据包..." style="flex: 1;">
-                            <span id="packet-stats">未开始</span>
+                <!-- SIP消息跟踪内容 -->
+                <div id="sip-messages-content" style="display: none;">
+                    <div class="sip-messages-controls">
+                        <div class="sip-messages-control-row">
+                            <button id="sip-messages-clear-btn" class="sip-messages-btn">清空</button>
+                            <button id="sip-messages-refresh-btn" class="sip-messages-btn">刷新</button>
+                            <button id="sip-messages-pause-btn" class="sip-messages-btn">暂停跟踪</button>
+                            <span id="sip-messages-stats">加载中...</span>
                         </div>
                     </div>
-                    <div id="packet-list" class="packet-list"></div>
+                    <div id="sip-messages-table-container" class="sip-messages-table-container">
+                        <div class="sip-messages-table-scroll-wrapper">
+                            <table id="sip-messages-table" class="sip-messages-table">
+                            <thead>
+                                <tr>
+                                    <th data-column="time_str">
+                                        <div class="table-header">
+                                            <span>时间</span>
+                                            <input type="text" class="column-filter" data-column="time_str" placeholder="过滤时间...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="method">
+                                        <div class="table-header">
+                                            <span>消息类型</span>
+                                            <input type="text" class="column-filter" data-column="method" placeholder="过滤类型...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="direction">
+                                        <div class="table-header">
+                                            <span>方向</span>
+                                            <input type="text" class="column-filter" data-column="direction" placeholder="过滤方向...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="registered_user">
+                                        <div class="table-header">
+                                            <span>注册号码</span>
+                                            <input type="text" class="column-filter" data-column="registered_user" placeholder="过滤注册号...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="from_user">
+                                        <div class="table-header">
+                                            <span>主叫</span>
+                                            <input type="text" class="column-filter" data-column="from_user" placeholder="过滤主叫...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="callee">
+                                        <div class="table-header">
+                                            <span>被叫</span>
+                                            <input type="text" class="column-filter" data-column="callee" placeholder="过滤被叫...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="src_ip">
+                                        <div class="table-header">
+                                            <span>源IP:端口</span>
+                                            <input type="text" class="column-filter" data-column="src_ip" placeholder="过滤源IP...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="dst_ip">
+                                        <div class="table-header">
+                                            <span>目标IP:端口</span>
+                                            <input type="text" class="column-filter" data-column="dst_ip" placeholder="过滤目标IP...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="src_ip_nat">
+                                        <div class="table-header">
+                                            <span>源IP:端口(NAT前)</span>
+                                            <input type="text" class="column-filter" data-column="src_ip_nat" placeholder="过滤NAT前源IP...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="dst_ip_nat">
+                                        <div class="table-header">
+                                            <span>目标IP:端口(NAT前)</span>
+                                            <input type="text" class="column-filter" data-column="dst_ip_nat" placeholder="过滤NAT前目标IP...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="call_id">
+                                        <div class="table-header">
+                                            <span>Call-ID</span>
+                                            <input type="text" class="column-filter" data-column="call_id" placeholder="过滤Call-ID...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="sdp_info">
+                                        <div class="table-header">
+                                            <span>SDP信息</span>
+                                            <input type="text" class="column-filter" data-column="sdp_info" placeholder="过滤SDP...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                </tr>
+                            </thead>
+                            <tbody id="sip-messages-tbody">
+                                <tr><td colspan="12" style="text-align: center; color: #858585; padding: 20px;">正在加载...</td></tr>
+                            </tbody>
+                        </table>
+                        </div>
+                    </div>
+                    <!-- 消息详情对话框 -->
+                    <div id="sip-message-detail-modal" class="modal" style="display: none;">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h3>SIP消息详情</h3>
+                                <button class="modal-close" id="sip-message-detail-close">&times;</button>
+                            </div>
+                            <div class="modal-body">
+                                <pre id="sip-message-detail-content"></pre>
+                            </div>
+                        </div>
+                    </div>
                 </div>
                 
                 <!-- 历史记录内容 -->
@@ -1633,13 +1839,19 @@
             try {
                 // 动态获取 WebSocket 地址：使用当前页面的主机和端口+1
                 const wsHost = window.location.hostname;
-                // 获取当前 HTTP 端口，如果为空或无效则使用默认值 8888
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                // 获取当前 HTTP 端口，如果为空或无效则使用默认值
                 const httpPort = window.location.port ? parseInt(window.location.port) : 
                                  (window.location.protocol === 'https:' ? 443 : 80);
-                // WebSocket 端口 = HTTP 端口 + 1（如果 HTTP 端口是 80，则使用 8889）
-                const wsPort = (httpPort === 80 || httpPort === 443) ? 8889 : (httpPort + 1);
-                const wsUrl = `ws://${wsHost}:${wsPort}/ws/logs`;
-                console.log(`[WebSocket] 连接到: ${wsUrl}`);
+                
+                // 如果通过 Cloudflare 隧道访问（trycloudflare.com），WebSocket 使用相同端口（HTTP 升级）
+                // 否则使用端口 + 1（独立 WebSocket 服务器）
+                const isCloudflareTunnel = window.location.hostname.includes('trycloudflare.com');
+                const wsPort = isCloudflareTunnel ? httpPort : ((httpPort === 80 || httpPort === 443) ? 8889 : (httpPort + 1));
+                
+                // HTTPS 页面必须使用 WSS，HTTP 页面使用 WS
+                const wsUrl = `${wsProtocol}//${wsHost}:${wsPort}/ws/logs`;
+                console.log(`[WebSocket] 连接到: ${wsUrl} (isCloudflareTunnel: ${isCloudflareTunnel})`);
                 ws = new WebSocket(wsUrl);
 
                 ws.onopen = () => {
@@ -1664,10 +1876,21 @@
 
                 ws.onerror = () => {
                     appendLog('WebSocket 连接错误（实时日志不可用）', 'WARNING');
+                    // 如果是通过 Cloudflare 隧道访问，提示 WebSocket 不可用
+                    if (window.location.hostname.includes('trycloudflare.com')) {
+                        appendLog('通过 Cloudflare 临时隧道访问时，WebSocket 实时日志不可用', 'WARNING');
+                    }
                 };
 
                 ws.onclose = (event) => {
                     appendLog(`WebSocket 连接已关闭 (code: ${event.code}, reason: ${event.reason || 'none'})`, 'WARNING');
+                    
+                    // 如果是通过 Cloudflare 隧道访问，不自动重连
+                    if (window.location.hostname.includes('trycloudflare.com')) {
+                        appendLog('通过 Cloudflare 临时隧道访问，不自动重连 WebSocket', 'INFO');
+                        return;
+                    }
+                    
                     // 如果连接意外关闭，尝试重连（延迟3秒）
                     if (event.code !== 1000) {  // 1000是正常关闭
                         setTimeout(() => {
@@ -2350,81 +2573,310 @@
         function initOutputTabs() {
             const currentTab = document.getElementById('current-tab');
             const historyTab = document.getElementById('history-tab');
-            const packetTab = document.getElementById('packet-tab');
+            const sipMessagesTab = document.getElementById('sip-messages-tab');
             const outputContent = document.getElementById('output-content');
             const historyContent = document.getElementById('history-content');
-            const packetContent = document.getElementById('packet-content');
+            const sipMessagesContent = document.getElementById('sip-messages-content');
             
             currentTab.addEventListener('click', () => {
                 currentTab.classList.add('active');
                 historyTab.classList.remove('active');
-                packetTab.classList.remove('active');
+                sipMessagesTab.classList.remove('active');
                 outputContent.style.display = 'block';
                 historyContent.style.display = 'none';
-                packetContent.style.display = 'none';
+                sipMessagesContent.style.display = 'none';
+                if (sipMessagesPollIntervalId) { clearInterval(sipMessagesPollIntervalId); sipMessagesPollIntervalId = null; }
+                // 恢复 MML 输入区和补全框
+                const inputArea = document.getElementById('input-area');
+                const paramForm = document.getElementById('param-form');
+                const horizontalResizer = document.getElementById('horizontal-resizer');
+                if (inputArea) {
+                    inputArea.style.display = '';
+                    inputArea.style.height = '';
+                    inputArea.style.minHeight = '';
+                    inputArea.style.maxHeight = '';
+                    inputArea.style.padding = '';
+                    inputArea.style.margin = '';
+                }
+                if (paramForm) {
+                    paramForm.style.display = '';  // 由 checkAndShowParamForm 控制显示
+                    paramForm.style.height = '';
+                    paramForm.style.minHeight = '';
+                    paramForm.style.maxHeight = '';
+                }
+                if (horizontalResizer) {
+                    horizontalResizer.style.display = '';
+                    horizontalResizer.style.height = '';
+                    horizontalResizer.style.margin = '';
+                }
             });
             
             historyTab.addEventListener('click', () => {
                 historyTab.classList.add('active');
                 currentTab.classList.remove('active');
-                packetTab.classList.remove('active');
+                sipMessagesTab.classList.remove('active');
                 historyContent.style.display = 'flex';
                 outputContent.style.display = 'none';
-                packetContent.style.display = 'none';
+                sipMessagesContent.style.display = 'none';
+                if (sipMessagesPollIntervalId) { clearInterval(sipMessagesPollIntervalId); sipMessagesPollIntervalId = null; }
+                // 恢复 MML 输入区和补全框
+                const inputArea = document.getElementById('input-area');
+                const paramForm = document.getElementById('param-form');
+                const horizontalResizer = document.getElementById('horizontal-resizer');
+                if (inputArea) {
+                    inputArea.style.display = '';
+                    inputArea.style.height = '';
+                    inputArea.style.minHeight = '';
+                    inputArea.style.maxHeight = '';
+                    inputArea.style.padding = '';
+                    inputArea.style.margin = '';
+                }
+                if (paramForm) {
+                    paramForm.style.display = '';
+                    paramForm.style.height = '';
+                    paramForm.style.minHeight = '';
+                    paramForm.style.maxHeight = '';
+                }
+                if (horizontalResizer) {
+                    horizontalResizer.style.display = '';
+                    horizontalResizer.style.height = '';
+                    horizontalResizer.style.margin = '';
+                }
             });
             
-            packetTab.addEventListener('click', () => {
-                packetTab.classList.add('active');
+            sipMessagesTab.addEventListener('click', () => {
+                sipMessagesTab.classList.add('active');
                 currentTab.classList.remove('active');
                 historyTab.classList.remove('active');
-                packetContent.style.display = 'flex';
+                sipMessagesContent.style.display = 'flex';
                 outputContent.style.display = 'none';
                 historyContent.style.display = 'none';
+                // 切换到SIP消息跟踪时彻底隐藏所有 MML 补全组件，释放空间
+                const inputArea = document.getElementById('input-area');
+                const paramForm = document.getElementById('param-form');
+                const autocompleteDropdown = document.getElementById('autocomplete-dropdown');
+                const horizontalResizer = document.getElementById('horizontal-resizer');
+                if (inputArea) {
+                    inputArea.style.display = 'none';
+                    inputArea.style.height = '0';
+                    inputArea.style.minHeight = '0';
+                    inputArea.style.maxHeight = '0';
+                    inputArea.style.padding = '0';
+                    inputArea.style.margin = '0';
+                }
+                if (paramForm) {
+                    paramForm.style.display = 'none';
+                    paramForm.style.height = '0';
+                    paramForm.style.minHeight = '0';
+                    paramForm.style.maxHeight = '0';
+                }
+                if (autocompleteDropdown) {
+                    autocompleteDropdown.style.display = 'none';
+                }
+                if (horizontalResizer) {
+                    horizontalResizer.style.display = 'none';
+                    horizontalResizer.style.height = '0';
+                    horizontalResizer.style.margin = '0';
+                }
+                loadSipMessages();
+                // 启动轮询：补全 WebSocket 延迟/漏推的消息（如 re-INVITE 200 的 ACK FWD）
+                if (sipMessagesPollIntervalId) clearInterval(sipMessagesPollIntervalId);
+                sipMessagesPollIntervalId = setInterval(() => {
+                    if (sipMessagesPaused) return;
+                    loadSipMessages();
+                }, 3000);
+                
+                // 添加滚动事件监听器，检测用户手动滚动
+                const scrollWrapper = document.querySelector('.sip-messages-table-scroll-wrapper');
+                if (scrollWrapper) {
+                    // 移除之前的监听器（如果存在）
+                    scrollWrapper.removeEventListener('scroll', handleSipMessagesScroll);
+                    // 添加新的监听器
+                    scrollWrapper.addEventListener('scroll', handleSipMessagesScroll);
+                }
             });
         }
         
-        // 数据包抓取功能
-        let packetWebSocket = null;
-        let packetList = [];
-        let displayFilter = '';
+        // SIP消息跟踪功能
+        let sipMessagesWebSocket = null;
+        let sipMessagesList = [];
+        let columnFilters = {};
+        let selectedMessageId = null;
+        let sipMessagesPaused = false; // 跟踪是否暂停
+        let sipMessagesPollIntervalId = null; // 轮询定时器，补全 WebSocket 延迟/漏推的消息（如 re-INVITE 200 的 ACK FWD）
+        let sipMessagesUserScrolled = false; // 跟踪用户是否手动滚动过
+        let sipMessagesAutoScrollTimeout = null; // 自动滚动定时器，用于防抖
         
-        function initPacketCapture() {
-            const startBtn = document.getElementById('packet-start-btn');
-            const stopBtn = document.getElementById('packet-stop-btn');
-            const clearBtn = document.getElementById('packet-clear-btn');
-            const displayFilterInput = document.getElementById('packet-display-filter');
+        // 初始化列宽调整功能
+        function initColumnResize() {
+            const table = document.getElementById('sip-messages-table');
+            if (!table) return;
             
-            startBtn.addEventListener('click', () => {
-                const interface = document.getElementById('packet-interface').value;
-                const filter = document.getElementById('packet-filter').value;
-                startPacketCapture(interface, filter);
+            const headers = table.querySelectorAll('thead th');
+            let isResizing = false;
+            let currentHeader = null;
+            let startX = 0;
+            let startWidth = 0;
+            
+            // 从 localStorage 恢复列宽
+            const savedWidths = JSON.parse(localStorage.getItem('sip-messages-column-widths') || '{}');
+            headers.forEach((header, index) => {
+                const columnName = header.getAttribute('data-column');
+                if (savedWidths[columnName]) {
+                    header.style.width = savedWidths[columnName] + 'px';
+                }
             });
             
-            stopBtn.addEventListener('click', () => {
-                stopPacketCapture();
+            headers.forEach((header, index) => {
+                const handle = header.querySelector('.resize-handle');
+                if (!handle) return;
+                
+                handle.addEventListener('mousedown', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    isResizing = true;
+                    currentHeader = header;
+                    startX = e.clientX;
+                    startWidth = header.offsetWidth;
+                    header.classList.add('resizing');
+                    document.body.style.cursor = 'col-resize';
+                    document.body.style.userSelect = 'none';
+                });
             });
             
+            document.addEventListener('mousemove', (e) => {
+                if (!isResizing || !currentHeader) return;
+                
+                const diff = e.clientX - startX;
+                const newWidth = Math.max(80, startWidth + diff); // 最小宽度 80px
+                currentHeader.style.width = newWidth + 'px';
+                
+                // 保存列宽到 localStorage
+                const columnName = currentHeader.getAttribute('data-column');
+                if (columnName) {
+                    const savedWidths = JSON.parse(localStorage.getItem('sip-messages-column-widths') || '{}');
+                    savedWidths[columnName] = newWidth;
+                    localStorage.setItem('sip-messages-column-widths', JSON.stringify(savedWidths));
+                }
+            });
+            
+            document.addEventListener('mouseup', () => {
+                if (isResizing) {
+                    isResizing = false;
+                    if (currentHeader) {
+                        currentHeader.classList.remove('resizing');
+                    }
+                    currentHeader = null;
+                    document.body.style.cursor = '';
+                    document.body.style.userSelect = '';
+                }
+            });
+        }
+        
+        function initSipMessages() {
+            // 初始化列宽调整功能
+            initColumnResize();
+            
+            const clearBtn = document.getElementById('sip-messages-clear-btn');
+            const refreshBtn = document.getElementById('sip-messages-refresh-btn');
+            const pauseBtn = document.getElementById('sip-messages-pause-btn');
+            const closeModalBtn = document.getElementById('sip-message-detail-close');
+            const modal = document.getElementById('sip-message-detail-modal');
+            
+            // 清空按钮
             clearBtn.addEventListener('click', () => {
-                packetList = [];
-                updatePacketDisplay();
+                if (confirm('确定要清空所有SIP消息记录吗？')) {
+                    clearSipMessages();
+                }
             });
             
-            displayFilterInput.addEventListener('input', (e) => {
-                displayFilter = e.target.value.toLowerCase();
-                updatePacketDisplay();
+            // 刷新按钮
+            refreshBtn.addEventListener('click', () => {
+                loadSipMessages();
             });
+            
+            // 暂停/恢复跟踪按钮
+            pauseBtn.addEventListener('click', () => {
+                sipMessagesPaused = !sipMessagesPaused;
+                if (sipMessagesPaused) {
+                    pauseBtn.textContent = '恢复跟踪';
+                    pauseBtn.classList.add('paused');
+                    console.log('[SIPMessages] 跟踪已暂停');
+                    // 更新统计信息显示暂停状态
+                    const statsSpan = document.getElementById('sip-messages-stats');
+                    if (statsSpan) {
+                        const currentText = statsSpan.textContent;
+                        statsSpan.textContent = currentText + ' [已暂停]';
+                        statsSpan.style.color = '#ff9800';
+                    }
+                } else {
+                    pauseBtn.textContent = '暂停跟踪';
+                    pauseBtn.classList.remove('paused');
+                    console.log('[SIPMessages] 跟踪已恢复');
+                    // 恢复统计信息显示
+                    const statsSpan = document.getElementById('sip-messages-stats');
+                    if (statsSpan) {
+                        statsSpan.style.color = '';
+                    }
+                    // 恢复后立即加载一次最新消息
+                    loadSipMessages();
+                }
+            });
+            
+            // 关闭对话框
+            closeModalBtn.addEventListener('click', () => {
+                modal.style.display = 'none';
+            });
+            
+            // 点击对话框外部关闭
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    modal.style.display = 'none';
+                }
+            });
+            
+            // 初始化列过滤
+            document.querySelectorAll('.column-filter').forEach(input => {
+                input.addEventListener('input', (e) => {
+                    const column = e.target.dataset.column;
+                    const value = e.target.value.trim();
+                    if (value) {
+                        columnFilters[column] = value;
+                    } else {
+                        delete columnFilters[column];
+                    }
+                    updateSipMessagesDisplay();
+                });
+            });
+            
+            // 连接WebSocket接收实时消息
+            connectSipMessagesWebSocket();
+            
+            // 初始加载
+            loadSipMessages();
+            
+            // 初始化滚动事件监听器
+            const scrollWrapper = document.querySelector('.sip-messages-table-scroll-wrapper');
+            if (scrollWrapper) {
+                scrollWrapper.addEventListener('scroll', handleSipMessagesScroll);
+            }
         }
         
-        function startPacketCapture(interface, filter) {
-            const startBtn = document.getElementById('packet-start-btn');
-            const stopBtn = document.getElementById('packet-stop-btn');
-            const statsSpan = document.getElementById('packet-stats');
+        // 加载SIP消息列表
+        function loadSipMessages() {
+            const params = new URLSearchParams();
+            params.append('action', 'list');
+            params.append('limit', '2000');  // 增加到 2000，确保 BYE 200 FWD 等消息不被截掉
+            params.append('offset', '0');
             
-            // 调用API启动抓包
-            const url = `/api/packet-capture?action=start&interface=${encodeURIComponent(interface)}&filter=${encodeURIComponent(filter)}`;
-            fetch(url, {
+            // 添加过滤条件
+            Object.keys(columnFilters).forEach(key => {
+                params.append(key, columnFilters[key]);
+            });
+            
+            fetch(`/api/sip-messages?${params.toString()}`, {
                 method: 'GET',
-                credentials: 'include'  // 包含cookie
+                credentials: 'include'
             })
                 .then(response => {
                     if (response.redirected || response.status === 302) {
@@ -2437,265 +2889,400 @@
                 })
                 .then(data => {
                     if (data.success) {
-                        startBtn.disabled = true;
-                        stopBtn.disabled = false;
-                        statsSpan.textContent = '抓包中...';
-                        
-                        // 连接WebSocket接收数据包
-                        connectPacketWebSocket();
-                    } else {
-                        alert('启动抓包失败: ' + data.message);
-                    }
-                })
-                .catch(error => {
-                    alert('启动抓包失败: ' + error);
-                });
-        }
-        
-        function stopPacketCapture() {
-            const startBtn = document.getElementById('packet-start-btn');
-            const stopBtn = document.getElementById('packet-stop-btn');
-            const statsSpan = document.getElementById('packet-stats');
-            
-            // 调用API停止抓包
-            fetch('/api/packet-capture?action=stop', {
-                method: 'GET',
-                credentials: 'include',  // 包含cookie
-                headers: {
-                    'Content-Type': 'application/json'
-                }
-            })
-                .then(response => {
-                    // 检查是否是重定向（302）
-                    if (response.redirected || response.status === 302) {
-                        throw new Error('需要登录，请刷新页面');
-                    }
-                    if (!response.ok) {
-                        // 尝试读取错误响应
-                        return response.text().then(text => {
-                            try {
-                                const data = JSON.parse(text);
-                                throw new Error(data.message || `HTTP错误: ${response.status}`);
-                            } catch {
-                                throw new Error(`HTTP错误: ${response.status} - ${text.substring(0, 100)}`);
+                        console.log('[SIPMessages] 加载成功，收到', data.records?.length || 0, '条消息');
+                        // 合并而不是替换：保留 WebSocket 推送的最新消息，避免最后一条消息丢失
+                        const newRecords = data.records || [];
+                        // 按 ID 合并：保留 ID 更大的消息（更新的）
+                        const mergedMap = new Map();
+                        // 先添加现有消息（WebSocket 推送的，可能更新）
+                        sipMessagesList.forEach(msg => {
+                            mergedMap.set(msg.id, msg);
+                        });
+                        // 再添加后端返回的消息，如果 ID 不存在或时间戳更新则覆盖
+                        newRecords.forEach(record => {
+                            const existing = mergedMap.get(record.id);
+                            if (!existing || (record.timestamp && existing.timestamp && record.timestamp > existing.timestamp)) {
+                                mergedMap.set(record.id, record);
                             }
                         });
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    if (data && data.success) {
-                        startBtn.disabled = false;
-                        stopBtn.disabled = true;
-                        
-                        // 断开WebSocket
-                        if (packetWebSocket) {
-                            packetWebSocket.close();
-                            packetWebSocket = null;
+                        sipMessagesList = Array.from(mergedMap.values());
+                        // 按 ID 排序（ID 越大越新），确保数组顺序正确
+                        sipMessagesList.sort((a, b) => (a.id || 0) - (b.id || 0));
+                        // 限制列表大小（保留最新的，ID 最大的 2000 条）
+                        if (sipMessagesList.length > 2000) {
+                            sipMessagesList = sipMessagesList.slice(-2000);
                         }
-                        
-                        // 更新统计
-                        updatePacketStats();
-                        console.log('[PacketCapture] 抓包已停止:', data.message);
+                        updateSipMessagesStats(data.stats || {});
+                        updateSipMessagesDisplay();
                     } else {
-                        alert('停止抓包失败: ' + (data?.message || '未知错误'));
+                        console.error('[SIPMessages] 加载失败:', data.message);
                     }
                 })
                 .catch(error => {
-                    console.error('[PacketCapture] 停止抓包错误:', error);
-                    // 如果是网络错误，可能是认证问题
-                    if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
-                        alert('停止抓包失败: 网络错误，可能是认证问题。请刷新页面后重试。');
-                    } else {
-                        alert('停止抓包失败: ' + error.message);
-                    }
+                    console.error('[SIPMessages] 加载错误:', error);
                 });
         }
         
-        function connectPacketWebSocket() {
+        // 清空SIP消息
+        function clearSipMessages() {
+            fetch('/api/sip-messages?action=clear', {
+                method: 'GET',
+                credentials: 'include'
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        sipMessagesList = [];
+                        updateSipMessagesDisplay();
+                        updateSipMessagesStats({ total: 0 });
+                    } else {
+                        alert('清空失败: ' + data.message);
+                    }
+                })
+                .catch(error => {
+                    console.error('[SIPMessages] 清空错误:', error);
+                });
+        }
+        
+        // 连接WebSocket接收实时SIP消息
+        function connectSipMessagesWebSocket() {
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsPort = parseInt(window.location.port) + 1;
-            const wsUrl = `${wsProtocol}//${window.location.hostname}:${wsPort}/ws/packets`;
+            const httpPort = window.location.port ? parseInt(window.location.port) : 
+                             (window.location.protocol === 'https:' ? 443 : 80);
             
-            console.log('[PacketCapture] 连接WebSocket:', wsUrl);
-            packetWebSocket = new WebSocket(wsUrl);
+            // 如果通过 Cloudflare 隧道访问（trycloudflare.com），WebSocket 使用相同端口（HTTP 升级）
+            // 否则使用端口 + 1（独立 WebSocket 服务器）
+            const isCloudflareTunnel = window.location.hostname.includes('trycloudflare.com');
+            const wsPort = isCloudflareTunnel ? httpPort : ((httpPort === 80 || httpPort === 443) ? 8889 : (httpPort + 1));
+            const wsUrl = `${wsProtocol}//${window.location.hostname}:${wsPort}/ws/sip-messages`;
             
-            packetWebSocket.onopen = () => {
-                console.log('[PacketCapture] WebSocket连接已建立');
+            console.log('[SIPMessages] 连接WebSocket:', wsUrl, 'isCloudflareTunnel:', isCloudflareTunnel);
+            sipMessagesWebSocket = new WebSocket(wsUrl);
+            
+            sipMessagesWebSocket.onopen = () => {
+                console.log('[SIPMessages] WebSocket连接已建立');
+                // 连接成功后，立即加载一次消息列表（确保能看到历史消息）
+                loadSipMessages();
             };
             
-            packetWebSocket.onmessage = (event) => {
+            sipMessagesWebSocket.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
+                    console.log('[SIPMessages] 收到消息:', data);
                     
-                    // 检查是否是系统消息（如连接确认）
-                    if (data.type && data.type !== 'packet') {
-                        console.log('[PacketCapture] 收到系统消息:', data);
+                    // 检查是否是系统消息
+                    if (data.type && data.type !== 'connected') {
                         if (data.type === 'connected') {
-                            console.log('[PacketCapture]', data.message);
+                            console.log('[SIPMessages]', data.message);
                         }
-                        return; // 不添加到数据包列表
+                        return;
                     }
                     
-                    // 这是实际的数据包
-                    console.log('[PacketCapture] 收到数据包:', data);
-                    packetList.push(data);
-                    
-                    // 限制列表大小（保留最近1000个）
-                    if (packetList.length > 1000) {
-                        packetList.shift();
+                    // 如果暂停跟踪，忽略新消息
+                    if (sipMessagesPaused) {
+                        console.log('[SIPMessages] 跟踪已暂停，忽略新消息:', data.id || 'unknown');
+                        return;
                     }
                     
-                    updatePacketDisplay();
-                    updatePacketStats();
+                    // 这是实际的SIP消息记录
+                    if (data.id) {
+                        console.log('[SIPMessages] 收到SIP消息记录，ID:', data.id, '方向:', data.direction, '方法:', data.method || data.status_code, '时间戳:', data.timestamp);
+                        // 检查是否已存在（避免重复）
+                        const exists = sipMessagesList.find(m => m.id === data.id);
+                        if (!exists) {
+                            sipMessagesList.push(data);
+                            console.log('[SIPMessages] 添加到列表，当前总数:', sipMessagesList.length, '消息ID:', data.id);
+                            // 限制列表大小（保留最近2000个，与 loadSipMessages 的 limit 保持一致）
+                            if (sipMessagesList.length > 2000) {
+                                sipMessagesList.shift();
+                            }
+                            // 立即更新显示，避免延迟导致消息丢失
+                            updateSipMessagesDisplay();
+                            console.log('[SIPMessages] 显示已更新，列表中的消息ID范围:', 
+                                sipMessagesList.length > 0 ? `${sipMessagesList[0].id}-${sipMessagesList[sipMessagesList.length-1].id}` : 'empty');
+                        } else {
+                            console.log('[SIPMessages] 消息已存在，跳过:', data.id);
+                        }
+                    } else {
+                        console.warn('[SIPMessages] 收到消息但没有ID:', data);
+                    }
                 } catch (e) {
-                    console.error('[PacketCapture] 解析数据包失败:', e, '原始数据:', event.data);
+                    console.error('[SIPMessages] 解析消息失败:', e, '原始数据:', event.data);
                 }
             };
             
-            packetWebSocket.onerror = (error) => {
-                console.error('[PacketCapture] WebSocket错误:', error);
+            sipMessagesWebSocket.onerror = (error) => {
+                console.error('[SIPMessages] WebSocket错误:', error);
+                console.error('[SIPMessages] WebSocket URL:', wsUrl);
+                console.error('[SIPMessages] 当前页面URL:', window.location.href);
+                
+                // 如果是通过 Cloudflare 隧道访问，提示 WebSocket 不可用
+                if (window.location.hostname.includes('trycloudflare.com')) {
+                    console.warn('[SIPMessages] 通过 Cloudflare 临时隧道访问时，WebSocket 功能不可用');
+                    console.warn('[SIPMessages] 请使用 HTTP API 获取 SIP 消息（点击"刷新"按钮）');
+                    // 显示提示信息
+                    const statsDiv = document.getElementById('sip-messages-stats');
+                    if (statsDiv) {
+                        statsDiv.innerHTML = '<div style="color: orange; padding: 10px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; margin: 10px 0;">⚠️ 通过 Cloudflare 临时隧道访问时，WebSocket 实时推送不可用。请使用"刷新"按钮手动获取 SIP 消息。</div>';
+                    }
+                }
             };
             
-            packetWebSocket.onclose = (event) => {
-                console.log('[PacketCapture] WebSocket连接已关闭', 'code:', event.code, 'reason:', event.reason);
-                packetWebSocket = null;
+            sipMessagesWebSocket.onclose = (event) => {
+                console.log('[SIPMessages] WebSocket连接已关闭', 'code:', event.code, 'reason:', event.reason);
+                sipMessagesWebSocket = null;
+                
+                // 如果是通过 Cloudflare 隧道访问，不自动重连
+                if (window.location.hostname.includes('trycloudflare.com')) {
+                    console.log('[SIPMessages] 通过 Cloudflare 临时隧道访问，不自动重连 WebSocket');
+                    return;
+                }
+                
                 // 如果连接意外关闭，尝试重连（延迟3秒）
-                if (event.code !== 1000) {  // 1000是正常关闭
-                    console.log('[PacketCapture] 连接意外关闭，3秒后尝试重连...');
+                if (event.code !== 1000) {
                     setTimeout(() => {
-                        if (document.getElementById('packet-start-btn').disabled) {
-                            console.log('[PacketCapture] 尝试重连WebSocket...');
-                            connectPacketWebSocket();
-                        }
+                        connectSipMessagesWebSocket();
                     }, 3000);
                 }
             };
         }
         
-        function updatePacketDisplay() {
-            const packetListDiv = document.getElementById('packet-list');
-            if (!packetListDiv) {
-                console.error('[PacketCapture] packet-list元素不存在');
+        // 处理用户手动滚动事件
+        function handleSipMessagesScroll() {
+            const scrollWrapper = document.querySelector('.sip-messages-table-scroll-wrapper');
+            if (!scrollWrapper) return;
+            
+            // 检查是否接近底部（距离底部小于50px）
+            const isNearBottom = scrollWrapper.scrollHeight - scrollWrapper.scrollTop - scrollWrapper.clientHeight < 50;
+            
+            // 如果用户滚动到接近底部，重置手动滚动标志，允许后续自动滚动
+            if (isNearBottom) {
+                sipMessagesUserScrolled = false;
+            } else {
+                // 如果用户向上滚动，标记为用户手动滚动
+                sipMessagesUserScrolled = true;
+            }
+        }
+        
+        // 更新SIP消息表格显示
+        function updateSipMessagesDisplay() {
+            const tbody = document.getElementById('sip-messages-tbody');
+            if (!tbody) {
                 return;
             }
             
-            console.log('[PacketCapture] 更新显示，数据包数量:', packetList.length);
-            packetListDiv.innerHTML = '';
+            // 调试：记录更新前的列表状态
+            if (sipMessagesList.length > 0) {
+                const lastMsg = sipMessagesList[sipMessagesList.length - 1];
+                const ackFwdCount = sipMessagesList.filter(m => (m.method === 'ACK' || m.status_code === 'ACK') && m.direction === 'FWD').length;
+                const maxId = Math.max(...sipMessagesList.map(m => m.id || 0));
+                console.log('[SIPMessages] 更新显示，列表总数:', sipMessagesList.length, 'ACK FWD数量:', ackFwdCount, '最大ID:', maxId, '数组最后一条ID:', lastMsg.id);
+            }
             
-            // 应用显示过滤
-            let filteredPackets = packetList;
-            if (displayFilter) {
-                filteredPackets = packetList.filter(p => {
-                    const searchText = JSON.stringify(p).toLowerCase();
-                    return searchText.includes(displayFilter);
+            // 应用列过滤
+            let filteredMessages = sipMessagesList;
+            if (Object.keys(columnFilters).length > 0) {
+                filteredMessages = sipMessagesList.filter(msg => {
+                    for (const [column, filterValue] of Object.entries(columnFilters)) {
+                        const msgValue = String(msg[column] || '').toLowerCase();
+                        if (!msgValue.includes(filterValue.toLowerCase())) {
+                            return false;
+                        }
+                    }
+                    return true;
                 });
             }
             
-            console.log('[PacketCapture] 过滤后数据包数量:', filteredPackets.length);
-            
-            // 显示数据包（最新的在前）
-            filteredPackets.slice().reverse().forEach(packet => {
-                // 跳过系统消息
-                if (packet.type && packet.type !== 'packet') {
-                    return;
+            // 按时间戳和ID排序（从旧到新，便于查看对话流程）
+            // 确保时间戳相同或接近时，ID 大的排在后面（更新的消息）
+            filteredMessages = filteredMessages.slice().sort((a, b) => {
+                // 先按时间戳排序
+                const tsDiff = (a.timestamp || 0) - (b.timestamp || 0);
+                if (Math.abs(tsDiff) > 0.001) {  // 时间戳差异大于 1ms，按时间戳排序
+                    return tsDiff;
                 }
-                
-                // 确保数据包有必要的字段
-                if (!packet.protocol) {
-                    console.warn('[PacketCapture] 数据包缺少protocol字段:', packet);
-                    return;
-                }
-                
-                const entry = document.createElement('div');
-                const protocolClass = packet.sip_method ? 'sip' : (packet.protocol ? packet.protocol.toLowerCase() : 'unknown');
-                entry.className = `packet-entry ${protocolClass}`;
-                
-                // 创建可展开的数据包条目
-                const isExpanded = packet.expanded || false;
-                entry.innerHTML = `
-                    <div class="packet-header" style="cursor: pointer;">
-                        <span class="packet-time">${packet.timestamp || 'N/A'}</span>
-                        <span class="packet-protocol">${packet.protocol || 'UNKNOWN'}</span>
-                        <span class="packet-toggle" style="margin-left: auto; color: #858585;">${isExpanded ? '▼' : '▶'}</span>
-                    </div>
-                    <div class="packet-info">
-                        ${packet.src_ip || 'N/A'}:${packet.src_port || 'N/A'} → ${packet.dst_ip || 'N/A'}:${packet.dst_port || 'N/A'}
-                        ${packet.length ? `(${packet.length} bytes)` : ''}
-                        ${packet.sip_method ? `[SIP: ${packet.sip_method}]` : ''}
-                        ${packet.flags ? `[${packet.flags}]` : ''}
-                    </div>
-                    <div class="packet-detail" style="display: ${isExpanded ? 'block' : 'none'}; margin-top: 8px; padding: 8px; background: #1e1e1e; border-radius: 3px; font-family: 'Consolas', 'Monaco', monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all;">
-                        <div style="color: #4ec9b0; margin-bottom: 5px;">原始数据包:</div>
-                        <div style="color: #d4d4d4;">${escapeHtml(packet.raw || '')}</div>
-                        ${packet.sip_method ? `
-                        <div style="color: #4ec9b0; margin-top: 10px; margin-bottom: 5px;">SIP消息:</div>
-                        <div style="color: #d4d4d4;">${escapeHtml(packet.raw || '')}</div>
-                        ` : ''}
-                    </div>
-                `;
-                
-                // 添加点击事件展开/收起详情
-                const header = entry.querySelector('.packet-header');
-                const detail = entry.querySelector('.packet-detail');
-                const toggle = entry.querySelector('.packet-toggle');
-                
-                header.addEventListener('click', () => {
-                    const wasExpanded = detail.style.display === 'block';
-                    detail.style.display = wasExpanded ? 'none' : 'block';
-                    toggle.textContent = wasExpanded ? '▶' : '▼';
-                    // 更新数据包状态
-                    packet.expanded = !wasExpanded;
-                });
-                
-                packetListDiv.appendChild(entry);
+                // 时间戳相同或非常接近（1ms内），按ID排序（ID越大越新）
+                return (a.id || 0) - (b.id || 0);
             });
             
-            // 自动滚动到底部
-            packetListDiv.scrollTop = packetListDiv.scrollHeight;
+            // 调试：记录排序后的状态
+            if (filteredMessages.length > 0) {
+                const sortedLastMsg = filteredMessages[filteredMessages.length - 1];
+                const ackFwdInFiltered = filteredMessages.filter(m => (m.method === 'ACK' || m.status_code === 'ACK') && m.direction === 'FWD');
+                console.log('[SIPMessages] 排序后，最后一条消息ID:', sortedLastMsg.id, '方向:', sortedLastMsg.direction, '方法:', sortedLastMsg.method || sortedLastMsg.status_code, 'ACK FWD数量:', ackFwdInFiltered.length);
+            }
+            
+            tbody.innerHTML = '';
+            
+            if (filteredMessages.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="12" style="text-align: center; color: #858585; padding: 20px;">暂无消息</td></tr>';
+                // 即使没有消息，也添加空白行保持布局一致
+                const spacerRow = document.createElement('tr');
+                spacerRow.className = 'sip-messages-spacer-row';
+                spacerRow.innerHTML = '<td colspan="12"></td>';
+                tbody.appendChild(spacerRow);
+                return;
+            }
+            
+            // 显示消息（从旧到新，便于查看对话流程）
+            // 调试：记录要显示的消息数量
+            const ackFwdInFiltered = filteredMessages.filter(m => (m.method === 'ACK' || m.status_code === 'ACK') && m.direction === 'FWD');
+            if (ackFwdInFiltered.length > 0) {
+                console.log('[SIPMessages] 过滤后列表中的ACK FWD数量:', ackFwdInFiltered.length, 'ID列表:', ackFwdInFiltered.map(m => m.id));
+            }
+            
+            filteredMessages.forEach(msg => {
+                const row = document.createElement('tr');
+                row.dataset.id = msg.id;
+                if (selectedMessageId === msg.id) {
+                    row.classList.add('selected');
+                }
+                
+                // 方向颜色
+                const directionColor = {
+                    'RX': '#4ec9b0',
+                    'TX': '#569cd6',
+                    'FWD': '#ce9178'
+                }[msg.direction] || '#d4d4d4';
+                
+                // 消息类型显示：如果是重传，加上标记
+                const methodText = msg.method || msg.status_code || '';
+                const methodDisplay = msg.is_retransmission ? `${methodText} (重传)` : methodText;
+                
+                row.innerHTML = `
+                    <td>${escapeHtml(msg.time_str || '')}</td>
+                    <td>${escapeHtml(methodDisplay)}</td>
+                    <td style="color: ${directionColor};">${escapeHtml(msg.direction || '')}</td>
+                    <td>${escapeHtml(msg.registered_user || '')}</td>
+                    <td>${escapeHtml(msg.from_user || '')}</td>
+                    <td>${escapeHtml(msg.callee || msg.to_user || '')}</td>
+                    <td>${escapeHtml(msg.src_ip || '')}:${escapeHtml(String(msg.src_port || ''))}</td>
+                    <td>${escapeHtml(msg.dst_ip || '')}:${escapeHtml(String(msg.dst_port || ''))}</td>
+                    <td>${escapeHtml(msg.src_ip_nat || '')}${msg.src_ip_nat && msg.src_port_nat ? ':' + escapeHtml(String(msg.src_port_nat || '')) : ''}</td>
+                    <td>${escapeHtml(msg.dst_ip_nat || '')}${msg.dst_ip_nat && msg.dst_port_nat ? ':' + escapeHtml(String(msg.dst_port_nat || '')) : ''}</td>
+                    <td title="${escapeHtml(msg.call_id || '')}">${escapeHtml((msg.call_id || '').substring(0, 20))}${(msg.call_id || '').length > 20 ? '...' : ''}</td>
+                    <td title="${escapeHtml(msg.sdp_info || '')}">${escapeHtml(msg.sdp_info || '')}</td>
+                `;
+                
+                // 双击查看消息详情
+                row.addEventListener('dblclick', () => {
+                    showMessageDetail(msg.id);
+                });
+                
+                // 单击选中
+                row.addEventListener('click', () => {
+                    document.querySelectorAll('#sip-messages-tbody tr').forEach(r => r.classList.remove('selected'));
+                    row.classList.add('selected');
+                    selectedMessageId = msg.id;
+                });
+                
+                tbody.appendChild(row);
+            });
+            
+            // 在表格底部添加一个空白行，确保最后一条消息完全可见
+            const spacerRow = document.createElement('tr');
+            spacerRow.className = 'sip-messages-spacer-row';
+            spacerRow.innerHTML = '<td colspan="10"></td>';
+            tbody.appendChild(spacerRow);
+            
+            // 默认自动滚动到底部（显示最新消息），但只在用户没有手动滚动时才滚动
+            // 使用内层滚动容器进行滚动控制
+            const scrollWrapper = document.querySelector('.sip-messages-table-scroll-wrapper');
+            if (scrollWrapper && tbody) {
+                // 清除之前的自动滚动定时器
+                if (sipMessagesAutoScrollTimeout) {
+                    clearTimeout(sipMessagesAutoScrollTimeout);
+                }
+                
+                // 检查用户是否手动滚动过，或者是否接近底部（距离底部小于50px时认为接近底部）
+                const isNearBottom = scrollWrapper.scrollHeight - scrollWrapper.scrollTop - scrollWrapper.clientHeight < 50;
+                
+                // 只在用户没有手动滚动，或者已经接近底部时，才自动滚动到底部
+                if (!sipMessagesUserScrolled || isNearBottom) {
+                    // 使用防抖，延迟执行滚动，避免频繁触发导致跳动
+                    sipMessagesAutoScrollTimeout = setTimeout(() => {
+                        // 等待 DOM 更新完成
+                        requestAnimationFrame(() => {
+                            setTimeout(() => {
+                                // 简单直接地滚动到底部
+                                scrollWrapper.scrollTop = scrollWrapper.scrollHeight;
+                                // 如果用户接近底部，重置手动滚动标志，允许后续自动滚动
+                                if (isNearBottom) {
+                                    sipMessagesUserScrolled = false;
+                                }
+                            }, 50);
+                        });
+                    }, 100);
+                }
+            }
         }
         
-        function updatePacketStats() {
-            const statsSpan = document.getElementById('packet-stats');
+        // 显示消息详情
+        function showMessageDetail(msgId) {
+            fetch(`/api/sip-messages?action=get&id=${msgId}`, {
+                method: 'GET',
+                credentials: 'include'
+            })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success && data.record) {
+                        const modal = document.getElementById('sip-message-detail-modal');
+                        const content = document.getElementById('sip-message-detail-content');
+                        content.textContent = data.record.full_message || '无消息内容';
+                        modal.style.display = 'block';
+                    } else {
+                        alert('获取消息详情失败: ' + (data.message || '未知错误'));
+                    }
+                })
+                .catch(error => {
+                    console.error('[SIPMessages] 获取消息详情错误:', error);
+                    alert('获取消息详情失败');
+                });
+        }
+        
+        // 更新统计信息
+        function updateSipMessagesStats(stats) {
+            const statsSpan = document.getElementById('sip-messages-stats');
             if (!statsSpan) {
                 return;
             }
             
-            fetch('/api/packet-capture?action=stats', {
-                method: 'GET',
-                credentials: 'include'  // 包含cookie
-            })
-                .then(response => {
-                    if (response.redirected || response.status === 302) {
-                        return { success: false, stats: { is_capturing: false, packet_count: 0, duration: 0 } };
-                    }
-                    if (!response.ok) {
-                        return { success: false, stats: { is_capturing: false, packet_count: 0, duration: 0 } };
-                    }
-                    return response.json();
+            // 保存暂停标记
+            const pausedMark = statsSpan.textContent.includes('[已暂停]') ? ' [已暂停]' : '';
+            
+            if (stats.total !== undefined) {
+                statsSpan.textContent = `总计: ${stats.total} | RX: ${stats.rx || 0} | TX: ${stats.tx || 0} | FWD: ${stats.fwd || 0}${pausedMark}`;
+                // 如果暂停，设置橙色
+                if (sipMessagesPaused) {
+                    statsSpan.style.color = '#ff9800';
+                } else {
+                    statsSpan.style.color = '';
+                }
+            } else {
+                // 从API获取统计
+                fetch('/api/sip-messages?action=stats', {
+                    method: 'GET',
+                    credentials: 'include'
                 })
-                .then(data => {
-                    if (data.success && data.stats) {
-                        const stats = data.stats;
-                        if (stats.is_capturing) {
-                            const duration = Math.floor(stats.duration);
-                            statsSpan.textContent = `抓包中 | ${stats.packet_count} 个数据包 | ${duration}秒 | ${stats.interface} | ${stats.filter || '无过滤'}`;
-                        } else {
-                            statsSpan.textContent = `已停止 | 共 ${stats.packet_count} 个数据包`;
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success && data.stats) {
+                            const s = data.stats;
+                            const pausedMark = sipMessagesPaused ? ' [已暂停]' : '';
+                            statsSpan.textContent = `总计: ${s.total || 0} | RX: ${s.rx || 0} | TX: ${s.tx || 0} | FWD: ${s.fwd || 0}${pausedMark}`;
+                            // 如果暂停，设置橙色
+                            if (sipMessagesPaused) {
+                                statsSpan.style.color = '#ff9800';
+                            } else {
+                                statsSpan.style.color = '';
+                            }
                         }
-                    }
-                })
-                .catch(error => {
-                    console.error('获取统计失败:', error);
-                });
-        }
-        
-        // 定期更新统计信息
-        setInterval(() => {
-            if (packetWebSocket) {
-                updatePacketStats();
+                    })
+                    .catch(error => {
+                        console.error('获取统计失败:', error);
+                    });
             }
-        }, 2000);
+        }
         
         // 更新历史记录显示
         function updateHistoryDisplay() {
@@ -2836,7 +3423,7 @@
             initParamForm();
             initOutputTabs();
             initHistoryNavigation();
-            initPacketCapture();
+            initSipMessages();
         });
     </script>
 </body>

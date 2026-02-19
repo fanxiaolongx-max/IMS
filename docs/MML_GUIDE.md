@@ -432,9 +432,9 @@ SET LOG LEVEL=WARNING
 
 ## 🔗 相关资源
 
-- [完整文档](web/README.md)
-- [命令参考](docs/MML_COMMAND_REFERENCE.md)（计划中）
-- [IMS 路线图](docs/IMS_ROADMAP.md)
+- [文档索引](README.md)
+- [命令参考](MML_COMMAND_REFERENCE.md)（计划中）
+- [IMS 路线图](IMS_ROADMAP.md)
 
 ---
 

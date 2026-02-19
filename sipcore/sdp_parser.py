@@ -195,6 +195,42 @@ def extract_sdp_info(sdp_body: bytes) -> tuple[str, str]:
     return result['call_type'], result['codec_str']
 
 
+def modify_sdp_ip_only(sdp_body: str, new_ip: str) -> str:
+    """
+    仅修改 SDP 中的 IP 地址（c= 行），端口保持不变。
+    用于 passthrough 模式下将 NAT 后地址写入 SDP，让主被叫直接互通。
+    
+    Args:
+        sdp_body: 原始 SDP
+        new_ip: 新的 IP 地址（通常是信令地址，NAT 后的公网 IP）
+    
+    Returns:
+        修改后的 SDP
+    """
+    if not sdp_body:
+        return sdp_body
+    
+    lines = sdp_body.split('\r\n') if '\r\n' in sdp_body else sdp_body.split('\n')
+    new_lines = []
+    
+    for line in lines:
+        line_stripped = line.rstrip()
+        if not line_stripped:
+            new_lines.append(line)
+            continue
+        
+        # 修改 c= 行（只改 IP 地址，保持其他部分不变）
+        if line_stripped.startswith('c='):
+            parts = line_stripped[2:].split()
+            if len(parts) >= 3 and parts[1] == 'IP4':
+                line_stripped = f"c=IN IP4 {new_ip}"
+        
+        new_lines.append(line_stripped)
+    
+    # 确保使用 \r\n 作为行分隔符 (SIP标准)
+    return '\r\n'.join(new_lines) + ('\r\n' if not sdp_body.endswith('\r\n') else '')
+
+
 # 测试代码（可选）
 if __name__ == "__main__":
     # 测试用例 1：纯音频 SDP
