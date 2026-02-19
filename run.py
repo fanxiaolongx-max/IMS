@@ -2108,8 +2108,11 @@ def _forward_response(resp: SIPMessage, addr, transport):
                             # 检查转发器是否真的存在（re-INVITE 时可能转发器不存在）
                             has_forwarder = False
                             if session and hasattr(media_relay, '_forwarders'):
-                                fwd_key = (call_id, 'single', 'rtp')
-                                has_forwarder = fwd_key in media_relay._forwarders
+                                # 双端口模式：检查 A-leg 和 B-leg 音频转发器
+                                fwd_key_a = (call_id, 'a', 'rtp')
+                                fwd_key_b = (call_id, 'b', 'rtp')
+                                has_forwarder = (fwd_key_a in media_relay._forwarders and 
+                                                fwd_key_b in media_relay._forwarders)
                             
                             sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
                             # 200 OK 发给主叫用 A-leg，发给被叫用 B-leg（如 re-INVITE 的应答）

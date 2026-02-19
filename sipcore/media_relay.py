@@ -59,6 +59,12 @@ class MediaSession:
     b_leg_video_remote_addr: Optional[Tuple[str, int]] = None  # 从SDP提取的视频地址
     b_leg_video_actual_addr: Optional[Tuple[str, int]] = None  # 对称RTP学习到的视频地址
     
+    # 媒体方向属性（sendrecv, sendonly, recvonly, inactive）
+    a_leg_audio_direction: str = 'sendrecv'
+    b_leg_audio_direction: str = 'sendrecv'
+    a_leg_video_direction: str = 'sendrecv'
+    b_leg_video_direction: str = 'sendrecv'
+    
     # 状态（可选，有默认值）
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
@@ -216,9 +222,11 @@ class SDPProcessor:
             'audio_port': None,
             'audio_payloads': [],
             'audio_connection_ip': None,
+            'audio_direction': 'sendrecv',  # 默认值：sendrecv, sendonly, recvonly, inactive
             'video_port': None,
             'video_payloads': [],
             'video_connection_ip': None,
+            'video_direction': 'sendrecv',  # 默认值：sendrecv, sendonly, recvonly, inactive
             'codec_info': {}
         }
         
@@ -277,6 +285,19 @@ class SDPProcessor:
                     payload = match.group(1)
                     codec_info = match.group(2)
                     result['codec_info'][payload] = codec_info
+            
+            # 解析媒体方向属性 (a=sendrecv, a=sendonly, a=recvonly, a=inactive)
+            # 这些属性通常出现在 m= 行之后，作用域是当前媒体
+            elif line.startswith('a=') and current_media:
+                direction_line = line[2:].strip().lower()
+                if direction_line in ('sendrecv', 'sendonly', 'recvonly', 'receiveonly', 'inactive'):
+                    # 标准化：receiveonly -> recvonly
+                    if direction_line == 'receiveonly':
+                        direction_line = 'recvonly'
+                    if current_media == 'audio':
+                        result['audio_direction'] = direction_line
+                    elif current_media == 'video':
+                        result['video_direction'] = direction_line
         
         # 如果没有音频端口，认为无效
         return result if result['audio_port'] else None
@@ -1062,7 +1083,11 @@ class MediaRelay:
             audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
             session.a_leg_remote_addr = (audio_ip, media_info['audio_port'])
             session.a_leg_sdp = sdp_body
-            print(f"[MediaRelay] A-leg音频信息: {session.a_leg_remote_addr}")
+            old_a_audio_direction = session.a_leg_audio_direction
+            session.a_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
+            print(f"[MediaRelay] A-leg音频信息: {session.a_leg_remote_addr}, 方向: {session.a_leg_audio_direction}")
+            if old_a_audio_direction != session.a_leg_audio_direction:
+                print(f"[MediaRelay] A-leg音频方向已改变: {old_a_audio_direction} → {session.a_leg_audio_direction}", file=sys.stderr, flush=True)
             
             # 检测并处理视频流
             if media_info.get('video_port'):
@@ -1085,8 +1110,15 @@ class MediaRelay:
                 
                 # 保存视频信息
                 video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                old_a_leg_video_addr = session.a_leg_video_remote_addr
                 session.a_leg_video_remote_addr = (video_ip, media_info['video_port'])
-                print(f"[MediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}")
+                old_a_video_direction = session.a_leg_video_direction
+                session.a_leg_video_direction = media_info.get('video_direction', 'sendrecv')
+                print(f"[MediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}, 方向: {session.a_leg_video_direction}")
+                if old_a_leg_video_addr and old_a_leg_video_addr != session.a_leg_video_remote_addr:
+                    print(f"[MediaRelay] A-leg视频地址已更新: {old_a_leg_video_addr} → {session.a_leg_video_remote_addr}", file=sys.stderr, flush=True)
+                if old_a_video_direction != session.a_leg_video_direction:
+                    print(f"[MediaRelay] A-leg视频方向已改变: {old_a_video_direction} → {session.a_leg_video_direction}", file=sys.stderr, flush=True)
         
         audio_port = session.b_leg_rtp_port if forward_to_callee else session.a_leg_rtp_port
         video_port = session.b_leg_video_rtp_port if forward_to_callee else session.a_leg_video_rtp_port
@@ -1130,18 +1162,30 @@ class MediaRelay:
             audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
             session.b_leg_remote_addr = (audio_ip, media_info['audio_port'])
             session.b_leg_sdp = sdp_body
-            print(f"[MediaRelay] B-leg音频信息: {session.b_leg_remote_addr}")
+            old_b_audio_direction = session.b_leg_audio_direction
+            session.b_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
+            print(f"[MediaRelay] B-leg音频信息: {session.b_leg_remote_addr}, 方向: {session.b_leg_audio_direction}")
+            if old_b_audio_direction != session.b_leg_audio_direction:
+                print(f"[MediaRelay] B-leg音频方向已改变: {old_b_audio_direction} → {session.b_leg_audio_direction}", file=sys.stderr, flush=True)
             
             if media_info.get('video_port'):
                 video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                old_b_leg_video_addr = session.b_leg_video_remote_addr
                 session.b_leg_video_remote_addr = (video_ip, media_info['video_port'])
-                print(f"[MediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}")
+                old_b_video_direction = session.b_leg_video_direction
+                session.b_leg_video_direction = media_info.get('video_direction', 'sendrecv')
+                print(f"[MediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}, 方向: {session.b_leg_video_direction}")
+                if old_b_leg_video_addr != session.b_leg_video_remote_addr:
+                    print(f"[MediaRelay] B-leg视频地址已更新: {old_b_leg_video_addr} → {session.b_leg_video_remote_addr}", file=sys.stderr, flush=True)
+                if old_b_video_direction != session.b_leg_video_direction:
+                    print(f"[MediaRelay] B-leg视频方向已改变: {old_b_video_direction} → {session.b_leg_video_direction}", file=sys.stderr, flush=True)
                 if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
                     a_v = self.port_manager.allocate_port_pair(call_id)
                     b_v = self.port_manager.allocate_port_pair(call_id)
                     if a_v and b_v:
                         session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port = a_v[0], a_v[1]
                         session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port = b_v[0], b_v[1]
+                        print(f"[MediaRelay] 分配视频端口: A-leg={a_v}, B-leg={b_v}", file=sys.stderr, flush=True)
         # 双端口模式：主叫使用 A-leg 端口，被叫使用 B-leg 端口
         # 根据 response_to_caller 选择对应的端口
         if response_to_caller:
@@ -1240,11 +1284,24 @@ class MediaRelay:
                     print(f"[MediaRelay] 音频目标地址改变，发送 NAT 打洞包: {call_id}", file=sys.stderr, flush=True)
                     fwd_a.send_nat_punch(count=20, interval=0.01)
                     fwd_b.send_nat_punch(count=20, interval=0.01)
+                # 检查媒体方向是否改变
+                audio_direction_changed = False
+                video_direction_changed = False
+                if session.a_leg_audio_direction == 'inactive' or session.b_leg_audio_direction == 'inactive':
+                    print(f"[MediaRelay] 检测到音频方向为 inactive: A-leg={session.a_leg_audio_direction}, B-leg={session.b_leg_audio_direction}", file=sys.stderr, flush=True)
+                if session.a_leg_video_direction == 'inactive' or session.b_leg_video_direction == 'inactive':
+                    print(f"[MediaRelay] 检测到视频方向为 inactive: A-leg={session.a_leg_video_direction}, B-leg={session.b_leg_video_direction}", file=sys.stderr, flush=True)
+                    # 注意：inactive 时通常不需要停止转发器，因为可能只是临时暂停
+                
                 # 处理视频转发器
                 video_forwarders_exist = False
                 if session.b_leg_video_rtp_port:
                     a_leg_video_target = session.get_a_leg_video_rtp_target_addr()
                     b_leg_video_target = session.get_b_leg_video_rtp_target_addr()
+                    print(f"[MediaRelay] re-INVITE 视频目标地址检查: {call_id}", file=sys.stderr, flush=True)
+                    print(f"  A-leg视频目标: {a_leg_video_target}, B-leg视频目标: {b_leg_video_target}", file=sys.stderr, flush=True)
+                    print(f"  A-leg视频远程地址: {session.a_leg_video_remote_addr}, 方向: {session.a_leg_video_direction}", file=sys.stderr, flush=True)
+                    print(f"  B-leg视频远程地址: {session.b_leg_video_remote_addr}, 方向: {session.b_leg_video_direction}", file=sys.stderr, flush=True)
                     if a_leg_video_target and b_leg_video_target:
                         fwd_video_a = self._forwarders.get((call_id, 'a', 'video-rtp'))
                         fwd_video_b = self._forwarders.get((call_id, 'b', 'video-rtp'))
@@ -1253,8 +1310,14 @@ class MediaRelay:
                             old_target_a = fwd_video_a.target_addr
                             old_target_b = fwd_video_b.target_addr
                             
+                            print(f"[MediaRelay] 视频转发器当前目标: A-leg={old_target_a}, B-leg={old_target_b}", file=sys.stderr, flush=True)
+                            print(f"[MediaRelay] 视频转发器新目标: A-leg→{b_leg_video_target}, B-leg→{a_leg_video_target}", file=sys.stderr, flush=True)
+                            
                             # 如果目标地址改变，重置统计（视频切换场景）
                             reset_stats = (old_target_a != b_leg_video_target or old_target_b != a_leg_video_target)
+                            
+                            if reset_stats:
+                                print(f"[MediaRelay] 检测到视频目标地址改变，将重置统计并发送 NAT 打洞包: {call_id}", file=sys.stderr, flush=True)
                             
                             fwd_video_a.update_target(b_leg_video_target, reset_stats=reset_stats)
                             fwd_video_b.update_target(a_leg_video_target, reset_stats=reset_stats)
@@ -1283,7 +1346,12 @@ class MediaRelay:
                             video_forwarders_exist = False
                 
                 # 如果音频和视频转发器都已更新，返回
-                if not session.b_leg_video_rtp_port or video_forwarders_exist:
+                # 注意：即使视频端口存在，如果视频转发器不存在，也需要继续创建
+                if session.b_leg_video_rtp_port and video_forwarders_exist:
+                    # 视频端口存在且转发器已更新，返回
+                    return True
+                elif not session.b_leg_video_rtp_port:
+                    # 没有视频端口，音频转发器已更新，返回
                     return True
                 # 否则继续执行下面的创建逻辑（创建视频转发器）
             else:
