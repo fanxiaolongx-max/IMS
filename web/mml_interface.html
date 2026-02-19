@@ -394,6 +394,17 @@
         .media-session-card table.media-ports th, .media-session-card table.media-ports td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #3e3e42; }
         .media-session-card table.media-ports th { color: #969696; }
         .media-endpoints-sessions .empty { color: #969696; text-align: center; padding: 40px; }
+        
+        /* 颜色区分样式 */
+        .media-label-caller { color: #569cd6; font-weight: bold; } /* 主叫 - 蓝色 */
+        .media-label-callee { color: #6a9955; font-weight: bold; } /* 被叫 - 绿色 */
+        .media-label-audio { color: #dcdcaa; } /* 音频 - 黄色 */
+        .media-label-video { color: #c586c0; } /* 视频 - 紫色 */
+        .media-label-uplink { background: rgba(86, 156, 214, 0.1); } /* 上行 - 浅蓝背景 */
+        .media-label-downlink { background: rgba(106, 153, 85, 0.1); } /* 下行 - 浅绿背景 */
+        .media-stat-good { color: #4ec9b0; } /* 正常统计 - 青色 */
+        .media-stat-zero { color: #f48771; } /* 零包 - 红色 */
+        .media-stat-warn { color: #dcdcaa; } /* 警告 - 黄色 */
 
         .sip-messages-table-container {
             flex: 1;
@@ -2785,18 +2796,104 @@
                 sessionsEl.innerHTML = sessions.map(s => {
                     const audio = s.audio || {};
                     const aA = audio.a_leg || {}, aB = audio.b_leg || {};
+                    const audioStats = audio.stats || {};
                     const video = s.video;
-                    let rows = [
-                        `<tr><th>主叫→被叫 (上行)</th><td>RTP/RTCP</td><td>A-leg: ${aA.rtp_port ?? '-'}/${aA.rtcp_port ?? '-'} → B-leg: ${aB.rtp_port ?? '-'}/${aB.rtcp_port ?? '-'}</td><td>${s.uplink_packets != null ? s.uplink_packets + ' 包' : '-'}</td></tr>`,
-                        `<tr><th>被叫→主叫 (下行)</th><td>RTP/RTCP</td><td>B-leg → A-leg</td><td>${s.downlink_packets != null ? s.downlink_packets + ' 包' : '-'}</td></tr>`,
-                    ];
+                    const videoStats = video?.stats;
+                    
+                    let rows = [];
+                    
+                    // 音频统计 - 主叫（上行），拆成两段：主叫→服务器 和 服务器→被叫
+                    const audioUplink = audioStats.uplink || {};
+                    const callerToServer = audioUplink.caller_to_server || {};
+                    const serverToCallee = audioUplink.server_to_callee || {};
+                    const callerToServerRtp = callerToServer.rtp ?? 0;
+                    const callerToServerRtcp = callerToServer.rtcp ?? 0;
+                    const serverToCalleeRtp = serverToCallee.rtp ?? 0;
+                    const serverToCalleeRtcp = serverToCallee.rtcp ?? 0;
+                    const callerToServerClass = callerToServerRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                    const serverToCalleeClass = serverToCalleeRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                    rows.push(`<tr class="media-label-uplink">
+                        <th><span class="media-label-caller">主叫</span> → <span class="media-label-callee">被叫</span> <span class="media-label-audio">(音频上行)</span></th>
+                        <td>
+                            <div style="display: flex; gap: 15px;">
+                                <span><span class="media-label-caller">主叫→服务器</span>: RTP <span class="${callerToServerClass}">${callerToServerRtp}</span> / RTCP <span class="${callerToServerRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${callerToServerRtcp}</span></span>
+                                <span><span class="media-label-callee">服务器→被叫</span>: RTP <span class="${serverToCalleeClass}">${serverToCalleeRtp}</span> / RTCP <span class="${serverToCalleeRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${serverToCalleeRtcp}</span></span>
+                            </div>
+                        </td>
+                        <td>A-leg: ${aA.rtp_port ?? '-'}/${aA.rtcp_port ?? '-'} → B-leg: ${aB.rtp_port ?? '-'}/${aB.rtcp_port ?? '-'}</td>
+                    </tr>`);
+                    
+                    // 音频统计 - 被叫（下行），拆成两段：被叫→服务器 和 服务器→主叫
+                    const audioDownlink = audioStats.downlink || {};
+                    const calleeToServer = audioDownlink.callee_to_server || {};
+                    const serverToCaller = audioDownlink.server_to_caller || {};
+                    const calleeToServerRtp = calleeToServer.rtp ?? 0;
+                    const calleeToServerRtcp = calleeToServer.rtcp ?? 0;
+                    const serverToCallerRtp = serverToCaller.rtp ?? 0;
+                    const serverToCallerRtcp = serverToCaller.rtcp ?? 0;
+                    const calleeToServerClass = calleeToServerRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                    const serverToCallerClass = serverToCallerRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                    rows.push(`<tr class="media-label-downlink">
+                        <th><span class="media-label-callee">被叫</span> → <span class="media-label-caller">主叫</span> <span class="media-label-audio">(音频下行)</span></th>
+                        <td>
+                            <div style="display: flex; gap: 15px;">
+                                <span><span class="media-label-callee">被叫→服务器</span>: RTP <span class="${calleeToServerClass}">${calleeToServerRtp}</span> / RTCP <span class="${calleeToServerRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${calleeToServerRtcp}</span></span>
+                                <span><span class="media-label-caller">服务器→主叫</span>: RTP <span class="${serverToCallerClass}">${serverToCallerRtp}</span> / RTCP <span class="${serverToCallerRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${serverToCallerRtcp}</span></span>
+                            </div>
+                        </td>
+                        <td>B-leg: ${aB.rtp_port ?? '-'}/${aB.rtcp_port ?? '-'} → A-leg: ${aA.rtp_port ?? '-'}/${aA.rtcp_port ?? '-'}</td>
+                    </tr>`);
+                    
+                    // 视频统计（如果存在）
                     if (video && (video.a_leg || video.b_leg)) {
                         const vA = video.a_leg || {}, vB = video.b_leg || {};
-                        rows.push(`<tr><th>视频</th><td>RTP/RTCP</td><td>A: ${vA.rtp_port ?? '-'}/${vA.rtcp_port ?? '-'} | B: ${vB.rtp_port ?? '-'}/${vB.rtcp_port ?? '-'}</td><td>-</td></tr>`);
+                        
+                        // 视频上行（主叫→被叫），拆成两段：主叫→服务器 和 服务器→被叫
+                        const videoUplink = videoStats?.uplink || {};
+                        const videoCallerToServer = videoUplink.caller_to_server || {};
+                        const videoServerToCallee = videoUplink.server_to_callee || {};
+                        const videoCallerToServerRtp = videoCallerToServer.rtp ?? 0;
+                        const videoCallerToServerRtcp = videoCallerToServer.rtcp ?? 0;
+                        const videoServerToCalleeRtp = videoServerToCallee.rtp ?? 0;
+                        const videoServerToCalleeRtcp = videoServerToCallee.rtcp ?? 0;
+                        const videoCallerToServerClass = videoCallerToServerRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                        const videoServerToCalleeClass = videoServerToCalleeRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                        rows.push(`<tr class="media-label-uplink">
+                            <th><span class="media-label-caller">主叫</span> → <span class="media-label-callee">被叫</span> <span class="media-label-video">(视频上行)</span></th>
+                            <td>
+                                <div style="display: flex; gap: 15px;">
+                                    <span><span class="media-label-caller">主叫→服务器</span>: RTP <span class="${videoCallerToServerClass}">${videoCallerToServerRtp}</span> / RTCP <span class="${videoCallerToServerRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${videoCallerToServerRtcp}</span></span>
+                                    <span><span class="media-label-callee">服务器→被叫</span>: RTP <span class="${videoServerToCalleeClass}">${videoServerToCalleeRtp}</span> / RTCP <span class="${videoServerToCalleeRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${videoServerToCalleeRtcp}</span></span>
+                                </div>
+                            </td>
+                            <td>A-leg: ${vA.rtp_port ?? '-'}/${vA.rtcp_port ?? '-'} → B-leg: ${vB.rtp_port ?? '-'}/${vB.rtcp_port ?? '-'}</td>
+                        </tr>`);
+                        
+                        // 视频下行（被叫→主叫），拆成两段：被叫→服务器 和 服务器→主叫
+                        const videoDownlink = videoStats?.downlink || {};
+                        const videoCalleeToServer = videoDownlink.callee_to_server || {};
+                        const videoServerToCaller = videoDownlink.server_to_caller || {};
+                        const videoCalleeToServerRtp = videoCalleeToServer.rtp ?? 0;
+                        const videoCalleeToServerRtcp = videoCalleeToServer.rtcp ?? 0;
+                        const videoServerToCallerRtp = videoServerToCaller.rtp ?? 0;
+                        const videoServerToCallerRtcp = videoServerToCaller.rtcp ?? 0;
+                        const videoCalleeToServerClass = videoCalleeToServerRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                        const videoServerToCallerClass = videoServerToCallerRtp > 0 ? 'media-stat-good' : 'media-stat-zero';
+                        rows.push(`<tr class="media-label-downlink">
+                            <th><span class="media-label-callee">被叫</span> → <span class="media-label-caller">主叫</span> <span class="media-label-video">(视频下行)</span></th>
+                            <td>
+                                <div style="display: flex; gap: 15px;">
+                                    <span><span class="media-label-callee">被叫→服务器</span>: RTP <span class="${videoCalleeToServerClass}">${videoCalleeToServerRtp}</span> / RTCP <span class="${videoCalleeToServerRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${videoCalleeToServerRtcp}</span></span>
+                                    <span><span class="media-label-caller">服务器→主叫</span>: RTP <span class="${videoServerToCallerClass}">${videoServerToCallerRtp}</span> / RTCP <span class="${videoServerToCallerRtcp > 0 ? 'media-stat-good' : 'media-stat-zero'}">${videoServerToCallerRtcp}</span></span>
+                                </div>
+                            </td>
+                            <td>B-leg: ${vB.rtp_port ?? '-'}/${vB.rtcp_port ?? '-'} → A-leg: ${vA.rtp_port ?? '-'}/${vA.rtcp_port ?? '-'}</td>
+                        </tr>`);
                     }
+                    
                     const diagClass = (s.diagnosis && (s.diagnosis.indexOf('未') >= 0 || s.diagnosis.indexOf('异常') >= 0)) ? '' : ' ok';
                     return `<div class="media-session-card">
-                        <h4>${s.caller} → ${s.callee} (${s.call_id}) ${s.duration_sec != null ? ' · ' + s.duration_sec + 's' : ''}</h4>
+                        <h4><span class="media-label-caller">${s.caller}</span> → <span class="media-label-callee">${s.callee}</span> (${s.call_id}) ${s.duration_sec != null ? ' · ' + s.duration_sec + 's' : ''}</h4>
                         <table class="media-ports"><tbody>${rows.join('')}</tbody></table>
                         <div class="diagnosis${diagClass}">${s.diagnosis || '正常'}</div>
                     </div>`;

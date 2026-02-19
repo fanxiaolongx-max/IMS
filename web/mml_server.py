@@ -2777,6 +2777,7 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
                 if not st:
                     continue
                 # 统一格式：主被叫、音视频 RTP/RTCP、上下行包数、诊断
+                # 音频端口信息
                 audio_a = {
                     'rtp_port': st.get('a_leg_rtp_port'),
                     'rtcp_port': st.get('a_leg_rtcp_port'),
@@ -2785,6 +2786,7 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
                     'rtp_port': st.get('b_leg_rtp_port'),
                     'rtcp_port': st.get('b_leg_rtcp_port'),
                 }
+                # 视频端口信息
                 video_a = {
                     'rtp_port': st.get('a_leg_video_rtp_port'),
                     'rtcp_port': st.get('a_leg_video_rtcp_port'),
@@ -2793,16 +2795,28 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
                     'rtp_port': st.get('b_leg_video_rtp_port'),
                     'rtcp_port': st.get('b_leg_video_rtcp_port'),
                 } if st.get('b_leg_video_rtp_port') else None
-                uplink = st.get('a_to_b_packets')  # 主叫→被叫
-                downlink = st.get('b_to_a_packets')  # 被叫→主叫
+                # 详细统计信息（新格式）
+                audio_stats = st.get('audio', {})
+                video_stats = st.get('video')
+                # 兼容旧格式
+                uplink = st.get('a_to_b_packets', audio_stats.get('uplink', {}).get('rtp', 0))
+                downlink = st.get('b_to_a_packets', audio_stats.get('downlink', {}).get('rtp', 0))
                 sessions.append({
                     'call_id': call_id,
                     'caller': st.get('caller', 'N/A'),
                     'callee': st.get('callee', 'N/A'),
-                    'audio': {'a_leg': audio_a, 'b_leg': audio_b},
-                    'video': {'a_leg': video_a, 'b_leg': video_b} if (video_a or video_b) else None,
-                    'uplink_packets': uplink,
-                    'downlink_packets': downlink,
+                    'audio': {
+                        'a_leg': audio_a,
+                        'b_leg': audio_b,
+                        'stats': audio_stats,  # 包含 uplink/downlink 的 rtp/rtcp 统计
+                    },
+                    'video': {
+                        'a_leg': video_a,
+                        'b_leg': video_b,
+                        'stats': video_stats,  # 包含 uplink/downlink 的 rtp/rtcp 统计
+                    } if (video_a or video_b) else None,
+                    'uplink_packets': uplink,  # 兼容旧格式
+                    'downlink_packets': downlink,  # 兼容旧格式
                     'duration_sec': st.get('duration_sec') or (st.get('duration') if st.get('duration') is not None else None),
                     'diagnosis': st.get('diagnosis', ''),
                 })

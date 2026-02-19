@@ -2105,6 +2105,12 @@ def _forward_response(resp: SIPMessage, addr, transport):
                         try:
                             session = media_relay._sessions.get(call_id)
                             already_started = session and session.started_at is not None
+                            # 检查转发器是否真的存在（re-INVITE 时可能转发器不存在）
+                            has_forwarder = False
+                            if session and hasattr(media_relay, '_forwarders'):
+                                fwd_key = (call_id, 'single', 'rtp')
+                                has_forwarder = fwd_key in media_relay._forwarders
+                            
                             sdp_body = resp.body.decode('utf-8', errors='ignore') if isinstance(resp.body, bytes) else resp.body
                             # 200 OK 发给主叫用 A-leg，发给被叫用 B-leg（如 re-INVITE 的应答）
                             response_to_caller = True
@@ -2119,7 +2125,8 @@ def _forward_response(resp: SIPMessage, addr, transport):
                                 if 'content-length' in resp.headers:
                                     resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
                                 log.info(f"[B2BUA] 200 OK SDP 已修改为服务器地址端口（发送前），Call-ID: {call_id}")
-                                if not already_started:
+                                # 如果转发器未启动或不存在，则启动/创建转发器
+                                if not already_started or not has_forwarder:
                                     try:
                                         from_header = resp.get("from") or ""
                                         to_header = resp.get("to") or ""
