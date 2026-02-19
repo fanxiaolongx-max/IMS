@@ -195,13 +195,15 @@ def _track_tx_response(resp, addr, direction: str = "TX"):
     """
     统一记录已发送的 SIP 响应到跟踪器。
     任意请求方法、任意响应状态码均自动解析并记录，无需写死类型。
+    源地址使用公网宣告地址，避免本机/容器环境下 SERVER_IP=127.0.0.1 时跟踪仍显示 127。
     """
     try:
         tracker = get_tracker()
         if tracker:
             resp_bytes = resp.to_bytes() if hasattr(resp, "to_bytes") else None
+            src = (advertised_sip_host(), advertised_sip_port())
             tracker.record_message(
-                resp, direction, (SERVER_IP, SERVER_PORT), dst_addr=addr, full_message_bytes=resp_bytes
+                resp, direction, src, dst_addr=addr, full_message_bytes=resp_bytes
             )
     except Exception as e:
         log.debug(f"[SIP-TRACKER] 记录 TX 失败: {e}")
@@ -1450,7 +1452,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                                 tracker = get_tracker()
                                 if tracker:
                                     try:
-                                        tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                        tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                                         log.warning(f"[ACK-TRACKER] ACK recorded as FWD (failed routing): Call-ID={call_id}")
                                     except:
                                         pass
@@ -1462,7 +1464,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                                 tracker = get_tracker()
                                 if tracker:
                                     try:
-                                        tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                        tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                                         log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no bindings): Call-ID={call_id}")
                                     except:
                                         pass
@@ -1473,7 +1475,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                             tracker = get_tracker()
                             if tracker:
                                 try:
-                                    tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                    tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                                     log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no AOR): Call-ID={call_id}")
                                 except:
                                     pass
@@ -1486,7 +1488,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                         tracker = get_tracker()
                         if tracker:
                             try:
-                                tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                                 log.warning(f"[ACK-TRACKER] ACK recorded as FWD (exception): Call-ID={call_id}, error={e}")
                             except:
                                 pass
@@ -1517,7 +1519,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                                 tracker = get_tracker()
                                 if tracker:
                                     try:
-                                        tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                        tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                                         log.warning(f"[ACK-TRACKER] ACK recorded as FWD (invalid contact): Call-ID={call_id}")
                                     except:
                                         pass
@@ -1528,7 +1530,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                             tracker = get_tracker()
                             if tracker:
                                 try:
-                                    tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                    tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                                     log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no bindings): Call-ID={call_id}")
                                 except:
                                     pass
@@ -1539,7 +1541,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                         tracker = get_tracker()
                         if tracker:
                             try:
-                                tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                                tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                                 log.warning(f"[ACK-TRACKER] ACK recorded as FWD (no To AOR): Call-ID={call_id}")
                             except:
                                 pass
@@ -1552,7 +1554,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                     tracker = get_tracker()
                     if tracker:
                         try:
-                            tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
+                            tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg.to_bytes())
                             log.warning(f"[ACK-TRACKER] ACK recorded as FWD (exception): Call-ID={call_id}, error={e}")
                         except:
                             pass
@@ -1764,7 +1766,7 @@ def _forward_request(msg: SIPMessage, addr, transport):
                         log.info(f"[ACK-FWD] Expected 200 OK Contact: {expected_contact}, ACK R-URI: {ack_ruri}")
                         if ack_ruri.lower().strip() != expected_contact.lower().strip():
                             log.warning(f"[ACK-FWD] WARNING: ACK R-URI does not match 200 OK Contact! R-URI: {ack_ruri}, Contact: {expected_contact}")
-                tracker.record_message(msg, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(host, port), full_message_bytes=msg_bytes)
+                tracker.record_message(msg, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(host, port), full_message_bytes=msg_bytes)
                 if method == "ACK":
                     log.info(f"[ACK-TRACKER] ACK recorded as FWD: Call-ID={call_id}, from={SERVER_IP}:{SERVER_PORT}, to={host}:{port}, is_2xx_ack={is_2xx_ack}")
         except RecursionError as re:
@@ -2266,7 +2268,7 @@ def _forward_response(resp: SIPMessage, addr, transport):
             if tracker:
                 cseq_header = resp.get("cseq") or ""
                 log.debug(f"[RESP-FWD-TRACKER] Recording {status_code} FWD: Call-ID={call_id}, CSeq={cseq_header}, to={nhost}:{nport}")
-                tracker.record_message(resp, "FWD", (SERVER_IP, SERVER_PORT), dst_addr=(nhost, nport), full_message_bytes=resp_bytes)
+                tracker.record_message(resp, "FWD", (advertised_sip_host(), advertised_sip_port()), dst_addr=(nhost, nport), full_message_bytes=resp_bytes)
                 log.debug(f"[RESP-FWD-TRACKER] Successfully recorded {status_code} FWD: Call-ID={call_id}")
         except RecursionError as re:
             log.error(f"[SIP-TRACKER] 记录转发响应时发生递归错误: {re}，跳过记录")
