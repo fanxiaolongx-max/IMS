@@ -512,6 +512,8 @@
             font-size: 12px;
             color: #858585;
         }
+        .media-monitor-tip { font-size: 10px; color: #666; margin-top: 6px; }
+        .media-monitor-tip code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 2px; }
         .media-monitor-status.connected {
             color: #4ec9b0;
         }
@@ -559,7 +561,7 @@
             background: #1e1e1e;
             border-radius: 4px;
         }
-        .media-monitor-panel-info { font-size: 11px; color: #858585; margin-top: 4px; word-break: break-all; white-space: pre-wrap; max-height: 3.6em; overflow-y: auto; }
+        .media-monitor-panel-info { font-size: 11px; color: #858585; margin-top: 4px; word-break: break-all; white-space: pre-wrap; max-height: 9em; overflow-y: auto; }
         .monitor-btn-single { min-width: 72px; }
         
         /* 颜色区分样式 */
@@ -1484,6 +1486,7 @@
                             </div>
                         </div>
                         <div class="media-monitor-status" id="media-monitor-status">未连接</div>
+                        <div class="media-monitor-tip" id="media-monitor-tip">提示：请用 <code>http://127.0.0.1:端口</code> 访问；用 <code>0.0.0.0</code> 时浏览器可能无法显示视频。</div>
                     </div>
                 </div>
 
@@ -3704,17 +3707,24 @@
         let lastVideoTimeByStream = {};
         let videoFrameCountByStream = {};
         let videoStreamDebug = {};  // streamType -> { lastError, lastNal, framesSentToDecoder }
+        const MAX_VIDEO_STATUS_LINES = 6;
+        let videoStatusHistoryByStream = {};  // streamType -> [最近几条状态文案]，用于多行显示
         
         function setVideoStreamStatus(streamType, msg, isError) {
             const infoEl = document.getElementById('info-' + streamType);
             if (!infoEl) return;
             if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
             if (isError) {
-                // 只存简短错误，避免与 getVideoStreamStatusLine 递归拼接导致状态栏爆长
                 const shortMsg = (msg.indexOf(' | ') >= 0) ? msg.split(' | ')[0] : msg;
                 videoStreamDebug[streamType].lastError = shortMsg.length > 120 ? shortMsg.slice(0, 120) + '…' : shortMsg;
             }
-            infoEl.textContent = msg;
+            if (!videoStatusHistoryByStream[streamType]) videoStatusHistoryByStream[streamType] = [];
+            const hist = videoStatusHistoryByStream[streamType];
+            if (hist.length === 0 || hist[hist.length - 1] !== msg) {
+                hist.push(msg);
+                if (hist.length > MAX_VIDEO_STATUS_LINES) hist.shift();
+            }
+            infoEl.textContent = hist.join('\n');
             infoEl.style.color = isError ? '#f48771' : '#858585';
         }
         
@@ -3960,6 +3970,9 @@
                 mseInvalidErrorShownAtByStream[st] = 0;
                 h264SPSByStream[st] = null;
                 h264PPSByStream[st] = null;
+                videoStatusHistoryByStream[st] = [];
+                var infoEl = document.getElementById('info-' + st);
+                if (infoEl) infoEl.textContent = '';
                 if (mseVideo && mseVideo.src) {
                     try { URL.revokeObjectURL(mseVideo.src); } catch (e) {}
                     mseVideo.removeAttribute('src');
