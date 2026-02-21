@@ -75,6 +75,112 @@
             letter-spacing: 1px;
         }
 
+        .header-title-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .tunnel-control {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .tunnel-switch-wrap {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            color: rgba(255,255,255,0.95);
+        }
+        .tunnel-switch {
+            position: absolute;
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .tunnel-slider {
+            position: relative;
+            width: 36px;
+            height: 20px;
+            background: rgba(255,255,255,0.3);
+            border-radius: 20px;
+            transition: 0.2s;
+        }
+        .tunnel-slider::before {
+            content: '';
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            left: 2px;
+            top: 2px;
+            background: white;
+            border-radius: 50%;
+            transition: 0.2s;
+        }
+        .tunnel-switch:checked + .tunnel-slider {
+            background: #4ade80;
+        }
+        .tunnel-switch:checked + .tunnel-slider::before {
+            transform: translateX(16px);
+        }
+        .tunnel-url-wrap {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+        }
+        .tunnel-url-wrap a {
+            color: #93c5fd;
+            text-decoration: none;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .tunnel-url-wrap a:hover {
+            text-decoration: underline;
+        }
+        #tunnel-copy {
+            background: rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.3);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        #tunnel-copy:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        .tunnel-hint {
+            font-size: 10px;
+            color: rgba(255,255,255,0.75);
+            margin-left: 2px;
+        }
+        .tunnel-loading {
+            color: rgba(255,255,255,0.8);
+            font-size: 12px;
+        }
+        .tunnel-spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: tunnel-spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 4px;
+        }
+        @keyframes tunnel-spin {
+            to { transform: rotate(360deg); }
+        }
+        .tunnel-control.tunnel-busy .tunnel-switch-wrap {
+            pointer-events: none;
+            opacity: 0.8;
+        }
+
         #header .status {
             margin-left: auto;
             display: flex;
@@ -1344,7 +1450,23 @@
     <div id="container">
         <!-- 头部 -->
         <div id="header">
-            <h1>🖥️ IMS MML 管理终端</h1>
+            <div class="header-title-row">
+                <h1>🖥️ IMS MML 管理终端</h1>
+                <div class="tunnel-control">
+                    <label class="tunnel-switch-wrap" title="开启后通过 Cloudflare 临时隧道生成公网链接（忽略本机配置）">
+                        <span class="tunnel-label">公网链接</span>
+                        <input type="checkbox" id="tunnel-switch" class="tunnel-switch">
+                        <span class="tunnel-slider"></span>
+                    </label>
+                    <div id="tunnel-url-wrap" class="tunnel-url-wrap" style="display:none">
+                        <a id="tunnel-url" href="#" target="_blank" rel="noopener"></a>
+                        <button type="button" id="tunnel-copy">复制</button>
+                        <span class="tunnel-hint" title="公网与本站不同源，打开链接后需重新登录">⚠️ 公网需重新登录</span>
+                    </div>
+                    <span id="tunnel-loading" class="tunnel-loading" style="display:none"><span class="tunnel-spinner"></span>创建中…</span>
+                    <span id="tunnel-error" class="tunnel-loading" style="display:none; color: #fca5a5;"></span>
+                </div>
+            </div>
             <div class="status">
                 <div class="status-indicator">
                     <span class="status-dot"></span>
@@ -6314,6 +6436,127 @@
                 window.location.href = '/api/logout';
             }
         });
+
+        // Cloudflare 临时隧道（公网链接）开关
+        let tunnelPollTimer = null;
+        const tunnelControlEl = () => document.querySelector('.tunnel-control');
+
+        function setTunnelUI(data) {
+            const sw = document.getElementById('tunnel-switch');
+            const urlWrap = document.getElementById('tunnel-url-wrap');
+            const urlEl = document.getElementById('tunnel-url');
+            const loadingEl = document.getElementById('tunnel-loading');
+            const errEl = document.getElementById('tunnel-error');
+            const ctrl = tunnelControlEl();
+            if (ctrl) ctrl.classList.toggle('tunnel-busy', !!data.starting);
+
+            if (data.enabled && data.url) {
+                sw.checked = true;
+                urlEl.href = data.url;
+                urlEl.textContent = data.url;
+                urlWrap.style.display = 'flex';
+                loadingEl.style.display = 'none';
+                errEl.style.display = 'none';
+                if (ctrl) ctrl.classList.remove('tunnel-busy');
+            } else if (data.starting) {
+                sw.checked = true;
+                urlWrap.style.display = 'none';
+                loadingEl.style.display = 'inline';
+                errEl.style.display = 'none';
+            } else {
+                sw.checked = false;
+                urlWrap.style.display = 'none';
+                loadingEl.style.display = 'none';
+                if (ctrl) ctrl.classList.remove('tunnel-busy');
+                if (data.error) {
+                    errEl.textContent = data.error;
+                    errEl.style.display = 'inline';
+                } else {
+                    errEl.style.display = 'none';
+                }
+            }
+        }
+
+        async function loadTunnelStatus() {
+            try {
+                const r = await fetch('/api/tunnel/status', { credentials: 'same-origin' });
+                const data = await r.json();
+                setTunnelUI(data);
+                return data;
+            } catch (e) {
+                console.warn('tunnel status:', e);
+                setTunnelUI({ enabled: false });
+                return { enabled: false };
+            }
+        }
+        function initTunnelSwitch() {
+            const sw = document.getElementById('tunnel-switch');
+            const urlWrap = document.getElementById('tunnel-url-wrap');
+            const loadingEl = document.getElementById('tunnel-loading');
+            const errEl = document.getElementById('tunnel-error');
+            const ctrl = tunnelControlEl();
+            loadTunnelStatus();
+
+            sw.addEventListener('change', async () => {
+                if (tunnelPollTimer) {
+                    clearInterval(tunnelPollTimer);
+                    tunnelPollTimer = null;
+                }
+                if (sw.checked) {
+                    errEl.style.display = 'none';
+                    loadingEl.style.display = 'inline';
+                    if (ctrl) ctrl.classList.add('tunnel-busy');
+                    try {
+                        await fetch('/api/tunnel/start', { method: 'POST', credentials: 'same-origin' });
+                        let data = await loadTunnelStatus();
+                        if (data.enabled && data.url) {
+                            /* 已存在或很快就绪 */
+                        } else {
+                            let pollCount = 0;
+                            const maxPoll = 30;
+                            tunnelPollTimer = setInterval(async () => {
+                                pollCount++;
+                                data = await loadTunnelStatus();
+                                if (data.enabled && data.url) {
+                                    clearInterval(tunnelPollTimer);
+                                    tunnelPollTimer = null;
+                                } else if (pollCount >= maxPoll || (data.error && !data.enabled && !data.starting)) {
+                                    clearInterval(tunnelPollTimer);
+                                    tunnelPollTimer = null;
+                                    if (ctrl) ctrl.classList.remove('tunnel-busy');
+                                }
+                            }, 2000);
+                        }
+                    } catch (e) {
+                        loadingEl.style.display = 'none';
+                        if (ctrl) ctrl.classList.remove('tunnel-busy');
+                        errEl.textContent = '请求失败: ' + (e.message || '');
+                        errEl.style.display = 'inline';
+                        sw.checked = false;
+                    }
+                } else {
+                    if (ctrl) ctrl.classList.add('tunnel-busy');
+                    try {
+                        await fetch('/api/tunnel/stop', { method: 'POST', credentials: 'same-origin' });
+                    } catch (e) {}
+                    await loadTunnelStatus();
+                    if (ctrl) ctrl.classList.remove('tunnel-busy');
+                }
+            });
+
+            document.getElementById('tunnel-copy').addEventListener('click', () => {
+                const urlEl = document.getElementById('tunnel-url');
+                const url = urlEl && urlEl.href;
+                if (url && url !== '#') {
+                    navigator.clipboard.writeText(url).then(() => {
+                        const btn = document.getElementById('tunnel-copy');
+                        const old = btn.textContent;
+                        btn.textContent = '已复制';
+                        setTimeout(() => { btn.textContent = old; }, 1500);
+                    });
+                }
+            });
+        }
         
         document.addEventListener('DOMContentLoaded', () => {
             loadUserInfo();
@@ -6325,6 +6568,7 @@
             initOutputTabs();
             initHistoryNavigation();
             initSipMessages();
+            initTunnelSwitch();
         });
     </script>
 </body>

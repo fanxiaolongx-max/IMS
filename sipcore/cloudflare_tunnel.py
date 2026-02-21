@@ -16,6 +16,7 @@ import sys
 import os
 import signal
 import platform
+import tempfile
 from typing import Optional, Tuple, List, Dict
 
 # 隧道进程与输出解析
@@ -254,12 +255,40 @@ def cleanup_conflicting_tunnels(target_urls: List[str], keep_named: bool = True)
     return cleaned
 
 
+def _devnull_config_path() -> str:
+    """返回用于忽略配置文件的路径（Unix: /dev/null，Windows: NUL）"""
+    return getattr(os, "devnull", "/dev/null")
+
+
+def _create_isolated_config_dir() -> Optional[str]:
+    """
+    创建仅用于 Quick Tunnel 的临时配置目录，写入最小合法 config，
+    避免 cloudflared 读取本机 ~/.cloudflared，且避免 "config was empty" 报错。
+    调用方需在隧道进程存活期间保留该目录（不删除）。
+    """
+    try:
+        tmp = tempfile.mkdtemp(prefix="cloudflared_quick_")
+        cfg_path = os.path.join(tmp, "config.yml")
+        with open(cfg_path, "w") as f:
+            f.write("# Quick tunnel only - no named tunnel\n")
+        return cfg_path
+    except Exception as e:
+        print(f"[CF-TUNNEL] 创建临时配置目录失败: {e}", file=sys.stderr, flush=True)
+        return None
+
+
 async def start_tunnel(
     url: str,
     timeout: float = 15.0,
+    ignore_config: bool = False,
 ) -> Tuple[Optional[str], Optional[int], Optional[subprocess.Popen]]:
     """
     启动一条 cloudflared quick tunnel，指向本地 url（如 tcp://localhost:5060 或 http://localhost:8888）。
+
+    Args:
+        url: 本地服务地址，如 http://127.0.0.1:8888
+        timeout: 超时秒数
+        ignore_config: 为 True 时完全忽略本机 ~/.cloudflared，使用临时 config 目录强制 Quick Tunnel
 
     Returns:
         (host, port, process): 解析到的公网 host、port（TCP 时可能非 443）、及子进程；
@@ -270,16 +299,23 @@ async def start_tunnel(
     if not exe:
         return None, None, None
 
-    # 检查是否有 config.yaml 或 config.yml 文件（会阻止 Quick Tunnel）
+    # 需要忽略本机配置时：使用临时目录内的小 config，避免读 ~/.cloudflared 且避免 "empty" 报错
     config_yaml = os.path.expanduser("~/.cloudflared/config.yaml")
     config_yml = os.path.expanduser("~/.cloudflared/config.yml")
     has_config = os.path.exists(config_yaml) or os.path.exists(config_yml)
-    
-    if has_config:
-        print(f"[CF-TUNNEL] 警告: 发现 ~/.cloudflared/config.yaml 或 config.yml，Quick Tunnel 可能受影响", file=sys.stderr, flush=True)
-        print(f"[CF-TUNNEL] 提示: 将使用 --config /dev/null 来忽略配置文件", file=sys.stderr, flush=True)
-        # 使用 --config /dev/null 来忽略配置文件，强制使用 Quick Tunnel
-        cmd = [exe, "tunnel", "--config", "/dev/null", "--url", url]
+    use_isolated_config = ignore_config or has_config
+
+    env = os.environ.copy()
+    if use_isolated_config:
+        if ignore_config or has_config:
+            print(f"[CF-TUNNEL] 使用临时配置目录，忽略本机 ~/.cloudflared", file=sys.stderr, flush=True)
+        isolated_cfg = _create_isolated_config_dir()
+        if isolated_cfg:
+            cmd = [exe, "tunnel", "--config", isolated_cfg, "--url", url]
+            # 让 cloudflared 仅从该目录读配置，不读 ~/.cloudflared
+            env["CLOUDFLARED_CONFIG_DIR"] = os.path.dirname(isolated_cfg)
+        else:
+            cmd = [exe, "tunnel", "--config", _devnull_config_path(), "--url", url]
     else:
         cmd = [exe, "tunnel", "--url", url]
 
@@ -291,6 +327,7 @@ async def start_tunnel(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=0,  # 无缓冲
+        env=env,
     )
     # 记录进程启动信息用于调试
     print(f"[CF-TUNNEL] 启动 cloudflared 进程 PID {proc.pid}，URL: {url}", file=sys.stderr, flush=True)

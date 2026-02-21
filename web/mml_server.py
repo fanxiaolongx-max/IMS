@@ -59,6 +59,14 @@ log_subscribers = set()
 # 日志消息队列（用于线程安全的日志传递）
 log_queue = queue.Queue(maxsize=1000)
 
+# Cloudflare 临时隧道（仅 Web 界面公网链接）状态
+MML_HTTP_PORT = 8888  # 由 init_mml_interface 设置
+_web_tunnel_proc = None
+_web_tunnel_url = None
+_web_tunnel_error = None
+_web_tunnel_starting = False  # 防止重复点击导致启动多条隧道
+_web_tunnel_lock = threading.Lock()
+
 
 class MMLCommandTree:
     """MML 命令树定义"""
@@ -2546,6 +2554,86 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
         response = json.dumps(data, ensure_ascii=False).encode('utf-8')
         self.wfile.write(response)
+
+    def _handle_tunnel_status(self):
+        """GET /api/tunnel/status：返回当前隧道状态"""
+        global _web_tunnel_proc, _web_tunnel_url, _web_tunnel_error, _web_tunnel_starting
+        with _web_tunnel_lock:
+            proc = _web_tunnel_proc
+            url = _web_tunnel_url
+            err = _web_tunnel_error
+            starting = _web_tunnel_starting
+        if proc is not None and proc.poll() is not None:
+            with _web_tunnel_lock:
+                _web_tunnel_proc = None
+                _web_tunnel_url = None
+                _web_tunnel_error = "隧道进程已退出"
+            proc, url, err = None, None, "隧道进程已退出"
+        enabled = proc is not None
+        data = {"enabled": enabled, "url": url, "starting": starting}
+        if err:
+            data["error"] = err
+        self._send_json_response(data)
+
+    def _handle_tunnel_start(self):
+        """POST /api/tunnel/start：启动 Cloudflare 临时隧道（仅 Web，忽略本机配置）"""
+        global _web_tunnel_proc, _web_tunnel_url, _web_tunnel_error, _web_tunnel_starting
+
+        def _run_tunnel():
+            global _web_tunnel_proc, _web_tunnel_url, _web_tunnel_error, _web_tunnel_starting
+            try:
+                from sipcore.cloudflare_tunnel import start_tunnel
+                url = f"http://127.0.0.1:{MML_HTTP_PORT}"
+                host, port, proc = asyncio.run(start_tunnel(url, ignore_config=True))
+                with _web_tunnel_lock:
+                    _web_tunnel_starting = False
+                    if proc and host:
+                        _web_tunnel_proc = proc
+                        _web_tunnel_url = f"https://{host}"
+                        _web_tunnel_error = None
+                    else:
+                        _web_tunnel_error = "隧道启动失败或未解析到公网地址"
+                        _web_tunnel_proc = None
+                        _web_tunnel_url = None
+            except Exception as e:
+                with _web_tunnel_lock:
+                    _web_tunnel_starting = False
+                    _web_tunnel_error = str(e)
+                    _web_tunnel_proc = None
+                    _web_tunnel_url = None
+
+        with _web_tunnel_lock:
+            if _web_tunnel_starting:
+                self._send_json_response({"success": True, "message": "隧道正在创建中，请稍候", "starting": True})
+                return
+            if _web_tunnel_proc is not None and _web_tunnel_proc.poll() is None:
+                self._send_json_response({"success": True, "message": "隧道已在运行", "url": _web_tunnel_url})
+                return
+            _web_tunnel_proc = None
+            _web_tunnel_url = None
+            _web_tunnel_starting = True
+        t = threading.Thread(target=_run_tunnel, daemon=True)
+        t.start()
+        self._send_json_response({"success": True, "message": "正在创建隧道，请稍候", "starting": True})
+
+    def _handle_tunnel_stop(self):
+        """POST /api/tunnel/stop：停止临时隧道"""
+        global _web_tunnel_proc, _web_tunnel_url, _web_tunnel_error
+        with _web_tunnel_lock:
+            proc = _web_tunnel_proc
+            _web_tunnel_proc = None
+            _web_tunnel_url = None
+            _web_tunnel_error = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._send_json_response({"success": True, "message": "隧道已关闭"})
     
     def do_GET(self):
         """处理 GET 请求"""
@@ -2569,6 +2657,9 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == '/api/media-endpoints':
             if self._require_auth():
                 self._handle_media_endpoints_api()
+        elif parsed_path.path == '/api/tunnel/status':
+            if self._require_auth():
+                self._handle_tunnel_status()
         else:
             self.send_error(404)
     
@@ -2581,6 +2672,12 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == '/api/execute':
             if self._require_auth():
                 self._execute_command()
+        elif parsed_path.path == '/api/tunnel/start':
+            if self._require_auth():
+                self._handle_tunnel_start()
+        elif parsed_path.path == '/api/tunnel/stop':
+            if self._require_auth():
+                self._handle_tunnel_stop()
         else:
             self.send_error(404)
     
@@ -2937,50 +3034,155 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
             self._send_json_response(result, 500)
 
 
+def _run_tcp_proxy(listen_port, http_backend_port, ws_backend_port):
+    """
+    在 listen_port 上监听，根据首行请求路径将连接转发到 HTTP(8887) 或 WebSocket(8889)。
+    这样单条 Cloudflare 隧道指向 listen_port 即可同时承载 HTTP 与 WebSocket。
+    """
+    import socket
+    BUFFER_SIZE = 8192
+    FIRST_LINE_MAX = 4096
+
+    def forward(src, dst):
+        try:
+            while True:
+                data = src.recv(BUFFER_SIZE)
+                if not data:
+                    break
+                dst.sendall(data)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def handle_client(client_sock):
+        try:
+            client_sock.settimeout(10)
+            first_chunk = b""
+            while len(first_chunk) < FIRST_LINE_MAX:
+                try:
+                    chunk = client_sock.recv(min(1024, FIRST_LINE_MAX - len(first_chunk)))
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                first_chunk += chunk
+                if b"\r\n" in first_chunk or b"\n" in first_chunk:
+                    break
+            if not first_chunk:
+                client_sock.close()
+                return
+            first_line = first_chunk.split(b"\r\n", 1)[0].split(b"\n", 1)[0].decode("utf-8", errors="replace")
+            parts = first_line.split()
+            path = parts[1] if len(parts) >= 2 else ""
+            to_ws = path.startswith("/ws") or path.startswith("/ws/")
+            backend_port = ws_backend_port if to_ws else http_backend_port
+            client_sock.settimeout(None)
+            backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            backend_sock.settimeout(30)
+            try:
+                backend_sock.connect(("127.0.0.1", backend_port))
+            except OSError as e:
+                print(f"[MML-PROXY] 后端 {backend_port} 连接失败: {e}", flush=True)
+                try:
+                    client_sock.close()
+                except OSError:
+                    pass
+                try:
+                    backend_sock.close()
+                except OSError:
+                    pass
+                return
+            backend_sock.settimeout(None)
+            backend_sock.sendall(first_chunk)
+            t1 = threading.Thread(target=forward, args=(client_sock, backend_sock), daemon=True)
+            t2 = threading.Thread(target=forward, args=(backend_sock, client_sock), daemon=True)
+            t1.start()
+            t2.start()
+            t1.join()
+            t2.join()
+        except Exception as e:
+            print(f"[MML-PROXY] 处理连接异常: {e}", file=sys.stderr, flush=True)
+        finally:
+            try:
+                client_sock.close()
+            except OSError:
+                pass
+            try:
+                backend_sock.close()
+            except NameError:
+                pass
+            except OSError:
+                pass
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind(("0.0.0.0", listen_port))
+        server.listen(128)
+        print(f"[MML] 代理已启动: 0.0.0.0:{listen_port} -> HTTP {http_backend_port} / WS {ws_backend_port}", flush=True)
+        while True:
+            client_sock, _ = server.accept()
+            t = threading.Thread(target=handle_client, args=(client_sock,), daemon=True)
+            t.start()
+    except Exception as e:
+        print(f"[MML] 代理启动失败: {e}", flush=True)
+
+
 def init_mml_interface(port=8888, server_globals=None):
     """初始化 MML 管理界面
     
     Args:
-        port: HTTP 端口
+        port: 对外 HTTP 端口（若启用 WebSocket，则此端口由代理占用，HTTP 实际在 port-1）
         server_globals: 服务器全局变量字典，包含 REGISTRATIONS, DIALOGS 等
     """
+    global MML_HTTP_PORT
+    MML_HTTP_PORT = port
     # 创建执行器并传递服务器状态
     MMLHTTPHandler.executor = MMLCommandExecutor(server_globals)
     
-    # HTTP 服务器监听在指定端口，WebSocket 服务器监听在端口+1
-    # 注意：Cloudflare 隧道只转发 HTTP 流量到 8888，WebSocket 服务器运行在 8889
-    # WebSocket 无法通过 Cloudflare 隧道访问，只能在本机访问
-    # TODO: 使用支持 WebSocket 升级的 HTTP 服务器（如 aiohttp）来同时处理 HTTP 和 WebSocket
-    http_port = port
-    ws_port = port + 1 if WEBSOCKET_AVAILABLE else None
+    # 当启用 WebSocket 时：HTTP 在 port-1(8887)，WebSocket 在 port+1(8889)，代理在 port(8888) 分流
+    # 这样 Cloudflare 隧道只指向 8888 即可同时承载 HTTP 与 WebSocket
+    use_proxy = WEBSOCKET_AVAILABLE
+    http_internal_port = (port - 1) if use_proxy else port
+    ws_port = (port + 1) if WEBSOCKET_AVAILABLE else None
     
     def run_server():
         try:
-            server = HTTPServer(('0.0.0.0', http_port), MMLHTTPHandler)
-            print(f"[MML] MML 管理界面已启动: http://0.0.0.0:{http_port}", flush=True)
-            # 验证服务器已就绪
+            server = HTTPServer(('0.0.0.0', http_internal_port), MMLHTTPHandler)
+            print(f"[MML] MML 管理界面已启动: http://0.0.0.0:{http_internal_port}", flush=True)
             import socket
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(1)
-            result = test_sock.connect_ex(('127.0.0.1', http_port))
+            result = test_sock.connect_ex(('127.0.0.1', http_internal_port))
             test_sock.close()
             if result == 0:
-                print(f"[MML] MML 服务已就绪，端口 {http_port} 可访问", flush=True)
+                print(f"[MML] MML 服务已就绪，端口 {http_internal_port} 可访问", flush=True)
             else:
-                print(f"[MML] 警告: 端口 {http_port} 可能未就绪", flush=True)
+                print(f"[MML] 警告: 端口 {http_internal_port} 可能未就绪", flush=True)
             server.serve_forever()
         except Exception as e:
             print(f"[MML] ERROR: {e}", flush=True)
     
-    # 在独立线程中运行 HTTP 服务器
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
     
-    # 启动 WebSocket 日志推送服务器（如果可用）
-    # 隧道模式：WebSocket 服务器监听在 HTTP 端口（8888），Cloudflare 隧道会将 WebSocket 流量转发到这里
-    # 正常模式：WebSocket 服务器监听在 HTTP 端口+1（8889）
     if WEBSOCKET_AVAILABLE:
         start_websocket_server(ws_port)
+    
+    if use_proxy:
+        # 代理必须在 HTTP(8887) 与 WS(8889) 均已启动后再启动，避免连接被拒绝
+        import time
+        time.sleep(0.5)
+        proxy_thread = threading.Thread(
+            target=_run_tcp_proxy,
+            args=(port, http_internal_port, ws_port),
+            daemon=True
+        )
+        proxy_thread.start()
         
         # 添加日志处理器，将日志推送到队列
         class WebSocketLogHandler(logging.Handler):
@@ -3541,12 +3743,8 @@ if WEBSOCKET_AVAILABLE:
 
 
 if __name__ == "__main__":
-    # 测试
+    # 测试（init_mml_interface 内部会按需启动 HTTP/代理/WebSocket）
     init_mml_interface(8888)
-    
-    if WEBSOCKET_AVAILABLE:
-        start_websocket_server(8889)
-    
     print("Press Ctrl+C to stop")
     try:
         import time
