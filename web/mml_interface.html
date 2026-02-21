@@ -1473,14 +1473,14 @@
                             <div class="media-monitor-panel" id="panel-video-a" data-stream-type="video-a">
                                 <div class="media-monitor-panel-head">
                                     <span class="media-monitor-panel-title">📹 主叫视频</span>
-                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-video-a" class="media-monitor-mute-cb"> 静音</label>
+                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-video-a" class="media-monitor-mute-cb"> 关闭画面</label>
                                 </div>
                                 <div class="media-monitor-panel-body media-monitor-video-wrap" id="panel-body-video-a"><canvas id="media-monitor-canvas-video-a" class="media-monitor-canvas" width="320" height="240"></canvas><div class="media-monitor-panel-info" id="info-video-a"></div></div>
                             </div>
                             <div class="media-monitor-panel" id="panel-video-b" data-stream-type="video-b">
                                 <div class="media-monitor-panel-head">
                                     <span class="media-monitor-panel-title">📹 被叫视频</span>
-                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-video-b" class="media-monitor-mute-cb"> 静音</label>
+                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-video-b" class="media-monitor-mute-cb"> 关闭画面</label>
                                 </div>
                                 <div class="media-monitor-panel-body media-monitor-video-wrap" id="panel-body-video-b"><canvas id="media-monitor-canvas-video-b" class="media-monitor-canvas" width="320" height="240"></canvas><div class="media-monitor-panel-info" id="info-video-b"></div></div>
                             </div>
@@ -3701,6 +3701,8 @@
         let audioBufferQueues = { 'audio-a': [], 'audio-b': [] };
         let audioGainNodes = {};
         let audioScriptProcessorsMulti = {};
+        let audioOpusDecodersByStream = {};   // streamType -> AudioDecoder (Opus)
+        let lastOpusTimestampByStream = {};    // streamType -> 微秒，用于 EncodedAudioChunk timestamp
         let videoDecodersByStream = {};  // streamType -> VideoDecoder
         let h264SPSByStream = {};
         let h264PPSByStream = {};
@@ -3934,6 +3936,11 @@
                     audioScriptProcessorsMulti[st] = null;
                 }
                 if (audioBufferQueues[st]) audioBufferQueues[st].length = 0;
+                if (audioOpusDecodersByStream[st]) {
+                    try { audioOpusDecodersByStream[st].close(); } catch (e) {}
+                    audioOpusDecodersByStream[st] = null;
+                }
+                lastOpusTimestampByStream[st] = 0;
             });
             if (audioContext && audioContext.state !== 'closed') {
                 audioContext.close().catch(() => {});
@@ -4061,6 +4068,68 @@
             }
             
             return floatSamples;
+        }
+        
+        // 通用音频重采样（线性插值）
+        function resampleAudioGeneric(inputData, inputSampleRate, outputSampleRate) {
+            if (inputSampleRate === outputSampleRate) return inputData;
+            const ratio = outputSampleRate / inputSampleRate;
+            const outputLength = Math.floor(inputData.length * ratio);
+            const outputData = new Float32Array(outputLength);
+            for (let i = 0; i < outputLength; i++) {
+                const srcIndex = i / ratio;
+                const f = Math.floor(srcIndex);
+                const c = Math.min(f + 1, inputData.length - 1);
+                const t = srcIndex - f;
+                outputData[i] = inputData[f] * (1 - t) + inputData[c] * t;
+            }
+            return outputData;
+        }
+        
+        function ensureOpusDecoderForStream(streamType) {
+            if (audioOpusDecodersByStream[streamType] && audioOpusDecodersByStream[streamType].state === 'configured') return true;
+            if (typeof window.AudioDecoder === 'undefined') return false;
+            try {
+                const dec = audioOpusDecodersByStream[streamType];
+                if (dec) { try { dec.close(); } catch (e) {} audioOpusDecodersByStream[streamType] = null; }
+                const ctx = audioContext;
+                const targetRate = ctx ? ctx.sampleRate : 48000;
+                const decoder = new AudioDecoder({
+                    output: (audioData) => {
+                        try {
+                            const q = audioBufferQueues[streamType];
+                            if (!q) { audioData.close(); return; }
+                            const rate = audioData.sampleRate;
+                            const format = audioData.format || 'f32-planar';
+                            const size = audioData.allocationSize({ planeIndex: 0 });
+                            const buf = new ArrayBuffer(size);
+                            audioData.copyTo(buf, { planeIndex: 0 });
+                            audioData.close();
+                            let floatSamples;
+                            if (format === 's16-planar') {
+                                const s16 = new Int16Array(buf);
+                                const n = s16.length;
+                                floatSamples = new Float32Array(n);
+                                for (let i = 0; i < n; i++) floatSamples[i] = s16[i] / 32768;
+                            } else {
+                                floatSamples = new Float32Array(buf);
+                            }
+                            const out = (rate !== targetRate) ? resampleAudioGeneric(floatSamples, rate, targetRate) : floatSamples;
+                            q.push(out);
+                            const maxQueueSize = Math.ceil(targetRate / 8000 * 12);
+                            if (q.length > maxQueueSize) { for (let i = 0; i < q.length - maxQueueSize; i++) q.shift(); }
+                        } catch (e) { if (audioData.close) audioData.close(); }
+                    },
+                    error: (e) => { console.warn('[MediaMonitor] Opus decode error', streamType, e); }
+                });
+                decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+                audioOpusDecodersByStream[streamType] = decoder;
+                if (lastOpusTimestampByStream[streamType] == null) lastOpusTimestampByStream[streamType] = 0;
+                return true;
+            } catch (e) {
+                console.warn('[MediaMonitor] Opus decoder init', streamType, e);
+                return false;
+            }
         }
         
         // 从 SPS+PPS 构建 AVCDecoderConfigurationRecord（avcC），供 WebCodecs 或 fMP4 使用
@@ -4778,13 +4847,18 @@
                                 infoEl.textContent = `音频流：解码错误 - ${e.message}`;
                             }
                         } else {
-                            infoEl.textContent = `音频流：不支持的编解码 ${codec || 'UNKNOWN'} (payload type: ${payloadType})`;
+                            infoEl.textContent = `音频流：当前仅支持 G.711 (PCMU/PCMA) 与 Opus，该流为 ${codec || ('pt=' + payloadType)}，暂无法播放`;
                         }
                     }
                 } else if (streamType.startsWith('video')) {
                     const infoEl = document.getElementById('media-monitor-player-info');
-                    if (codec !== 'H264' && payloadType !== 96) {
-                        infoEl.textContent = `视频流：不支持的编解码 ${codec || 'UNKNOWN'} (payload type: ${payloadType})`;
+                    const vCodec = codec ? String(codec).toUpperCase() : '';
+                    const vIsH264 = vCodec === 'H264';
+                    const vIsAudioPt = payloadType === 0 || payloadType === 8;
+                    if (!vIsH264 || vIsAudioPt) {
+                        const codecLabel = (vCodec.indexOf('H265') >= 0 || vCodec.indexOf('HEVC') >= 0)
+                            ? 'H.265/HEVC' : (codec || ('pt=' + payloadType));
+                        infoEl.textContent = `视频流：当前仅支持 H.264 监看，该流为 ${codecLabel}，暂无法解码`;
                     } else {
                         try {
                             const START_CODE = new Uint8Array([0, 0, 0, 1]);
@@ -4991,7 +5065,36 @@
                 const payload = Uint8Array.from(atob(payloadB64), c => c.charCodeAt(0));
                 if (streamType.startsWith('audio')) {
                     if (!audioContext || audioContext.state !== 'running') return;
-                    if (codec !== 'PCMU' && codec !== 'PCMA' && payloadType !== 0 && payloadType !== 8) return;
+                    const codecNorm = codec ? String(codec).toLowerCase() : '';
+                    if (codecNorm === 'opus') {
+                        if (!ensureOpusDecoderForStream(streamType)) {
+                            const panelBody = document.getElementById('panel-body-' + streamType);
+                            if (panelBody) panelBody.textContent = 'Opus 需要浏览器支持 WebCodecs (Chrome/Edge)';
+                            return;
+                        }
+                        const dec = audioOpusDecodersByStream[streamType];
+                        if (dec && dec.state === 'configured' && payload.length > 0) {
+                            let ts = lastOpusTimestampByStream[streamType];
+                            if (ts == null) ts = 0;
+                            try {
+                                const buf = payload.byteLength === payload.buffer.byteLength ? payload.buffer : payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+                                dec.decode(new EncodedAudioChunk({
+                                    type: 'delta',
+                                    timestamp: ts,
+                                    duration: 20000,
+                                    data: buf
+                                }));
+                                lastOpusTimestampByStream[streamType] = ts + 20000;
+                            } catch (e) { console.warn('[MediaMonitor] Opus decode queue', streamType, e); }
+                        }
+                        return;
+                    }
+                    if (codec !== 'PCMU' && codec !== 'PCMA' && payloadType !== 0 && payloadType !== 8) {
+                        const codecLabel = codec || ('pt=' + payloadType);
+                        const panelBody = document.getElementById('panel-body-' + streamType);
+                        if (panelBody) panelBody.textContent = '当前仅支持 G.711 (PCMU/PCMA) 与 Opus，该流为 ' + codecLabel + '，暂无法播放';
+                        return;
+                    }
                     const actualCodec = (payloadType === 0) ? 'PCMU' : 'PCMA';
                     const pcmSamples = decodeG711(payload, actualCodec);
                     const targetSampleRate = audioContext.sampleRate;
@@ -5003,8 +5106,13 @@
                         if (q.length > maxQueueSize) { for (let i = 0; i < q.length - maxQueueSize; i++) q.shift(); }
                     }
                 } else if (streamType.startsWith('video')) {
-                    if (codec !== 'H264' || (payloadType !== undefined && payloadType !== 96)) {
-                        setVideoStreamStatus(streamType, '非 H264 编解码: ' + (codec || '') + ' pt=' + payloadType + ' | ' + getVideoStreamStatusLine(streamType), true);
+                    const videoCodec = codec ? String(codec).toUpperCase() : '';
+                    const isH264 = videoCodec === 'H264';
+                    const isAudioPt = payloadType === 0 || payloadType === 8;  // PCMU/PCMA，避免误当视频
+                    if (!isH264 || isAudioPt) {
+                        const codecLabel = (videoCodec.indexOf('H265') >= 0 || videoCodec.indexOf('HEVC') >= 0)
+                            ? 'H.265/HEVC' : (codec || ('pt=' + payloadType));
+                        setVideoStreamStatus(streamType, '当前仅支持 H.264 监看，该流为 ' + codecLabel + '，暂无法解码 | ' + getVideoStreamStatusLine(streamType), true);
                         return;
                     }
                     const START_CODE = new Uint8Array([0, 0, 0, 1]);

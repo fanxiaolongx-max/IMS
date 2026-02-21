@@ -125,5 +125,16 @@
     "create_time": "2026-02-15T21:09:51.888070",
     "update_time": "2026-02-15T21:10:37.967274",
     "role": "ADMIN"
+  },
+  "1003": {
+    "username": "1003",
+    "password": "1234",
+    "display_name": "用户1003",
+    "phone": "",
+    "email": "",
+    "status": "ACTIVE",
+    "service_type": "BASIC",
+    "create_time": "2026-02-21T13:27:43.871699",
+    "update_time": "2026-02-21T13:27:43.871712"
   }
 }
