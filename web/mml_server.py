@@ -3294,8 +3294,9 @@ if WEBSOCKET_AVAILABLE:
                                         s["rtp_payload_b64"] = base64.b64encode(rtp_payload).decode('utf-8')
                                     return s
                                 
-                                # 历史包：视频也发 rtp_packet，由前端 MSE 从 SPS/PPS+关键帧起解码出图
-                                history_limit = 2000 if stream_type.startswith('video') else 0
+                                # 不再向新连接推送历史缓冲，避免关闭后重开时“疯狂快速播放旧帧”；仅推送实时包，前端等下一个关键帧即可出图
+                                # history_limit = 0 表示不发送历史，新连接只收实时
+                                history_limit = 0
                                 buffered = media_relay.get_channel_buffered_packets(call_id, stream_type, limit=history_limit)
                                 if buffered:
                                     batch_size = 40
