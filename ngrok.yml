@@ -1,0 +1,9 @@
+version: 3
+endpoints:
+  - name: sip-tcp
+    url: tcp://
+    upstream:
+      url: 5060
+  - name: web
+    upstream:
+      url: http://localhost:8888

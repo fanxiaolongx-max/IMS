@@ -2,7 +2,6 @@
     "FORCE_LOCAL_ADDR": false,
     "SERVER_ADDR": "AUTO_DETECT",
     "SERVER_PORT": 5060,
-    "SERVER_PUBLIC_PORT": null,
     "USERS": {
         "1001": "1234",
         "1002": "1234",

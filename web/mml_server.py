@@ -2819,6 +2819,8 @@ class MMLHTTPHandler(BaseHTTPRequestHandler):
                     'downlink_packets': downlink,  # 兼容旧格式
                     'duration_sec': st.get('duration_sec') or (st.get('duration') if st.get('duration') is not None else None),
                     'diagnosis': st.get('diagnosis', ''),
+                    'audio_drops': st.get('audio_drops'),  # { uplink, downlink } 发送缓冲满丢包
+                    'video_drops': st.get('video_drops'),
                 })
             # 整体诊断摘要
             active = len(sessions)
@@ -3027,13 +3029,36 @@ if WEBSOCKET_AVAILABLE:
     # SIP消息队列（用于线程安全的异步发送）
     sip_message_queue: queue.Queue = queue.Queue(maxsize=1000)
     
-    async def log_push_handler(websocket):
+    # 媒体流监听订阅者: call_id -> {stream_type -> [websocket1, websocket2, ...]}
+    # stream_type: 'audio-a', 'audio-b', 'video-a', 'video-b'
+    media_stream_subscribers: Dict[str, Dict[str, Set]] = {}
+    # 注意：media_stream_callbacks 已废弃，现在使用独立媒体流通道，前台只读取通道，不注册监听器
+    media_stream_callbacks: Dict = {}  # (call_id, stream_type) -> callback (已废弃，保留仅为兼容)
+    media_stream_lock = threading.Lock()
+    
+    async def log_push_handler(websocket, path=None):
         """WebSocket 处理器（支持多路径）"""
+        # 兼容不同版本的websockets库
         # websockets 16.0+: 通过websocket.request.path获取路径
-        path = websocket.request.path
+        # websockets <16.0: 路径作为参数传入
+        if path is None:
+            try:
+                # 尝试新版本API
+                path = websocket.request.path
+            except AttributeError:
+                # 旧版本API，尝试从websocket对象获取
+                try:
+                    path = getattr(websocket, 'path', '/ws/logs')
+                except:
+                    # 如果都获取不到，使用默认路径
+                    path = '/ws/logs'
+        
         print(f"[MML-DEBUG] WebSocket连接请求: path={path}, remote={websocket.remote_address}", file=sys.stderr, flush=True)
         
-        if path == '/ws/logs':
+        # 提取基础路径（去掉查询参数）
+        base_path = path.split('?')[0] if path else '/ws/logs'
+        
+        if base_path == '/ws/logs':
             log_subscribers.add(websocket)
             print(f"[MML-DEBUG] WebSocket连接建立: /ws/logs, 订阅者数量: {len(log_subscribers)}", file=sys.stderr, flush=True)
             try:
@@ -3051,7 +3076,7 @@ if WEBSOCKET_AVAILABLE:
             finally:
                 log_subscribers.discard(websocket)
                 print(f"[MML-DEBUG] 已移除日志订阅者，剩余: {len(log_subscribers)}", file=sys.stderr, flush=True)
-        elif path == '/ws/sip-messages':
+        elif base_path == '/ws/sip-messages':
             # SIP消息跟踪WebSocket
             sip_message_subscribers.add(websocket)
             callback_ref = None
@@ -3116,6 +3141,262 @@ if WEBSOCKET_AVAILABLE:
                 if websocket in sip_message_callbacks:
                     del sip_message_callbacks[websocket]
                 print(f"[MML-DEBUG] 已移除SIP消息订阅者，剩余: {len(sip_message_subscribers)}", file=sys.stderr, flush=True)
+        elif base_path == '/ws/media-stream':
+            # 媒体流监听WebSocket
+            # 从查询参数获取 call_id 和 stream_type
+            try:
+                # 从websocket对象获取URI（兼容不同websockets版本）
+                uri_str = None
+                try:
+                    # websockets 16.0+: websocket.request.uri
+                    if hasattr(websocket, 'request') and hasattr(websocket.request, 'uri'):
+                        uri_str = websocket.request.uri
+                except:
+                    pass
+                
+                if not uri_str:
+                    # 尝试从path中解析（如果path包含查询参数）
+                    if '?' in path:
+                        uri_str = path
+                    else:
+                        # 如果都没有，尝试从websocket对象获取
+                        try:
+                            uri_str = getattr(websocket, 'path', path)
+                        except:
+                            uri_str = path
+                
+                # 如果uri_str不包含查询参数，尝试从websocket对象获取
+                if not uri_str or '?' not in uri_str:
+                    try:
+                        if hasattr(websocket, 'request') and hasattr(websocket.request, 'query_string'):
+                            query_string = websocket.request.query_string
+                            if query_string:
+                                uri_str = (uri_str or '/ws/media-stream') + '?' + query_string.decode('utf-8')
+                    except:
+                        pass
+                
+                parsed_path = urlparse(uri_str if uri_str else '/')
+                print(f"[MML-DEBUG] 解析URI: {uri_str}, parsed_path.query={parsed_path.query}", file=sys.stderr, flush=True)
+                
+                query_params = parse_qs(parsed_path.query)
+                call_id = query_params.get('call_id', [''])[0]
+                stream_type = query_params.get('stream_type', [''])[0]  # 'audio-a', 'audio-b', 'video-a', 'video-b'
+                
+                print(f"[MML-DEBUG] 媒体流监听参数: call_id={call_id}, stream_type={stream_type}", file=sys.stderr, flush=True)
+                
+                if not call_id or not stream_type:
+                    error_msg = json.dumps({"type": "error", "message": f"缺少参数: call_id={call_id}, stream_type={stream_type}"}, ensure_ascii=False)
+                    print(f"[MML-ERROR] {error_msg}", file=sys.stderr, flush=True)
+                    await websocket.send(error_msg)
+                    await websocket.close()
+                    return
+                
+                print(f"[MML-DEBUG] 媒体流监听连接: call_id={call_id}, stream_type={stream_type}", file=sys.stderr, flush=True)
+                
+                # 注册订阅者
+                with media_stream_lock:
+                    if call_id not in media_stream_subscribers:
+                        media_stream_subscribers[call_id] = {}
+                    if stream_type not in media_stream_subscribers[call_id]:
+                        media_stream_subscribers[call_id][stream_type] = set()
+                    media_stream_subscribers[call_id][stream_type].add(websocket)
+                
+                # 获取媒体转发器并添加监听回调
+                try:
+                    from sipcore.media_relay import get_media_relay
+                    media_relay = get_media_relay()
+                    if media_relay:
+                        # 根据stream_type找到对应的转发器
+                        forwarder_key = None
+                        if stream_type == 'audio-a':
+                            forwarder_key = (call_id, 'a', 'rtp')
+                        elif stream_type == 'audio-b':
+                            forwarder_key = (call_id, 'b', 'rtp')
+                        elif stream_type == 'video-a':
+                            forwarder_key = (call_id, 'a', 'video-rtp')
+                        elif stream_type == 'video-b':
+                            forwarder_key = (call_id, 'b', 'video-rtp')
+                        
+                        if forwarder_key:
+                            forwarder = media_relay._forwarders.get(forwarder_key)
+                            print(f"[MML-DEBUG] 查找转发器: forwarder_key={forwarder_key}, 找到={forwarder is not None}", file=sys.stderr, flush=True)
+                            if not forwarder:
+                                # 列出所有转发器用于调试
+                                all_forwarders = list(media_relay._forwarders.keys()) if hasattr(media_relay, '_forwarders') else []
+                                matching_forwarders = [f for f in all_forwarders if f[0] == call_id]
+                                print(f"[MML-DEBUG] 该call_id的所有转发器: {matching_forwarders}", file=sys.stderr, flush=True)
+                                print(f"[MML-DEBUG] 所有转发器数量: {len(all_forwarders)}", file=sys.stderr, flush=True)
+                            if forwarder:
+                                # 获取会话的SDP信息以确定编解码
+                                session = media_relay._sessions.get(call_id) if hasattr(media_relay, '_sessions') else None
+                                codec_map = {}  # payload_type -> codec_name
+                                if session:
+                                    # 根据stream_type选择对应的SDP
+                                    sdp_body = None
+                                    if stream_type in ('audio-a', 'video-a') and session.a_leg_sdp:
+                                        sdp_body = session.a_leg_sdp
+                                    elif stream_type in ('audio-b', 'video-b') and session.b_leg_sdp:
+                                        sdp_body = session.b_leg_sdp
+                                    
+                                    if sdp_body:
+                                        from sipcore.media_relay import SDPProcessor
+                                        media_info = SDPProcessor.extract_media_info(sdp_body)
+                                        if media_info and 'codec_info' in media_info:
+                                            codec_map = media_info['codec_info']
+                                
+                                # 同步回调函数（在转发器线程中执行）
+                                # 从独立媒体流通道读取（后台自动复制，前台只读取，互不干扰，切换流畅）
+                                stream_channel = media_relay.get_media_stream_channel(call_id, stream_type)
+                                if not stream_channel:
+                                    error_msg = f"媒体流通道不存在: {call_id}/{stream_type}"
+                                    print(f"[MML-ERROR] {error_msg}", file=sys.stderr, flush=True)
+                                    await websocket.send(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+                                    return
+                                
+                                print(f"[MML-DEBUG] 从独立媒体流通道读取: call_id={call_id}, stream_type={stream_type}", file=sys.stderr, flush=True)
+                                
+                                # 辅助函数：构建统计信息
+                                static_payloads = {
+                                    0: 'PCMU', 1: '1016', 2: 'G721', 3: 'GSM', 4: 'G723', 5: 'DVI4', 6: 'DVI4',
+                                    7: 'LPC', 8: 'PCMA', 9: 'G722', 10: 'L16', 11: 'L16', 12: 'QCELP', 13: 'CN',
+                                    14: 'MPA', 15: 'G728', 16: 'DVI4', 17: 'DVI4', 18: 'G729', 96: 'H264'
+                                }
+                                def build_stats_from_rtp(rtp_data, source_addr, local_port, timestamp):
+                                    payload_type = (rtp_data[1] & 0x7F) if len(rtp_data) >= 12 else None
+                                    rtp_payload = rtp_data[12:] if len(rtp_data) >= 12 else None
+                                    payload_type_str = str(payload_type) if payload_type is not None else ''
+                                    if payload_type_str in codec_map:
+                                        codec_name = (codec_map[payload_type_str].split('/')[0]
+                                            if '/' in codec_map[payload_type_str] else codec_map[payload_type_str])
+                                    else:
+                                        codec_name = static_payloads.get(payload_type, 'UNKNOWN') if payload_type is not None else 'UNKNOWN'
+                                    s = {
+                                        "type": "rtp_packet", "call_id": call_id, "stream_type": stream_type,
+                                        "packet_size": len(rtp_data), "payload_size": len(rtp_payload) if rtp_payload else 0,
+                                        "payload_type": payload_type, "codec": codec_name,
+                                        "source_addr": f"{source_addr[0]}:{source_addr[1]}",
+                                        "local_port": local_port, "timestamp": timestamp,
+                                        "packets_received": forwarder.packets_received,
+                                        "packets_sent": forwarder.packets_sent,
+                                        "packets_dropped_send": getattr(forwarder, 'packets_dropped_send', 0),
+                                        "total_bytes": forwarder.total_bytes, "rtp_payload_b64": None,
+                                    }
+                                    if rtp_payload and len(rtp_payload) <= 2000:
+                                        import base64
+                                        s["rtp_payload_b64"] = base64.b64encode(rtp_payload).decode('utf-8')
+                                    return s
+                                
+                                # 历史包：视频也发 rtp_packet，由前端 MSE 从 SPS/PPS+关键帧起解码出图
+                                history_limit = 2000 if stream_type.startswith('video') else 0
+                                buffered = media_relay.get_channel_buffered_packets(call_id, stream_type, limit=history_limit)
+                                if buffered:
+                                    batch_size = 40
+                                    for i in range(0, len(buffered), batch_size):
+                                        chunk = buffered[i:i + batch_size]
+                                        for rtp_data, source_addr, local_port, ts in chunk:
+                                            try:
+                                                st = build_stats_from_rtp(rtp_data, source_addr, local_port, ts)
+                                                await websocket.send(json.dumps(st, ensure_ascii=False))
+                                            except Exception:
+                                                break
+                                        if i + batch_size < len(buffered):
+                                            await asyncio.sleep(0.02)
+                                    print(f"[MML-DEBUG] 已发送历史包 {len(buffered)} 个: {call_id}/{stream_type}", file=sys.stderr, flush=True)
+                                
+                                # 发送欢迎消息
+                                try:
+                                    connected_msg = json.dumps({"type": "connected", "message": f"媒体流监听已启动: {call_id}/{stream_type}"}, ensure_ascii=False)
+                                    await websocket.send(connected_msg)
+                                    print(f"[MML-DEBUG] 已发送欢迎消息: call_id={call_id}, stream_type={stream_type}", file=sys.stderr, flush=True)
+                                except websockets.exceptions.ConnectionClosed as e:
+                                    print(f"[MML-DEBUG] WebSocket连接在发送欢迎消息前已关闭: call_id={call_id}, stream_type={stream_type}, code={e.code}, reason={e.reason}", file=sys.stderr, flush=True)
+                                    return
+                                except Exception as e:
+                                    print(f"[MML-ERROR] 发送欢迎消息失败: call_id={call_id}, stream_type={stream_type}, error={e}", file=sys.stderr, flush=True)
+                                    import traceback
+                                    traceback.print_exc(file=sys.stderr)
+                                    return
+                                
+                                # 持续从通道读取实时包（用 run_in_executor 避免阻塞事件循环，否则四路只有一路能跑）
+                                loop = asyncio.get_event_loop()
+                                def get_one():
+                                    return stream_channel.get(timeout=1.0)
+                                try:
+                                    while True:
+                                        try:
+                                            rtp_data, source_addr, local_port, ts = await loop.run_in_executor(None, get_one)
+                                            st = build_stats_from_rtp(rtp_data, source_addr, local_port, ts)
+                                            await websocket.send(json.dumps(st, ensure_ascii=False))
+                                        except queue.Empty:
+                                            await websocket.send(json.dumps({"type": "heartbeat", "timestamp": time.time()}, ensure_ascii=False))
+                                except websockets.exceptions.ConnectionClosed:
+                                    print(f"[MML-DEBUG] WebSocket连接已关闭（正常）: call_id={call_id}, stream_type={stream_type}", file=sys.stderr, flush=True)
+                                    pass
+                            else:
+                                # 转发器不存在，列出所有可用的转发器用于调试
+                                available_forwarders = list(media_relay._forwarders.keys())[:20] if hasattr(media_relay, '_forwarders') else []
+                                available_sessions = list(media_relay._sessions.keys())[:10] if hasattr(media_relay, '_sessions') else []
+                                error_msg = f"转发器不存在: {forwarder_key}\n可用转发器: {available_forwarders}\n可用会话: {available_sessions}"
+                                print(f"[MML-ERROR] {error_msg}", file=sys.stderr, flush=True)
+                                try:
+                                    await websocket.send(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+                                    # 等待一下让消息发送完成，然后保持连接让前端显示错误
+                                    await asyncio.sleep(0.5)
+                                except Exception as send_error:
+                                    print(f"[MML-ERROR] 发送错误消息失败: {send_error}", file=sys.stderr, flush=True)
+                                # 不立即关闭连接，让前端显示错误消息后再关闭
+                                return
+                        else:
+                            error_msg = f"无效的stream_type: {stream_type}，支持的类型: audio-a, audio-b, video-a, video-b"
+                            print(f"[MML-ERROR] {error_msg}", file=sys.stderr, flush=True)
+                            try:
+                                await websocket.send(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+                                await asyncio.sleep(0.5)
+                            except Exception as send_error:
+                                print(f"[MML-ERROR] 发送错误消息失败: {send_error}", file=sys.stderr, flush=True)
+                            return
+                    else:
+                        error_msg = "媒体转发器未初始化"
+                        print(f"[MML-ERROR] {error_msg}", file=sys.stderr, flush=True)
+                        try:
+                            await websocket.send(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+                            await asyncio.sleep(0.5)
+                        except Exception as send_error:
+                            print(f"[MML-ERROR] 发送错误消息失败: {send_error}", file=sys.stderr, flush=True)
+                        return
+                except Exception as e:
+                    import traceback
+                    error_msg = f"处理媒体流监听请求时发生异常: {str(e)}"
+                    print(f"[MML-ERROR] {error_msg}", file=sys.stderr, flush=True)
+                    traceback.print_exc(file=sys.stderr)
+                    try:
+                        await websocket.send(json.dumps({"type": "error", "message": error_msg}, ensure_ascii=False))
+                        await asyncio.sleep(0.5)
+                    except Exception as send_error:
+                        print(f"[MML-ERROR] 发送错误消息失败: {send_error}", file=sys.stderr, flush=True)
+                    return
+                
+                print(f"[MML-DEBUG] 媒体流监听连接已关闭: call_id={call_id}, stream_type={stream_type}", file=sys.stderr, flush=True)
+            except Exception as e:
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                print(f"[MML-ERROR] 媒体流监听处理异常: {e}", file=sys.stderr, flush=True)
+            finally:
+                # 清理订阅者和回调
+                call_id_local = call_id if 'call_id' in locals() else None
+                stream_type_local = stream_type if 'stream_type' in locals() else None
+                
+                if call_id_local and stream_type_local:
+                    with media_stream_lock:
+                        if call_id_local in media_stream_subscribers:
+                            if stream_type_local in media_stream_subscribers[call_id_local]:
+                                media_stream_subscribers[call_id_local][stream_type_local].discard(websocket)
+                                if not media_stream_subscribers[call_id_local][stream_type_local]:
+                                    del media_stream_subscribers[call_id_local][stream_type_local]
+                            if not media_stream_subscribers[call_id_local]:
+                                del media_stream_subscribers[call_id_local]
+                    
+                    # 注意：不再需要移除回调，因为现在使用独立媒体流通道，前台只读取通道，不注册监听器
         else:
             # 未知路径，关闭连接
             await websocket.close()
@@ -3210,10 +3491,14 @@ if WEBSOCKET_AVAILABLE:
     
     def start_websocket_server(port=8889):
         """启动 WebSocket 服务器"""
-        async def handler(websocket):
-            """WebSocket处理器（websockets 16.0+ API）"""
+        async def handler(websocket, path=None):
+            """WebSocket处理器（兼容不同版本的websockets库）
+            
+            websockets 12.0: handler(websocket, path)
+            websockets 16.0+: handler(websocket) 且 path = websocket.request.path
+            """
             try:
-                await log_push_handler(websocket)
+                await log_push_handler(websocket, path)
             except Exception as e:
                 print(f"[MML-ERROR] WebSocket handler异常: {e}", file=sys.stderr, flush=True)
                 import traceback
@@ -3224,6 +3509,10 @@ if WEBSOCKET_AVAILABLE:
                     pass
         
         async def main():
+            # websockets.serve 在不同版本中handler签名不同
+            # 旧版本(12.0): handler(websocket, path) - path作为参数
+            # 新版本(16.0+): handler(websocket) - path通过websocket.request.path获取
+            # 使用兼容的方式：handler总是接收path参数，如果为None则从websocket.request获取
             async with websockets.serve(handler, "0.0.0.0", port):
                 print(f"[MML] WebSocket 服务已启动: ws://0.0.0.0:{port}")
                 print(f"[MML]   - 日志推送: ws://0.0.0.0:{port}/ws/logs")

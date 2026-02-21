@@ -7,6 +7,7 @@ import socket
 import os
 import subprocess
 import shutil
+from typing import Optional
 
 from sipcore.transport_udp import UDPServer
 from sipcore.transport_tcp import TCPServer
@@ -59,16 +60,22 @@ def get_server_ip():
     """获取服务器IP地址，优先级：环境变量 > 配置文件 SERVER_ADDR > 自动检测 > 默认值"""
     # 1. 优先从环境变量读取
     server_ip = os.getenv("SERVER_IP")
-    if server_ip:
+    if server_ip and server_ip.upper() != "AUTO_DETECT":
         log.info(f"[CONFIG] SERVER_IP from environment: {server_ip}")
         return server_ip
+    elif server_ip and server_ip.upper() == "AUTO_DETECT":
+        log.info(f"[CONFIG] SERVER_IP 设置为 AUTO_DETECT，将自动检测")
+        server_ip = None  # 继续后续的自动检测流程
     
     # 2. 从配置文件读取 SERVER_ADDR（用于显示和对外宣告）
     server_addr = None
     try:
         server_addr = config_mgr.get("SERVER_ADDR")
-        if server_addr:
+        if server_addr and server_addr.upper() != "AUTO_DETECT":
             log.info(f"[CONFIG] SERVER_ADDR from config: {server_addr}（将用于消息跟踪显示）")
+        elif server_addr and server_addr.upper() == "AUTO_DETECT":
+            server_addr = None  # 标记为需要自动检测
+            log.info(f"[CONFIG] SERVER_ADDR 设置为 AUTO_DETECT，将自动检测")
     except Exception as e:
         log.debug(f"[CONFIG] Failed to read SERVER_ADDR from config: {e}")
     
@@ -109,7 +116,22 @@ SERVER_IP = get_server_ip()
 SERVER_PORT = 5060
 # 公网信令地址（Cloudflare 隧道启用时由隧道 host:port 覆盖，用于 Via/Contact/Record-Route）
 SERVER_PUBLIC_HOST = None  # 例如 xxx.trycloudflare.com
-SERVER_PUBLIC_PORT = None  # 隧道 TCP 端口
+# 公网端口（NAT映射后的端口，如果内网5060映射到公网其他端口，在此配置）
+SERVER_PUBLIC_PORT = os.getenv("SERVER_PUBLIC_PORT")
+if SERVER_PUBLIC_PORT:
+    try:
+        SERVER_PUBLIC_PORT = int(SERVER_PUBLIC_PORT)
+    except ValueError:
+        SERVER_PUBLIC_PORT = None
+else:
+    # 从配置文件读取
+    try:
+        public_port = config_mgr.get("SERVER_PUBLIC_PORT")
+        if public_port:
+            SERVER_PUBLIC_PORT = int(public_port)
+    except Exception:
+        SERVER_PUBLIC_PORT = None
+
 def advertised_sip_host():
     return SERVER_PUBLIC_HOST or SERVER_IP
 def advertised_sip_port():
@@ -234,7 +256,7 @@ RTPPROXY_TCP_PORT = int(os.getenv("RTPPROXY_TCP_PORT", "7722"))
 RTPPROXY_TCP = (RTPPROXY_TCP_HOST, RTPPROXY_TCP_PORT)
 
 
-def start_rtpproxy_if_needed(server_ip: str) -> subprocess.Popen | None:
+def start_rtpproxy_if_needed(server_ip: str):
     """
     若启用媒体中继且配置为自动启动，则启动 RTPProxy 子进程。
     若 127.0.0.1:7722 已被占用则视为已有 RTPProxy 在运行，不重复启动。
@@ -445,7 +467,7 @@ def _record_failed_attempt(ip: str):
 _load_ip_blacklist()
 
 # ====== 工具函数 ======
-def _aor_from_from(from_val: str | None) -> str:
+def _aor_from_from(from_val: Optional[str]) -> str:
     if not from_val:
         return ""
     s = from_val
@@ -467,7 +489,7 @@ def _same_user(uri1: str, uri2: str) -> bool:
         return m.group(1) if m else u
     return extract_user(uri1) == extract_user(uri2)
 
-def _extract_number_from_uri(uri: str | None) -> str:
+def _extract_number_from_uri(uri: Optional[str]) -> str:
     """从 SIP URI 中提取号码（用户部分）
     
     例如:
@@ -484,7 +506,7 @@ def _extract_number_from_uri(uri: str | None) -> str:
     # 如果没有 sip: 前缀，直接返回
     return uri.strip("<>")
 
-def _aor_from_to(to_val: str | None) -> str:
+def _aor_from_to(to_val: Optional[str]) -> str:
     if not to_val:
         return ""
     s = to_val
@@ -744,7 +766,7 @@ def _add_record_route_for_initial(msg: SIPMessage):
     # 在初始请求上插入 RR
     msg.add_header("record-route", f"<{_server_uri()}>")
 
-def _make_response(req: SIPMessage, code: int, reason: str, extra_headers: dict | None = None, body: bytes = b"") -> SIPMessage:
+def _make_response(req: SIPMessage, code: int, reason: str, extra_headers: Optional[dict] = None, body: bytes = b"") -> SIPMessage:
     r = SIPMessage(start_line=f"SIP/2.0 {code} {reason}")
     for v in req.headers.get("via", []):
         r.add_header("via", v)
@@ -2196,6 +2218,10 @@ def _forward_response(resp: SIPMessage, addr, transport):
                                 if 'content-length' in resp.headers:
                                     resp.headers['content-length'] = [str(len(resp.body) if isinstance(resp.body, bytes) else len(resp.body.encode('utf-8')))]
                                 log.info(f"[B2BUA] 200 OK SDP 已修改为服务器地址端口（发送前），Call-ID: {call_id}")
+                                # 检查是否是 re-INVITE（通过 To 头是否有 tag 判断）
+                                to_header = resp.get("to") or ""
+                                is_reinvite = "tag=" in to_header
+                                
                                 # 若会话有视频但尚无视频转发器（re-INVITE 加视频），也需调用以创建视频转发器
                                 has_video_forwarder = False
                                 if session and hasattr(media_relay, '_forwarders'):
@@ -2203,12 +2229,15 @@ def _forward_response(resp: SIPMessage, addr, transport):
                                         (call_id, 'a', 'video-rtp') in media_relay._forwarders and
                                         (call_id, 'b', 'video-rtp') in media_relay._forwarders
                                     )
+                                # re-INVITE 时，即使转发器已存在，也需要调用 start_media_forwarding 来更新目标地址
                                 need_start = (
                                     not already_started or
                                     not has_forwarder or
-                                    (session and session.b_leg_video_rtp_port and not has_video_forwarder)
+                                    (session and session.b_leg_video_rtp_port and not has_video_forwarder) or
+                                    (is_reinvite and already_started)  # re-INVITE 时总是更新转发器目标地址
                                 )
                                 # 转发器未启动、不存在、或需补建视频转发器时，启动/创建
+                                # re-INVITE 时也需要更新转发器目标地址
                                 if need_start:
                                     try:
                                         from_header = resp.get("from") or ""
@@ -2706,11 +2735,51 @@ async def main():
     await udp.start()
     # UDP server listening 日志已在 transport_udp.py 中输出，此处不再重复
 
-    # Cloudflare 隧道已禁用：避免 Record-Route/Route 使用隧道 host:443 导致 ACK/信令不到本机、跟踪不全。
-    # 若需公网访问请用端口映射或 VPN，勿用 ENABLE_CF_TUNNEL。
+    # TCP服务器配置（支持SIP over TCP注册）
+    # 可以通过环境变量 ENABLE_TCP=1 启用TCP服务器
+    ENABLE_TCP = os.getenv("ENABLE_TCP", "0").strip().lower() in ("1", "true", "yes")
+    ENABLE_CF_TUNNEL = os.getenv("ENABLE_CF_TUNNEL", "0").strip().lower() in ("1", "true", "yes")
+    
     tcp_server = None
     cf_tunnel_procs = []
-    server_globals["_TCP_SERVER"] = None
+    
+    # 启动TCP服务器（如果启用）
+    if ENABLE_TCP or ENABLE_CF_TUNNEL:
+        try:
+            tcp_server = TCPServer((UDP_BIND_IP, SERVER_PORT), on_datagram)
+            await tcp_server.start()
+            server_globals["_TCP_SERVER"] = tcp_server
+            log.info(f"[SIP/TCP] TCP服务器已启动，监听 {UDP_BIND_IP}:{SERVER_PORT}")
+        except Exception as e:
+            log.error(f"[SIP/TCP] TCP服务器启动失败: {e}")
+            tcp_server = None
+            server_globals["_TCP_SERVER"] = None
+    else:
+        server_globals["_TCP_SERVER"] = None
+        log.info("[SIP/TCP] TCP服务器已禁用（设置 ENABLE_TCP=1 启用）")
+    
+    # Cloudflare隧道（如果启用）
+    if ENABLE_CF_TUNNEL:
+        try:
+            from sipcore.cloudflare_tunnel import start_sip_tunnel
+            log.info("[CF-TUNNEL] 正在启动Cloudflare隧道...")
+            sip_host, sip_port_pub, http_host, http_port_pub, procs = await start_sip_tunnel(
+                sip_port=SERVER_PORT,
+                http_port=8888,
+                timeout=15.0,
+                auto_cleanup=True
+            )
+            cf_tunnel_procs.extend(procs)
+            if sip_host:
+                SERVER_PUBLIC_HOST = sip_host
+                SERVER_PUBLIC_PORT = sip_port_pub or 443
+                log.info(f"[CF-TUNNEL] SIP隧道已启动: {SERVER_PUBLIC_HOST}:{SERVER_PUBLIC_PORT}")
+            if http_host:
+                log.info(f"[CF-TUNNEL] HTTP隧道已启动: https://{http_host}")
+        except Exception as e:
+            log.error(f"[CF-TUNNEL] Cloudflare隧道启动失败: {e}")
+            log.info("[CF-TUNNEL] 提示: 请确保已安装cloudflared: brew install cloudflared")
+    
     server_globals["_CF_TUNNEL_PROCS"] = cf_tunnel_procs
 
     # 创建并启动定时器

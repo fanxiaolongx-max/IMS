@@ -12,13 +12,20 @@
 
 import random
 import socket
+import select
 import threading
 import re
 import time
 import asyncio
 import sys
-from typing import Dict, Optional, Tuple, List
+import queue
+from collections import deque
+from typing import Dict, Optional, Tuple, List, Callable, Any
 from dataclasses import dataclass, field
+
+# 后台媒体缓冲容量（测试/演示用，尽量大以保障流畅）
+BACKGROUND_AUDIO_BUFFER_PACKETS = 15000   # 主被叫音频各自独立缓冲
+BACKGROUND_VIDEO_BUFFER_PACKETS = 8000    # 主被叫视频各自独立缓冲
 
 
 @dataclass
@@ -414,7 +421,7 @@ class DualPortMediaForwarder:
     - A-leg 转发器：监听 A-leg 端口，接收主叫的 RTP，转发给被叫
     - B-leg 转发器：监听 B-leg 端口，接收被叫的 RTP，转发给主叫
     """
-    _RECV_BUF = 4096  # 视频 RTP 可能超过 2KB
+    _RECV_BUF = 8192  # 视频 RTP 包可能较大，使用8KB缓冲区
 
     SILENCE_RTP = (
         b'\x80\x00'
@@ -427,11 +434,15 @@ class DualPortMediaForwarder:
     def __init__(self, local_port: int,
                  target_addr: Tuple[str, int],
                  expected_ip: Optional[str] = None,
-                 call_name: str = ""):
+                 call_name: str = "",
+                 stream_channel: Optional[queue.Queue] = None,
+                 history_buffer: Optional[deque] = None):
         self.local_port = local_port
         self.target_addr = target_addr
         self.expected_ip = expected_ip
         self.call_name = call_name or f"port-{local_port}"
+        self.stream_channel = stream_channel  # 独立媒体流通道：后台自动复制包到此，前台只读取通道
+        self.history_buffer = history_buffer  # 历史缓冲：用于前台订阅时先发首帧/历史
         
         self.sock: Optional[socket.socket] = None
         self.running = False
@@ -440,10 +451,18 @@ class DualPortMediaForwarder:
         self.packets_sent = 0
         self.packets_received = 0  # 接收到的包数（从客户端到服务器）
         self.total_bytes = 0
+        self.packets_dropped_send = 0  # 因发送缓冲区满等原因未能发出的包数（卡顿相关）
         
         self._last_log_time = 0
         self._last_packets = 0
         self._last_received = 0
+        self._last_stutter_log_time = 0  # 上次输出卡顿统计的时间
+        self._last_recv_time = 0.0  # 上次收到包的时间（用于检测收包间隔）
+        self._consecutive_drops = 0   # 连续丢包次数
+        
+        # RTP监听回调：call_id -> [callback1, callback2, ...]
+        self._rtp_listeners: Dict[str, List[Callable]] = {}
+        self._listener_lock = threading.Lock()
     
     def start(self):
         if self.running:
@@ -451,13 +470,24 @@ class DualPortMediaForwarder:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            buf_size = 512 * 1024  # 512KB，减少视频突发丢包
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buf_size)
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buf_size)
+            # 视频转发需要更大的缓冲区：2MB接收，4MB发送（视频包更大且突发）
+            # 这样可以缓冲更多包，减少丢包和卡顿
+            rcv_buf_size = 2 * 1024 * 1024  # 2MB 接收缓冲区
+            snd_buf_size = 4 * 1024 * 1024  # 4MB 发送缓冲区
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcv_buf_size)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, snd_buf_size)
         except OSError:
-            pass
+            # 如果系统不支持这么大的缓冲区，使用默认值
+            try:
+                # 尝试设置较小的值
+                buf_size = 1024 * 1024  # 1MB
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, buf_size)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buf_size)
+            except OSError:
+                pass
         self.sock.bind(('0.0.0.0', self.local_port))
-        self.sock.settimeout(1.0)
+        # 使用非阻塞模式，减少延迟（视频需要低延迟）
+        self.sock.setblocking(False)
         self.running = True
         self.thread = threading.Thread(target=self._forward_loop, daemon=True)
         self.thread.start()
@@ -502,8 +532,10 @@ class DualPortMediaForwarder:
         if reset_stats:
             self.packets_sent = 0
             self.packets_received = 0
+            self.packets_dropped_send = 0
             self._last_packets = 0
             self._last_received = 0
+            self._consecutive_drops = 0
             print(f"[RTP-UPDATE] {self.call_name}(:{self.local_port}): "
                   f"更新目标并重置统计: {target_addr}",
                   file=sys.stderr, flush=True)
@@ -513,11 +545,11 @@ class DualPortMediaForwarder:
                   file=sys.stderr, flush=True)
     
     def _log_stats(self):
-        # 降低热路径开销：仅每 100 包检查一次时间，且统计日志间隔改为 15 秒，减少打印造成的卡顿
-        if self.packets_sent > 0 and self.packets_sent % 100 != 0:
+        # 降低热路径开销：仅每 500 包检查一次时间（视频包频率高），统计日志间隔改为 30 秒，减少打印造成的卡顿
+        if self.packets_sent > 0 and self.packets_sent % 500 != 0:
             return
         now = time.time()
-        if now - self._last_log_time >= 15:
+        if now - self._last_log_time >= 30:
             packets_diff = self.packets_sent - self._last_packets
             if self.packets_sent > 0 or packets_diff > 0:
                 print(f"[RTP-STATS] {self.call_name}(:{self.local_port}): "
@@ -527,39 +559,163 @@ class DualPortMediaForwarder:
             self._last_log_time = now
             self._last_packets = self.packets_sent
     
+    def _log_stutter_debug(self, now: float):
+        """卡顿调试：每 5 秒输出一次转发与丢包统计（仅当有丢包或为视频转发器时输出详情）"""
+        if now - self._last_stutter_log_time < 5.0:
+            return
+        self._last_stutter_log_time = now
+        is_video = "VIDEO" in (self.call_name or "")
+        total_recv = self.packets_received + self.packets_dropped_send  # 近似：已发+未发
+        # 更准确：接收数就是 packets_received
+        recv = self.packets_received
+        sent = self.packets_sent
+        dropped = self.packets_dropped_send
+        drop_rate = (100.0 * dropped / recv) if recv else 0
+        if dropped > 0 :
+            print(f"[RTP-STUTTER-DEBUG] {self.call_name}(:{self.local_port}): "
+                  f"收={recv} 发={sent} 丢={dropped} 丢包率={drop_rate:.2f}% "
+                  f"目标={self.target_addr}",
+                  file=sys.stderr, flush=True)
+    
     def _forward_loop(self):
         print(f"[RTP-DUAL] {self.call_name} 双端口转发器启动: 端口{self.local_port}",
               file=sys.stderr, flush=True)
-        print(f"  目标地址: {self.target_addr} (期望IP: {self.expected_ip})",
-              file=sys.stderr, flush=True)
+        print(f"  监听端口: {self.local_port} (接收数据从此端口)", file=sys.stderr, flush=True)
+        print(f"  转发目标: {self.target_addr} (转发数据到此地址)", file=sys.stderr, flush=True)
+        print(f"  期望IP: {self.expected_ip}", file=sys.stderr, flush=True)
         
-        # 视频 RTP 可能超过 2KB，使用更大缓冲区减少分片/丢包
+        # 视频 RTP 转发优化：使用非阻塞socket + select，减少延迟
+        # 非阻塞模式下，如果没有数据立即返回，避免阻塞等待
         while self.running and self.sock:
             try:
-                data, addr = self.sock.recvfrom(self._RECV_BUF)
+                # 使用select检查是否有数据可读（非阻塞模式）
+                ready, _, _ = select.select([self.sock], [], [], 0.01)  # 10ms超时
+                if not ready:
+                    # 没有数据时，减少CPU占用，但保持低延迟
+                    self._log_stats()
+                    now_idle = time.time()
+                    self._log_stutter_debug(now_idle)
+                    time.sleep(0.001)  # 1ms短暂休眠，避免CPU空转
+                    continue
+                
+                # 有数据可读，立即接收并转发
+                try:
+                    data, addr = self.sock.recvfrom(self._RECV_BUF)
+                except BlockingIOError:
+                    # 非阻塞模式下，如果没有数据会抛出此异常，继续循环
+                    continue
+                
                 if len(data) < 12:
                     continue
+                
+                now_recv = time.time()
+                # 卡顿调试 + 自适应：收包间隔过大时记录，并做短暂让步使转发更平滑
+                gap_ms = 0.0
+                if self._last_recv_time > 0:
+                    gap_ms = (now_recv - self._last_recv_time) * 1000
+                    if gap_ms > 100:
+                        # print(f"[RTP-STUTTER-DEBUG] {self.call_name}(:{self.local_port}): "
+                        #       f"收包间隔较大 {gap_ms:.0f}ms (可能上游卡顿或网络抖动)",
+                        #       file=sys.stderr, flush=True)
+                        # 自适应：间隔大说明上游在突发，稍作让步减轻下游冲刷
+                        if gap_ms > 200:
+                            time.sleep(0.005)
+                self._last_recv_time = now_recv
                 
                 self.packets_received += 1
                 self.total_bytes += len(data)
                 
+                # 复制到独立媒体流通道（后台自动复制，前台只读取通道，互不干扰）
+                if self.stream_channel:
+                    try:
+                        packet_tuple = (bytes(data), addr, self.local_port, now_recv)
+                        self.stream_channel.put_nowait(packet_tuple)
+                        # 同时写入历史缓冲（用于前台订阅时先发首帧/历史）
+                        if self.history_buffer is not None:
+                            self.history_buffer.append(packet_tuple)
+                    except queue.Full:
+                        # 通道满，丢弃最老的包（保持最新）
+                        try:
+                            self.stream_channel.get_nowait()
+                            packet_tuple = (bytes(data), addr, self.local_port, now_recv)
+                            self.stream_channel.put_nowait(packet_tuple)
+                            if self.history_buffer is not None:
+                                self.history_buffer.append(packet_tuple)
+                        except queue.Empty:
+                            pass
+                
+                # 通知RTP监听器（如果有，兼容旧代码）
+                with self._listener_lock:
+                    listeners = list(self._rtp_listeners.values())
+                for listener_list in listeners:
+                    for callback in listener_list:
+                        try:
+                            callback(data, addr, self.local_port, time.time())
+                        except Exception as e:
+                            print(f"[RTP-LISTENER-ERROR] {self.call_name}: 监听器回调失败: {e}",
+                                  file=sys.stderr, flush=True)
+                
+                # 立即转发，减少延迟
                 if self.target_addr:
                     try:
                         self.sock.sendto(data, self.target_addr)
                         self.packets_sent += 1
+                        self._consecutive_drops = 0
+                    except BlockingIOError:
+                        # 发送缓冲区满，记录但不阻塞（视频包会丢失，可能造成卡顿）
+                        self.packets_dropped_send += 1
+                        self._consecutive_drops += 1
+                        print(f"[RTP-STUTTER] {self.call_name}(:{self.local_port}): "
+                              f"发送缓冲区满，丢包 (连续第{self._consecutive_drops}次，累计{self.packets_dropped_send}次)",
+                              file=sys.stderr, flush=True)
                     except Exception as e:
+                        self.packets_dropped_send += 1
+                        self._consecutive_drops += 1
                         print(f"[RTP-ERROR] {self.call_name}: →{self.target_addr}: {e}",
                               file=sys.stderr, flush=True)
                 
-                self._log_stats()
+                # 每500包才检查一次统计（减少开销）
+                if self.packets_sent % 500 == 0:
+                    self._log_stats()
+                # 卡顿调试：每 1000 包检查一次是否输出卡顿统计
+                if self.packets_received % 1000 == 0 and self.packets_received > 0:
+                    self._log_stutter_debug(now_recv)
                 
-            except socket.timeout:
-                self._log_stats()
-                continue
             except Exception as e:
                 if self.running:
+                    # 忽略常见的非阻塞socket异常
+                    if isinstance(e, (BlockingIOError, OSError)):
+                        continue
                     print(f"[RTP-ERROR] {self.call_name}(:{self.local_port}): {e}",
                           file=sys.stderr, flush=True)
+    
+    def add_rtp_listener(self, call_id: str, callback: Callable[[bytes, Tuple[str, int], int, float], None]):
+        """添加RTP包监听器
+        
+        Args:
+            call_id: 呼叫ID
+            callback: 回调函数 callback(rtp_data, source_addr, local_port, timestamp)
+        """
+        with self._listener_lock:
+            if call_id not in self._rtp_listeners:
+                self._rtp_listeners[call_id] = []
+            self._rtp_listeners[call_id].append(callback)
+    
+    def remove_rtp_listener(self, call_id: str, callback: Optional[Callable] = None):
+        """移除RTP包监听器
+        
+        Args:
+            call_id: 呼叫ID
+            callback: 要移除的回调函数，如果为None则移除该call_id的所有监听器
+        """
+        with self._listener_lock:
+            if call_id in self._rtp_listeners:
+                if callback is None:
+                    del self._rtp_listeners[call_id]
+                elif callback in self._rtp_listeners[call_id]:
+                    self._rtp_listeners[call_id].remove(callback)
+                    if not self._rtp_listeners[call_id]:
+                        del self._rtp_listeners[call_id]
 
 
 class SinglePortMediaForwarder:
@@ -979,6 +1135,13 @@ class MediaRelay:
         # 转发器管理: (call_id, leg, direction) -> RTPForwarder
         self._forwarders: Dict[Tuple[str, str, str], RTPForwarder] = {}
         
+        # 独立媒体流通道（后台复制，前台读取，互不干扰）: (call_id, stream_type) -> queue.Queue
+        # 每个转发器自动复制包到此通道，前台订阅时只读取通道，切换流畅
+        self._media_stream_channels: Dict[Tuple[str, str], queue.Queue] = {}
+        # 历史缓冲（用于前台订阅时先发首帧/历史）: (call_id, stream_type) -> deque
+        self._channel_history_buffers: Dict[Tuple[str, str], deque] = {}
+        self._channel_lock = threading.Lock()
+        
         print(f"[MediaRelay] 初始化完成，服务器IP: {server_ip}")
     
     def create_session(self, call_id: str) -> Optional[MediaSession]:
@@ -1021,6 +1184,79 @@ class MediaRelay:
         print(f"  B-leg: RTP={b_ports[0]}, RTCP={b_ports[1]}")
         
         return session
+    
+    def _ensure_media_stream_channels(self, call_id: str):
+        """为已存在的音频/视频转发器创建独立媒体流通道（主被叫、音视频独立）。
+        转发器自动复制包到通道，前台订阅时只读取通道，互不干扰，切换流畅。"""
+        with self._channel_lock:
+            for stream_type, forwarder_key in [
+                ('audio-a', (call_id, 'a', 'rtp')),
+                ('audio-b', (call_id, 'b', 'rtp')),
+                ('video-a', (call_id, 'a', 'video-rtp')),
+                ('video-b', (call_id, 'b', 'video-rtp')),
+            ]:
+                key = (call_id, stream_type)
+                if key in self._media_stream_channels:
+                    continue
+                forwarder = self._forwarders.get(forwarder_key)
+                if not forwarder:
+                    continue
+                # 创建独立通道（大容量队列，测试用）
+                maxsize = BACKGROUND_VIDEO_BUFFER_PACKETS if stream_type.startswith('video') else BACKGROUND_AUDIO_BUFFER_PACKETS
+                ch = queue.Queue(maxsize=maxsize)
+                self._media_stream_channels[key] = ch
+                # 创建历史缓冲（用于前台订阅时先发首帧/历史）
+                maxlen = BACKGROUND_VIDEO_BUFFER_PACKETS if stream_type.startswith('video') else BACKGROUND_AUDIO_BUFFER_PACKETS
+                hist_buf = deque(maxlen=maxlen)
+                self._channel_history_buffers[key] = hist_buf
+                # 更新转发器的通道和历史缓冲引用（如果转发器已创建，需要更新）
+                forwarder.stream_channel = ch
+                forwarder.history_buffer = hist_buf
+                print(f"[MediaRelay] 独立媒体流通道已创建: {call_id} {stream_type} maxsize={maxsize}, history_maxlen={maxlen}", file=sys.stderr, flush=True)
+    
+    def get_media_stream_channel(self, call_id: str, stream_type: str) -> Optional[queue.Queue]:
+        """获取独立媒体流通道，供前台订阅时读取（先读历史，再持续读实时）。"""
+        key = (call_id, stream_type)
+        with self._channel_lock:
+            return self._media_stream_channels.get(key)
+    
+    def get_channel_buffered_packets(self, call_id: str, stream_type: str, limit: int = 2000) -> List[Tuple[bytes, Tuple[str, int], int, float]]:
+        """从历史缓冲读取最近 limit 个包（用于前台订阅时先发首帧/历史）。"""
+        key = (call_id, stream_type)
+        with self._channel_lock:
+            hist_buf = self._channel_history_buffers.get(key)
+            if not hist_buf:
+                return []
+            arr = list(hist_buf)
+        if not arr:
+            return []
+        # 取最后 limit 个，保持时间顺序（旧→新）
+        start = max(0, len(arr) - limit)
+        return arr[start:]
+    
+    def _clear_media_stream_channels(self, call_id: str):
+        """会话结束时清理该 call_id 的独立媒体流通道。"""
+        with self._channel_lock:
+            for stream_type in ('audio-a', 'audio-b', 'video-a', 'video-b'):
+                key = (call_id, stream_type)
+                ch = self._media_stream_channels.pop(key, None)
+                if ch:
+                    # 清空通道
+                    try:
+                        while True:
+                            ch.get_nowait()
+                    except queue.Empty:
+                        pass
+                # 清空历史缓冲
+                self._channel_history_buffers.pop(key, None)
+                # 清除转发器的通道和历史缓冲引用
+                leg = 'a' if stream_type.endswith('-a') else 'b'
+                kind = 'video-rtp' if stream_type.startswith('video') else 'rtp'
+                forwarder = self._forwarders.get((call_id, leg, kind))
+                if forwarder:
+                    forwarder.stream_channel = None
+                    forwarder.history_buffer = None
+        print(f"[MediaRelay] 独立媒体流通道已清理: {call_id}", file=sys.stderr, flush=True)
     
     def process_invite_sdp(self, call_id: str, sdp_body: str, 
                            caller_addr: Tuple[str, int]) -> Tuple[str, Optional[MediaSession]]:
@@ -1066,70 +1302,94 @@ class MediaRelay:
                                   forward_to_callee: bool = True) -> Tuple[str, Optional[MediaSession]]:
         """
         处理转发的 INVITE/re-INVITE SDP。
-        forward_to_callee=True 用 B-leg，False 用 A-leg（与 RTPProxy 实现一致）。
+        视频转发方向严格固定：主叫(A-leg)→转发器→被叫(B-leg)，被叫(B-leg)→转发器→主叫(A-leg)。
+        不随谁发起 INVITE 改变：
+        - forward_to_callee=True：本 INVITE 来自主叫（发往被叫），SDP 更新 A-leg，修改后 SDP 填 B-leg 端口给被叫收。
+        - forward_to_callee=False：本 INVITE 来自被叫（发往主叫），SDP 更新 B-leg，修改后 SDP 填 A-leg 端口给主叫收。
         """
-        # 获取或创建会话
         session = self._sessions.get(call_id)
         if not session:
             session = self.create_session(call_id)
             if not session:
                 return sdp_body, None
         
-        # 保存主被叫号码
         if caller_number:
             session.caller_number = caller_number
         if callee_number:
             session.callee_number = callee_number
         
-        # 保存A-leg信令地址（优先使用，NAT后的真实地址）
-        # 使用信令来源端口+1作为RTP端口估计（标准RTP端口是SDP端口+0）
-        session.a_leg_signaling_addr = caller_addr
-        print(f"[MediaRelay] A-leg信令地址: {caller_addr} (NAT后真实地址)")
-        
-        # 提取A-leg原始媒体信息（SDP中声明的地址）
+        # 发送方地址：forward_to_callee 时为主叫，否则为被叫
+        sender_addr = caller_addr
         media_info = self.sdp_processor.extract_media_info(sdp_body)
-        if media_info:
-            # 保存音频信息
-            audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
-            session.a_leg_remote_addr = (audio_ip, media_info['audio_port'])
-            session.a_leg_sdp = sdp_body
-            old_a_audio_direction = session.a_leg_audio_direction
-            session.a_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
-            print(f"[MediaRelay] A-leg音频信息: {session.a_leg_remote_addr}, 方向: {session.a_leg_audio_direction}")
-            if old_a_audio_direction != session.a_leg_audio_direction:
-                print(f"[MediaRelay] A-leg音频方向已改变: {old_a_audio_direction} → {session.a_leg_audio_direction}", file=sys.stderr, flush=True)
-            
-            # 检测并处理视频流
-            if media_info.get('video_port'):
-                # 动态分配视频端口（如果还没有分配）
-                if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
-                    a_video_ports = self.port_manager.allocate_port_pair(call_id)
-                    b_video_ports = self.port_manager.allocate_port_pair(call_id)
-                    
-                    if a_video_ports and b_video_ports:
-                        session.a_leg_video_rtp_port = a_video_ports[0]
-                        session.a_leg_video_rtcp_port = a_video_ports[1]
-                        session.b_leg_video_rtp_port = b_video_ports[0]
-                        session.b_leg_video_rtcp_port = b_video_ports[1]
-                        
-                        print(f"[MediaRelay] 检测到视频流，分配视频端口:")
-                        print(f"  A-leg视频: RTP={a_video_ports[0]}, RTCP={a_video_ports[1]}")
-                        print(f"  B-leg视频: RTP={b_video_ports[0]}, RTCP={b_video_ports[1]}")
-                    else:
-                        print(f"[MediaRelay-WARNING] 视频端口分配失败，将只处理音频: {call_id}")
-                
-                # 保存视频信息
-                video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
-                old_a_leg_video_addr = session.a_leg_video_remote_addr
-                session.a_leg_video_remote_addr = (video_ip, media_info['video_port'])
-                old_a_video_direction = session.a_leg_video_direction
-                session.a_leg_video_direction = media_info.get('video_direction', 'sendrecv')
-                print(f"[MediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}, 方向: {session.a_leg_video_direction}")
-                if old_a_leg_video_addr and old_a_leg_video_addr != session.a_leg_video_remote_addr:
-                    print(f"[MediaRelay] A-leg视频地址已更新: {old_a_leg_video_addr} → {session.a_leg_video_remote_addr}", file=sys.stderr, flush=True)
-                if old_a_video_direction != session.a_leg_video_direction:
-                    print(f"[MediaRelay] A-leg视频方向已改变: {old_a_video_direction} → {session.a_leg_video_direction}", file=sys.stderr, flush=True)
         
+        if forward_to_callee:
+            # INVITE 来自主叫 → 只更新 A-leg（主叫侧）
+            session.a_leg_signaling_addr = sender_addr
+            print(f"[MediaRelay] INVITE 来自主叫，更新 A-leg 信令地址: {sender_addr}", file=sys.stderr, flush=True)
+            if media_info:
+                audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
+                session.a_leg_remote_addr = (audio_ip, media_info['audio_port'])
+                session.a_leg_sdp = sdp_body
+                old_a_audio_direction = session.a_leg_audio_direction
+                session.a_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
+                print(f"[MediaRelay] A-leg音频信息: {session.a_leg_remote_addr}, 方向: {session.a_leg_audio_direction}")
+                if old_a_audio_direction != session.a_leg_audio_direction:
+                    print(f"[MediaRelay] A-leg音频方向已改变: {old_a_audio_direction} → {session.a_leg_audio_direction}", file=sys.stderr, flush=True)
+                if media_info.get('video_port'):
+                    if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
+                        a_video_ports = self.port_manager.allocate_port_pair(call_id)
+                        b_video_ports = self.port_manager.allocate_port_pair(call_id)
+                        if a_video_ports and b_video_ports:
+                            session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port = a_video_ports[0], a_video_ports[1]
+                            session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port = b_video_ports[0], b_video_ports[1]
+                            print(f"[MediaRelay] 分配视频端口: A-leg={a_video_ports}, B-leg={b_video_ports}", file=sys.stderr, flush=True)
+                        else:
+                            print(f"[MediaRelay-WARNING] 视频端口分配失败: {call_id}", file=sys.stderr, flush=True)
+                    video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                    old_a_leg_video_addr = session.a_leg_video_remote_addr
+                    session.a_leg_video_remote_addr = (video_ip, media_info['video_port'])
+                    old_a_video_direction = session.a_leg_video_direction
+                    session.a_leg_video_direction = media_info.get('video_direction', 'sendrecv')
+                    print(f"[MediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}, 方向: {session.a_leg_video_direction}", file=sys.stderr, flush=True)
+                    if old_a_leg_video_addr and old_a_leg_video_addr != session.a_leg_video_remote_addr:
+                        print(f"[MediaRelay] A-leg视频地址已更新: {old_a_leg_video_addr} → {session.a_leg_video_remote_addr}", file=sys.stderr, flush=True)
+                    if old_a_video_direction != session.a_leg_video_direction:
+                        print(f"[MediaRelay] A-leg视频方向已改变: {old_a_video_direction} → {session.a_leg_video_direction}", file=sys.stderr, flush=True)
+        else:
+            # INVITE 来自被叫（re-INVITE）→ 只更新 B-leg（被叫侧），不碰 A-leg
+            session.b_leg_signaling_addr = sender_addr
+            print(f"[MediaRelay] re-INVITE 来自被叫，更新 B-leg 信令地址: {sender_addr}", file=sys.stderr, flush=True)
+            if media_info:
+                audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
+                session.b_leg_remote_addr = (audio_ip, media_info['audio_port'])
+                session.b_leg_sdp = sdp_body
+                old_b_audio_direction = session.b_leg_audio_direction
+                session.b_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
+                print(f"[MediaRelay] B-leg音频信息: {session.b_leg_remote_addr}, 方向: {session.b_leg_audio_direction}", file=sys.stderr, flush=True)
+                if old_b_audio_direction != session.b_leg_audio_direction:
+                    print(f"[MediaRelay] B-leg音频方向已改变: {old_b_audio_direction} → {session.b_leg_audio_direction}", file=sys.stderr, flush=True)
+                if media_info.get('video_port'):
+                    if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
+                        a_video_ports = self.port_manager.allocate_port_pair(call_id)
+                        b_video_ports = self.port_manager.allocate_port_pair(call_id)
+                        if a_video_ports and b_video_ports:
+                            session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port = a_video_ports[0], a_video_ports[1]
+                            session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port = b_video_ports[0], b_video_ports[1]
+                            print(f"[MediaRelay] 分配视频端口: A-leg={a_video_ports}, B-leg={b_video_ports}", file=sys.stderr, flush=True)
+                        else:
+                            print(f"[MediaRelay-WARNING] 视频端口分配失败: {call_id}", file=sys.stderr, flush=True)
+                    video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                    old_b_leg_video_addr = session.b_leg_video_remote_addr
+                    session.b_leg_video_remote_addr = (video_ip, media_info['video_port'])
+                    old_b_video_direction = session.b_leg_video_direction
+                    session.b_leg_video_direction = media_info.get('video_direction', 'sendrecv')
+                    print(f"[MediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}, 方向: {session.b_leg_video_direction}", file=sys.stderr, flush=True)
+                    if old_b_leg_video_addr != session.b_leg_video_remote_addr:
+                        print(f"[MediaRelay] B-leg视频地址已更新: {old_b_leg_video_addr} → {session.b_leg_video_remote_addr}", file=sys.stderr, flush=True)
+                    if old_b_video_direction != session.b_leg_video_direction:
+                        print(f"[MediaRelay] B-leg视频方向已改变: {old_b_video_direction} → {session.b_leg_video_direction}", file=sys.stderr, flush=True)
+        
+        # 修改后 SDP：发给被叫用 B-leg 端口，发给主叫用 A-leg 端口（收端固定用对应 leg）
         audio_port = session.b_leg_rtp_port if forward_to_callee else session.a_leg_rtp_port
         video_port = session.b_leg_video_rtp_port if forward_to_callee else session.a_leg_video_rtp_port
         audio_rtcp = session.b_leg_rtcp_port if forward_to_callee else session.a_leg_rtcp_port
@@ -1143,61 +1403,92 @@ class MediaRelay:
             new_video_rtcp_port=video_rtcp,
         )
         leg = "B-leg" if forward_to_callee else "A-leg"
-        print(f"[MediaRelay] INVITE SDP 修改为{leg}端口: 音频={audio_port}", end='')
+        print(f"[MediaRelay] INVITE SDP 修改为{leg}端口: 音频={audio_port}", end='', file=sys.stderr, flush=True)
         if video_port:
-            print(f", 视频={video_port}")
+            print(f", 视频={video_port}", file=sys.stderr, flush=True)
         else:
-            print()
+            print(file=sys.stderr, flush=True)
         return new_sdp, session
 
     def process_answer_sdp(self, call_id: str, sdp_body: str,
                           callee_addr: Tuple[str, int],
                           response_to_caller: bool = True) -> Tuple[str, bool]:
         """
-        处理 200 OK 的 SDP。response_to_caller=True 用 A-leg，False 用 B-leg。
+        处理 200 OK 的 SDP。转发方向固定：主叫(A-leg)↔转发器↔被叫(B-leg)。
+        - response_to_caller=True：200 OK 发往主叫，SDP 来自被叫 → 只更新 B-leg，修改后 SDP 填 A-leg 端口（主叫收）。
+        - response_to_caller=False：200 OK 发往被叫，SDP 来自主叫 → 只更新 A-leg，修改后 SDP 填 B-leg 端口（被叫收）。
         """
         session = self._sessions.get(call_id)
         if not session:
             print(f"[MediaRelay] 会话不存在: {call_id}")
             return sdp_body, False
         
-        # 保存B-leg信令地址（优先使用，NAT后的真实地址）
-        session.b_leg_signaling_addr = callee_addr
-        print(f"[MediaRelay] B-leg信令地址: {callee_addr} (NAT后真实地址)")
-        
-        # 提取被叫媒体信息（SDP中声明的地址）
+        sender_addr = callee_addr  # 200 OK 发送方地址
         media_info = self.sdp_processor.extract_media_info(sdp_body)
-        if media_info:
-            # 保存音频信息
-            audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
-            session.b_leg_remote_addr = (audio_ip, media_info['audio_port'])
-            session.b_leg_sdp = sdp_body
-            old_b_audio_direction = session.b_leg_audio_direction
-            session.b_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
-            print(f"[MediaRelay] B-leg音频信息: {session.b_leg_remote_addr}, 方向: {session.b_leg_audio_direction}")
-            if old_b_audio_direction != session.b_leg_audio_direction:
-                print(f"[MediaRelay] B-leg音频方向已改变: {old_b_audio_direction} → {session.b_leg_audio_direction}", file=sys.stderr, flush=True)
-            
-            if media_info.get('video_port'):
-                video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
-                old_b_leg_video_addr = session.b_leg_video_remote_addr
-                session.b_leg_video_remote_addr = (video_ip, media_info['video_port'])
-                old_b_video_direction = session.b_leg_video_direction
-                session.b_leg_video_direction = media_info.get('video_direction', 'sendrecv')
-                print(f"[MediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}, 方向: {session.b_leg_video_direction}")
-                if old_b_leg_video_addr != session.b_leg_video_remote_addr:
-                    print(f"[MediaRelay] B-leg视频地址已更新: {old_b_leg_video_addr} → {session.b_leg_video_remote_addr}", file=sys.stderr, flush=True)
-                if old_b_video_direction != session.b_leg_video_direction:
-                    print(f"[MediaRelay] B-leg视频方向已改变: {old_b_video_direction} → {session.b_leg_video_direction}", file=sys.stderr, flush=True)
-                if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
-                    a_v = self.port_manager.allocate_port_pair(call_id)
-                    b_v = self.port_manager.allocate_port_pair(call_id)
-                    if a_v and b_v:
-                        session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port = a_v[0], a_v[1]
-                        session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port = b_v[0], b_v[1]
-                        print(f"[MediaRelay] 分配视频端口: A-leg={a_v}, B-leg={b_v}", file=sys.stderr, flush=True)
-        # 双端口模式：主叫使用 A-leg 端口，被叫使用 B-leg 端口
-        # 根据 response_to_caller 选择对应的端口
+        
+        if response_to_caller:
+            # 200 OK 发往主叫 → 发送方是被叫，只更新 B-leg
+            session.b_leg_signaling_addr = sender_addr
+            print(f"[MediaRelay] 200 OK 来自被叫，更新 B-leg 信令地址: {sender_addr}", file=sys.stderr, flush=True)
+            if media_info:
+                audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
+                session.b_leg_remote_addr = (audio_ip, media_info['audio_port'])
+                session.b_leg_sdp = sdp_body
+                old_b_audio_direction = session.b_leg_audio_direction
+                session.b_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
+                print(f"[MediaRelay] B-leg音频信息: {session.b_leg_remote_addr}, 方向: {session.b_leg_audio_direction}", file=sys.stderr, flush=True)
+                if old_b_audio_direction != session.b_leg_audio_direction:
+                    print(f"[MediaRelay] B-leg音频方向已改变: {old_b_audio_direction} → {session.b_leg_audio_direction}", file=sys.stderr, flush=True)
+                if media_info.get('video_port'):
+                    video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                    old_b_leg_video_addr = session.b_leg_video_remote_addr
+                    session.b_leg_video_remote_addr = (video_ip, media_info['video_port'])
+                    old_b_video_direction = session.b_leg_video_direction
+                    session.b_leg_video_direction = media_info.get('video_direction', 'sendrecv')
+                    print(f"[MediaRelay] B-leg视频信息: {session.b_leg_video_remote_addr}, 方向: {session.b_leg_video_direction}", file=sys.stderr, flush=True)
+                    if old_b_leg_video_addr != session.b_leg_video_remote_addr:
+                        print(f"[MediaRelay] B-leg视频地址已更新: {old_b_leg_video_addr} → {session.b_leg_video_remote_addr}", file=sys.stderr, flush=True)
+                    if old_b_video_direction != session.b_leg_video_direction:
+                        print(f"[MediaRelay] B-leg视频方向已改变: {old_b_video_direction} → {session.b_leg_video_direction}", file=sys.stderr, flush=True)
+                    if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
+                        a_v = self.port_manager.allocate_port_pair(call_id)
+                        b_v = self.port_manager.allocate_port_pair(call_id)
+                        if a_v and b_v:
+                            session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port = a_v[0], a_v[1]
+                            session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port = b_v[0], b_v[1]
+                            print(f"[MediaRelay] 分配视频端口: A-leg={a_v}, B-leg={b_v}", file=sys.stderr, flush=True)
+        else:
+            # 200 OK 发往被叫 → 发送方是主叫，只更新 A-leg
+            session.a_leg_signaling_addr = sender_addr
+            print(f"[MediaRelay] 200 OK 来自主叫，更新 A-leg 信令地址: {sender_addr}", file=sys.stderr, flush=True)
+            if media_info:
+                audio_ip = media_info.get('audio_connection_ip') or media_info.get('connection_ip')
+                session.a_leg_remote_addr = (audio_ip, media_info['audio_port'])
+                session.a_leg_sdp = sdp_body
+                old_a_audio_direction = session.a_leg_audio_direction
+                session.a_leg_audio_direction = media_info.get('audio_direction', 'sendrecv')
+                print(f"[MediaRelay] A-leg音频信息: {session.a_leg_remote_addr}, 方向: {session.a_leg_audio_direction}", file=sys.stderr, flush=True)
+                if old_a_audio_direction != session.a_leg_audio_direction:
+                    print(f"[MediaRelay] A-leg音频方向已改变: {old_a_audio_direction} → {session.a_leg_audio_direction}", file=sys.stderr, flush=True)
+                if media_info.get('video_port'):
+                    video_ip = media_info.get('video_connection_ip') or media_info.get('connection_ip')
+                    old_a_leg_video_addr = session.a_leg_video_remote_addr
+                    session.a_leg_video_remote_addr = (video_ip, media_info['video_port'])
+                    old_a_video_direction = session.a_leg_video_direction
+                    session.a_leg_video_direction = media_info.get('video_direction', 'sendrecv')
+                    print(f"[MediaRelay] A-leg视频信息: {session.a_leg_video_remote_addr}, 方向: {session.a_leg_video_direction}", file=sys.stderr, flush=True)
+                    if old_a_leg_video_addr != session.a_leg_video_remote_addr:
+                        print(f"[MediaRelay] A-leg视频地址已更新: {old_a_leg_video_addr} → {session.a_leg_video_remote_addr}", file=sys.stderr, flush=True)
+                    if old_a_video_direction != session.a_leg_video_direction:
+                        print(f"[MediaRelay] A-leg视频方向已改变: {old_a_video_direction} → {session.a_leg_video_direction}", file=sys.stderr, flush=True)
+                    if not session.a_leg_video_rtp_port or not session.b_leg_video_rtp_port:
+                        a_v = self.port_manager.allocate_port_pair(call_id)
+                        b_v = self.port_manager.allocate_port_pair(call_id)
+                        if a_v and b_v:
+                            session.a_leg_video_rtp_port, session.a_leg_video_rtcp_port = a_v[0], a_v[1]
+                            session.b_leg_video_rtp_port, session.b_leg_video_rtcp_port = b_v[0], b_v[1]
+                            print(f"[MediaRelay] 分配视频端口: A-leg={a_v}, B-leg={b_v}", file=sys.stderr, flush=True)
+        # 修改后 SDP：发往主叫填 A-leg 端口，发往被叫填 B-leg 端口
         if response_to_caller:
             audio_port = session.a_leg_rtp_port
             video_port = session.a_leg_video_rtp_port
@@ -1231,9 +1522,11 @@ class MediaRelay:
         """
         启动媒体转发（双端口模式）
         
-        主叫和被叫使用不同的端口：
-        - A-leg 转发器：监听 A-leg 端口，接收主叫的 RTP，转发给被叫
-        - B-leg 转发器：监听 B-leg 端口，接收被叫的 RTP，转发给主叫
+        转发方向严格固定，不随谁发起 INVITE/re-INVITE 改变：
+        - 主叫 → 媒体转发器(A-leg 端口) → 被叫
+        - 被叫 → 媒体转发器(B-leg 端口) → 主叫
+        即：A-leg 转发器监听 A-leg 端口、接收主叫 RTP、转发给被叫；
+            B-leg 转发器监听 B-leg 端口、接收被叫 RTP、转发给主叫。
         
         Args:
             call_id: 呼叫ID
@@ -1315,6 +1608,7 @@ class MediaRelay:
                     if a_leg_video_target and b_leg_video_target:
                         fwd_video_a = self._forwarders.get((call_id, 'a', 'video-rtp'))
                         fwd_video_b = self._forwarders.get((call_id, 'b', 'video-rtp'))
+                        # 只有当两侧转发器都存在时才更新，否则需要创建
                         if fwd_video_a and fwd_video_b:
                             # 视频转发器已存在，检查目标地址是否改变
                             old_target_a = fwd_video_a.target_addr
@@ -1322,6 +1616,9 @@ class MediaRelay:
                             
                             print(f"[MediaRelay] 视频转发器当前目标: A-leg={old_target_a}, B-leg={old_target_b}", file=sys.stderr, flush=True)
                             print(f"[MediaRelay] 视频转发器新目标: A-leg→{b_leg_video_target}, B-leg→{a_leg_video_target}", file=sys.stderr, flush=True)
+                            print(f"  ⚠️ 转发方向检查 (re-INVITE更新):", file=sys.stderr, flush=True)
+                            print(f"    A-leg转发器 (端口{session.a_leg_video_rtp_port}): {old_target_a} → {b_leg_video_target} (主叫视频→被叫)", file=sys.stderr, flush=True)
+                            print(f"    B-leg转发器 (端口{session.b_leg_video_rtp_port}): {old_target_b} → {a_leg_video_target} (被叫视频→主叫)", file=sys.stderr, flush=True)
                             
                             # 如果目标地址改变，重置统计（视频切换场景）
                             reset_stats = (old_target_a != b_leg_video_target or old_target_b != a_leg_video_target)
@@ -1329,6 +1626,9 @@ class MediaRelay:
                             if reset_stats:
                                 print(f"[MediaRelay] 检测到视频目标地址改变，将重置统计并发送 NAT 打洞包: {call_id}", file=sys.stderr, flush=True)
                             
+                            # 关键修复：确保转发方向正确
+                            # A-leg转发器应该转发到B-leg目标（主叫的视频转发给被叫）
+                            # B-leg转发器应该转发到A-leg目标（被叫的视频转发给主叫）
                             fwd_video_a.update_target(b_leg_video_target, reset_stats=reset_stats)
                             fwd_video_b.update_target(a_leg_video_target, reset_stats=reset_stats)
                             
@@ -1350,6 +1650,27 @@ class MediaRelay:
                                 fwd_video_b.send_nat_punch(count=20, interval=0.01)
                             
                             video_forwarders_exist = True
+                        elif fwd_video_a or fwd_video_b:
+                            # 只有一侧转发器存在，说明另一方刚打开视频，需要创建缺失的转发器
+                            # 先停止已存在的转发器，然后重新创建（确保方向正确）
+                            print(f"[MediaRelay] re-INVITE 检测到只有一侧视频转发器存在，将重新创建: {call_id}", file=sys.stderr, flush=True)
+                            print(f"  当前状态: A-leg转发器={'存在' if fwd_video_a else '不存在'}, B-leg转发器={'存在' if fwd_video_b else '不存在'}", file=sys.stderr, flush=True)
+                            print(f"  视频目标地址: A-leg={a_leg_video_target}, B-leg={b_leg_video_target}", file=sys.stderr, flush=True)
+                            if fwd_video_a:
+                                print(f"  停止A-leg转发器: 端口{fwd_video_a.local_port}, 目标={fwd_video_a.target_addr}", file=sys.stderr, flush=True)
+                                fwd_video_a.stop()
+                                self._forwarders.pop((call_id, 'a', 'video-rtp'), None)
+                                fwd_video_a_rtcp = self._forwarders.pop((call_id, 'a', 'video-rtcp'), None)
+                                if fwd_video_a_rtcp:
+                                    fwd_video_a_rtcp.stop()
+                            if fwd_video_b:
+                                print(f"  停止B-leg转发器: 端口{fwd_video_b.local_port}, 目标={fwd_video_b.target_addr}", file=sys.stderr, flush=True)
+                                fwd_video_b.stop()
+                                self._forwarders.pop((call_id, 'b', 'video-rtp'), None)
+                                fwd_video_b_rtcp = self._forwarders.pop((call_id, 'b', 'video-rtcp'), None)
+                                if fwd_video_b_rtcp:
+                                    fwd_video_b_rtcp.stop()
+                            video_forwarders_exist = False
                         else:
                             # 视频转发器不存在（re-INVITE 时添加视频），需要创建
                             print(f"[MediaRelay] re-INVITE 检测到视频但转发器不存在，将创建视频转发器: {call_id}", file=sys.stderr, flush=True)
@@ -1396,12 +1717,25 @@ class MediaRelay:
             print(f"  B-leg RTP端口: {session.b_leg_rtp_port} (被叫发送到此端口)",
                   file=sys.stderr, flush=True)
             
+            # 创建独立媒体流通道和历史缓冲（音频）
+            with self._channel_lock:
+                ch_audio_a = queue.Queue(maxsize=BACKGROUND_AUDIO_BUFFER_PACKETS)
+                ch_audio_b = queue.Queue(maxsize=BACKGROUND_AUDIO_BUFFER_PACKETS)
+                hist_audio_a = deque(maxlen=BACKGROUND_AUDIO_BUFFER_PACKETS)
+                hist_audio_b = deque(maxlen=BACKGROUND_AUDIO_BUFFER_PACKETS)
+                self._media_stream_channels[(call_id, 'audio-a')] = ch_audio_a
+                self._media_stream_channels[(call_id, 'audio-b')] = ch_audio_b
+                self._channel_history_buffers[(call_id, 'audio-a')] = hist_audio_a
+                self._channel_history_buffers[(call_id, 'audio-b')] = hist_audio_b
+            
             # A-leg 转发器：监听 A-leg 端口，接收主叫的 RTP，转发给被叫
             forwarder_a = DualPortMediaForwarder(
                 local_port=session.a_leg_rtp_port,
                 target_addr=b_leg_target,
                 expected_ip=a_expected_ip,
-                call_name=f"{caller}→{callee}-A"
+                call_name=f"{caller}→{callee}-A",
+                stream_channel=ch_audio_a,
+                history_buffer=hist_audio_a
             )
             forwarder_a.start()
             
@@ -1410,7 +1744,9 @@ class MediaRelay:
                 local_port=session.b_leg_rtp_port,
                 target_addr=a_leg_target,
                 expected_ip=b_expected_ip,
-                call_name=f"{callee}→{caller}-B"
+                call_name=f"{callee}→{caller}-B",
+                stream_channel=ch_audio_b,
+                history_buffer=hist_audio_b
             )
             forwarder_b.start()
             
@@ -1459,26 +1795,44 @@ class MediaRelay:
                 
                 if not video_forwarders_exist:
                     print(f"[MediaRelay] 启动视频转发: {call_id}", file=sys.stderr, flush=True)
-                    print(f"  主叫({caller})视频: {a_leg_video_target}", file=sys.stderr, flush=True)
-                    print(f"  被叫({callee})视频: {b_leg_video_target}", file=sys.stderr, flush=True)
-                    print(f"  A-leg视频RTP端口: {session.a_leg_video_rtp_port}", file=sys.stderr, flush=True)
-                    print(f"  B-leg视频RTP端口: {session.b_leg_video_rtp_port}", file=sys.stderr, flush=True)
+                    print(f"  主叫({caller})视频目标地址: {a_leg_video_target}", file=sys.stderr, flush=True)
+                    print(f"  被叫({callee})视频目标地址: {b_leg_video_target}", file=sys.stderr, flush=True)
+                    print(f"  A-leg视频RTP端口: {session.a_leg_video_rtp_port} (主叫发送视频到此端口)", file=sys.stderr, flush=True)
+                    print(f"  B-leg视频RTP端口: {session.b_leg_video_rtp_port} (被叫发送视频到此端口)", file=sys.stderr, flush=True)
+                    print(f"  ⚠️ 转发方向检查:", file=sys.stderr, flush=True)
+                    print(f"    A-leg转发器: 监听端口{session.a_leg_video_rtp_port} → 转发到被叫 {b_leg_video_target} (主叫视频→被叫)", file=sys.stderr, flush=True)
+                    print(f"    B-leg转发器: 监听端口{session.b_leg_video_rtp_port} → 转发到主叫 {a_leg_video_target} (被叫视频→主叫)", file=sys.stderr, flush=True)
                     
-                    # A-leg 视频转发器
+                    # 创建独立媒体流通道和历史缓冲（视频）
+                    with self._channel_lock:
+                        ch_video_a = queue.Queue(maxsize=BACKGROUND_VIDEO_BUFFER_PACKETS)
+                        ch_video_b = queue.Queue(maxsize=BACKGROUND_VIDEO_BUFFER_PACKETS)
+                        hist_video_a = deque(maxlen=BACKGROUND_VIDEO_BUFFER_PACKETS)
+                        hist_video_b = deque(maxlen=BACKGROUND_VIDEO_BUFFER_PACKETS)
+                        self._media_stream_channels[(call_id, 'video-a')] = ch_video_a
+                        self._media_stream_channels[(call_id, 'video-b')] = ch_video_b
+                        self._channel_history_buffers[(call_id, 'video-a')] = hist_video_a
+                        self._channel_history_buffers[(call_id, 'video-b')] = hist_video_b
+                    
+                    # A-leg 视频转发器：监听A-leg端口，接收主叫的视频，转发给被叫
                     forwarder_video_a = DualPortMediaForwarder(
                         local_port=session.a_leg_video_rtp_port,
                         target_addr=b_leg_video_target,
                         expected_ip=a_expected_ip,
-                        call_name=f"{caller}→{callee}-VIDEO-A"
+                        call_name=f"{caller}→{callee}-VIDEO-A",
+                        stream_channel=ch_video_a,
+                        history_buffer=hist_video_a
                     )
                     forwarder_video_a.start()
                     
-                    # B-leg 视频转发器
+                    # B-leg 视频转发器：监听B-leg端口，接收被叫的视频，转发给主叫
                     forwarder_video_b = DualPortMediaForwarder(
                         local_port=session.b_leg_video_rtp_port,
                         target_addr=a_leg_video_target,
                         expected_ip=b_expected_ip,
-                        call_name=f"{callee}→{caller}-VIDEO-B"
+                        call_name=f"{callee}→{caller}-VIDEO-B",
+                        stream_channel=ch_video_b,
+                        history_buffer=hist_video_b
                     )
                     forwarder_video_b.start()
                     
@@ -1513,6 +1867,8 @@ class MediaRelay:
                     print(f"[MediaRelay] 视频转发器已存在，跳过创建: {call_id}", file=sys.stderr, flush=True)
         
         session.started_at = time.time()
+        # 确保所有通道已创建（如果转发器已存在，更新通道引用）
+        self._ensure_media_stream_channels(call_id)
         print(f"[MediaRelay] 媒体转发已启动（音频+视频）: {call_id}", file=sys.stderr, flush=True)
         print(f"[MediaRelay] 媒体转发已启动: {call_id}", flush=True)
         
@@ -1525,7 +1881,7 @@ class MediaRelay:
             return
         
         print(f"[MediaRelay] 停止媒体转发: {call_id}")
-        
+        self._clear_media_stream_channels(call_id)
         # 停止音频和视频转发器
         for key in [(call_id, 'a', 'rtp'), (call_id, 'b', 'rtp'),
                     (call_id, 'a', 'rtcp'), (call_id, 'b', 'rtcp'),
@@ -1634,6 +1990,12 @@ class MediaRelay:
         video_downlink_rtp = video_server_to_caller_rtp
         video_downlink_rtcp = video_server_to_caller_rtcp
         
+        # 卡顿/丢包统计（供日志与媒体端点可视化）
+        audio_drops_a = fwd_a_audio.packets_dropped_send if fwd_a_audio and hasattr(fwd_a_audio, 'packets_dropped_send') else 0
+        audio_drops_b = fwd_b_audio.packets_dropped_send if fwd_b_audio and hasattr(fwd_b_audio, 'packets_dropped_send') else 0
+        video_drops_a = fwd_a_video.packets_dropped_send if fwd_a_video and hasattr(fwd_a_video, 'packets_dropped_send') else 0
+        video_drops_b = fwd_b_video.packets_dropped_send if fwd_b_video and hasattr(fwd_b_video, 'packets_dropped_send') else 0
+        
         duration = time.time() - session.started_at if session.started_at else 0
         diagnosis = []
         if not session.started_at:
@@ -1658,6 +2020,13 @@ class MediaRelay:
             
             if not diagnosis:
                 diagnosis.append("正常转发")
+            # 卡顿：有丢包时追加诊断
+            total_audio_drops = audio_drops_a + audio_drops_b
+            total_video_drops = video_drops_a + video_drops_b
+            if total_audio_drops > 0:
+                diagnosis.append(f"音频丢包(发送缓冲满):{total_audio_drops}")
+            if total_video_drops > 0:
+                diagnosis.append(f"视频丢包(发送缓冲满):{total_video_drops}")
         else:
             diagnosis.append("转发器未创建")
         
@@ -1711,6 +2080,9 @@ class MediaRelay:
             'duration': duration,
             'duration_sec': round(duration, 1),
             'diagnosis': ' | '.join(diagnosis),
+            # 卡顿/丢包（供媒体端点界面与日志）
+            'audio_drops': {'uplink': audio_drops_a, 'downlink': audio_drops_b},
+            'video_drops': {'uplink': video_drops_a, 'downlink': video_drops_b} if (fwd_a_video or fwd_b_video) else None,
         }
     
     def get_all_stats(self) -> Dict:

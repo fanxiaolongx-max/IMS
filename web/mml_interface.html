@@ -395,6 +395,173 @@
         .media-session-card table.media-ports th { color: #969696; }
         .media-endpoints-sessions .empty { color: #969696; text-align: center; padding: 40px; }
         
+        /* 媒体监听按钮 */
+        .monitor-buttons {
+            margin-top: 10px;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .monitor-btn {
+            padding: 6px 12px;
+            background: #2d2d2d;
+            border: 1px solid #3e3e3e;
+            color: #d4d4d4;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+        .monitor-btn:hover {
+            background: #3e3e3e;
+            border-color: #569cd6;
+        }
+        .monitor-btn.active {
+            background: #007acc;
+            border-color: #569cd6;
+            color: #fff;
+        }
+        
+        /* 媒体监听窗口 */
+        .media-monitor-window {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 600px;
+            max-width: 90vw;
+            max-height: 80vh;
+            background: #1e1e1e;
+            border: 2px solid #3e3e3e;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            z-index: 10000;
+            display: none;
+            flex-direction: column;
+        }
+        .media-monitor-window.active {
+            display: flex;
+        }
+        .media-monitor-header {
+            padding: 12px 16px;
+            background: #252526;
+            border-bottom: 1px solid #3e3e3e;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-radius: 8px 8px 0 0;
+        }
+        .media-monitor-title {
+            font-weight: bold;
+            color: #d4d4d4;
+        }
+        .media-monitor-close {
+            background: none;
+            border: none;
+            color: #858585;
+            font-size: 20px;
+            cursor: pointer;
+            padding: 0;
+            width: 24px;
+            height: 24px;
+            line-height: 24px;
+        }
+        .media-monitor-close:hover {
+            color: #fff;
+        }
+        .media-monitor-content {
+            padding: 16px;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .media-monitor-stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .media-monitor-stat-item {
+            background: #252526;
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid #3e3e3e;
+        }
+        .media-monitor-stat-label {
+            font-size: 12px;
+            color: #858585;
+            margin-bottom: 4px;
+        }
+        .media-monitor-stat-value {
+            font-size: 18px;
+            font-weight: bold;
+            color: #4ec9b0;
+        }
+        .media-monitor-chart {
+            background: #252526;
+            padding: 12px;
+            border-radius: 4px;
+            border: 1px solid #3e3e3e;
+            height: 200px;
+            margin-top: 16px;
+        }
+        .media-monitor-status {
+            padding: 8px 12px;
+            background: #2d2d2d;
+            border-radius: 4px;
+            margin-top: 12px;
+            font-size: 12px;
+            color: #858585;
+        }
+        .media-monitor-status.connected {
+            color: #4ec9b0;
+        }
+        .media-monitor-status.error {
+            color: #f48771;
+        }
+        .media-monitor-panels {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-top: 12px;
+        }
+        .media-monitor-panel {
+            background: #252526;
+            border: 1px solid #3e3e3e;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .media-monitor-panel-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 10px;
+            background: #2d2d2d;
+            font-size: 12px;
+        }
+        .media-monitor-panel-title { color: #d4d4d4; }
+        .media-monitor-mute { font-size: 11px; color: #858585; cursor: pointer; margin: 0; display: flex; align-items: center; gap: 4px; }
+        .media-monitor-mute-cb { cursor: pointer; }
+        .media-monitor-panel-body {
+            padding: 8px;
+            min-height: 48px;
+            font-size: 12px;
+            color: #858585;
+        }
+        .media-monitor-video-wrap {
+            padding: 4px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .media-monitor-canvas {
+            max-width: 100%;
+            max-height: 180px;
+            background: #1e1e1e;
+            border-radius: 4px;
+        }
+        .media-monitor-panel-info { font-size: 11px; color: #858585; margin-top: 4px; word-break: break-all; white-space: pre-wrap; max-height: 3.6em; overflow-y: auto; }
+        .monitor-btn-single { min-width: 72px; }
+        
         /* 颜色区分样式 */
         .media-label-caller { color: #569cd6; font-weight: bold; } /* 主叫 - 蓝色 */
         .media-label-callee { color: #6a9955; font-weight: bold; } /* 被叫 - 绿色 */
@@ -1259,6 +1426,66 @@
                     <div id="media-endpoints-diagnosis" class="media-endpoints-diagnosis"></div>
                     <div id="media-endpoints-sessions" class="media-endpoints-sessions"></div>
                 </div>
+                
+                <!-- 媒体监听窗口：主被叫音视频四路，可单独静音 -->
+                <div id="media-monitor-window" class="media-monitor-window">
+                    <div class="media-monitor-header">
+                        <div class="media-monitor-title" id="media-monitor-title">媒体流监听</div>
+                        <button class="media-monitor-close" id="media-monitor-close">&times;</button>
+                    </div>
+                    <div class="media-monitor-content">
+                        <div class="media-monitor-stats" id="media-monitor-stats">
+                            <div class="media-monitor-stat-item">
+                                <div class="media-monitor-stat-label">接收包数</div>
+                                <div class="media-monitor-stat-value" id="stat-packets-received">0</div>
+                            </div>
+                            <div class="media-monitor-stat-item">
+                                <div class="media-monitor-stat-label">发送包数</div>
+                                <div class="media-monitor-stat-value" id="stat-packets-sent">0</div>
+                            </div>
+                            <div class="media-monitor-stat-item">
+                                <div class="media-monitor-stat-label">总字节数</div>
+                                <div class="media-monitor-stat-value" id="stat-total-bytes">0</div>
+                            </div>
+                            <div class="media-monitor-stat-item">
+                                <div class="media-monitor-stat-label">丢包(缓冲满)</div>
+                                <div class="media-monitor-stat-value" id="stat-packets-dropped">0</div>
+                            </div>
+                        </div>
+                        <!-- 四路：主叫音频、被叫音频、主叫视频、被叫视频，每路可静音 -->
+                        <div id="media-monitor-panels" class="media-monitor-panels">
+                            <div class="media-monitor-panel" id="panel-audio-a" data-stream-type="audio-a">
+                                <div class="media-monitor-panel-head">
+                                    <span class="media-monitor-panel-title">🎤 主叫音频</span>
+                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-audio-a" class="media-monitor-mute-cb"> 静音</label>
+                                </div>
+                                <div class="media-monitor-panel-body" id="panel-body-audio-a">—</div>
+                            </div>
+                            <div class="media-monitor-panel" id="panel-audio-b" data-stream-type="audio-b">
+                                <div class="media-monitor-panel-head">
+                                    <span class="media-monitor-panel-title">🎤 被叫音频</span>
+                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-audio-b" class="media-monitor-mute-cb"> 静音</label>
+                                </div>
+                                <div class="media-monitor-panel-body" id="panel-body-audio-b">—</div>
+                            </div>
+                            <div class="media-monitor-panel" id="panel-video-a" data-stream-type="video-a">
+                                <div class="media-monitor-panel-head">
+                                    <span class="media-monitor-panel-title">📹 主叫视频</span>
+                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-video-a" class="media-monitor-mute-cb"> 静音</label>
+                                </div>
+                                <div class="media-monitor-panel-body media-monitor-video-wrap" id="panel-body-video-a"><canvas id="media-monitor-canvas-video-a" class="media-monitor-canvas" width="320" height="240"></canvas><div class="media-monitor-panel-info" id="info-video-a"></div></div>
+                            </div>
+                            <div class="media-monitor-panel" id="panel-video-b" data-stream-type="video-b">
+                                <div class="media-monitor-panel-head">
+                                    <span class="media-monitor-panel-title">📹 被叫视频</span>
+                                    <label class="media-monitor-mute"><input type="checkbox" id="mute-video-b" class="media-monitor-mute-cb"> 静音</label>
+                                </div>
+                                <div class="media-monitor-panel-body media-monitor-video-wrap" id="panel-body-video-b"><canvas id="media-monitor-canvas-video-b" class="media-monitor-canvas" width="320" height="240"></canvas><div class="media-monitor-panel-info" id="info-video-b"></div></div>
+                            </div>
+                        </div>
+                        <div class="media-monitor-status" id="media-monitor-status">未连接</div>
+                    </div>
+                </div>
 
                 <!-- SIP消息跟踪内容 -->
                 <div id="sip-messages-content" style="display: none;">
@@ -1267,7 +1494,11 @@
                             <button id="sip-messages-clear-btn" class="sip-messages-btn">清空</button>
                             <button id="sip-messages-refresh-btn" class="sip-messages-btn">刷新</button>
                             <button id="sip-messages-pause-btn" class="sip-messages-btn">暂停跟踪</button>
-                            <span id="sip-messages-stats">加载中...</span>
+                            <label style="margin-left: 15px; color: #d4d4d4; cursor: pointer;">
+                                <input type="checkbox" id="sip-messages-show-retransmissions" style="margin-right: 5px;">
+                                显示重传消息
+                            </label>
+                            <span id="sip-messages-stats" style="margin-left: 15px;">加载中...</span>
                         </div>
                     </div>
                     <div id="sip-messages-table-container" class="sip-messages-table-container">
@@ -2892,10 +3123,28 @@
                     }
                     
                     const diagClass = (s.diagnosis && (s.diagnosis.indexOf('未') >= 0 || s.diagnosis.indexOf('异常') >= 0)) ? '' : ' ok';
+                    const audioDrops = s.audio_drops || {};
+                    const videoDrops = s.video_drops || {};
+                    const dropText = [];
+                    if ((audioDrops.uplink || 0) + (audioDrops.downlink || 0) > 0) dropText.push('音频丢包:' + ((audioDrops.uplink || 0) + (audioDrops.downlink || 0)));
+                    if ((videoDrops.uplink || 0) + (videoDrops.downlink || 0) > 0) dropText.push('视频丢包:' + ((videoDrops.uplink || 0) + (videoDrops.downlink || 0)));
+                    const dropLine = dropText.length ? '<div class="diagnosis" style="margin-top:4px;">转发卡顿: ' + dropText.join('; ') + '</div>' : '';
+                    const callId = s.call_id;
+                    const hasAudio = s.audio && (s.audio.a_leg || s.audio.b_leg);
+                    const hasVideo = s.video && (s.video.a_leg || s.video.b_leg);
+                    
+                    // 监听按钮：一个按钮打开主被叫音视频，窗口内可单独静音
+                    const hasAny = hasAudio || hasVideo;
+                    const monitorBtn = hasAny
+                        ? `<button class="monitor-btn monitor-btn-single" data-call-id="${callId}" data-has-audio="${!!hasAudio}" data-has-video="${!!hasVideo}" title="监听主被叫音视频">🎧 监听</button>`
+                        : '';
+                    
                     return `<div class="media-session-card">
                         <h4><span class="media-label-caller">${s.caller}</span> → <span class="media-label-callee">${s.callee}</span> (${s.call_id}) ${s.duration_sec != null ? ' · ' + s.duration_sec + 's' : ''}</h4>
                         <table class="media-ports"><tbody>${rows.join('')}</tbody></table>
                         <div class="diagnosis${diagClass}">${s.diagnosis || '正常'}</div>
+                        ${dropLine}
+                        ${monitorBtn ? `<div class="monitor-buttons">${monitorBtn}</div>` : ''}
                     </div>`;
                 }).join('');
             } catch (e) {
@@ -2914,12 +3163,1950 @@
             }
         });
         
+        // 媒体流监听功能（四路：主叫/被叫 音频/视频，一个按钮打开，可单独静音）
+        let mediaMonitorWebSocket = null;  // 兼容单路旧逻辑
+        let mediaMonitorWebSockets = {};  // streamType -> WebSocket
+        let currentMonitorCallId = null;
+        let currentMonitorStreamType = null;
+        const mediaMonitorStats = { packetsReceived: 0, packetsSent: 0, totalBytes: 0, lastPacketSize: 0, packetsDropped: 0 };
+        const mediaMonitorStreamStats = {};  // streamType -> { packetsReceived, packetsSent, totalBytes, packetsDropped }
+        let mediaMonitorMute = { 'audio-a': false, 'audio-b': false, 'video-a': false, 'video-b': false };  // 静音状态
+        
+        // 监听按钮点击事件（事件委托）：一个按钮打开主被叫音视频四路
+        document.addEventListener('click', (e) => {
+            if (!e.target.classList.contains('monitor-btn')) return;
+            const callId = e.target.dataset.callId;
+            const isSingle = e.target.classList.contains('monitor-btn-single');
+            
+            if (isSingle) {
+                // 一个按钮：打开窗口并连接主被叫音视频四路
+                const hasAudio = e.target.dataset.hasAudio === 'true';
+                const hasVideo = e.target.dataset.hasVideo === 'true';
+                const isActive = e.target.classList.contains('active');
+                if (isActive) {
+                    closeMediaMonitorWindow();
+                    e.target.classList.remove('active');
+                } else {
+                    document.querySelectorAll('.monitor-btn.active').forEach(btn => btn.classList.remove('active'));
+                    startMediaMonitorAll(callId, hasAudio, hasVideo);
+                    e.target.classList.add('active');
+                }
+                return;
+            }
+            // 兼容旧版多按钮（若有残留）
+            const streamType = e.target.dataset.streamType;
+            if (!streamType) return;
+            const isActive = e.target.classList.contains('active');
+            if (isActive) {
+                stopAllMediaMonitorWebSockets();
+                currentMonitorCallId = null;
+                updateMonitorStatus('未连接', '');
+                e.target.classList.remove('active');
+            } else {
+                document.querySelectorAll('.monitor-btn.active').forEach(btn => btn.classList.remove('active'));
+                startMediaMonitor(callId, streamType);
+                e.target.classList.add('active');
+            }
+        });
+        
+        function stopAllMediaMonitorWebSockets() {
+            [...Object.entries(mediaMonitorWebSockets)].forEach(([st, ws]) => {
+                if (!ws) return;
+                ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null;
+                try { if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(); } catch (e) {}
+            });
+            mediaMonitorWebSockets = {};
+            if (mediaMonitorWebSocket) {
+                mediaMonitorWebSocket.onopen = null; mediaMonitorWebSocket.onmessage = null;
+                mediaMonitorWebSocket.onerror = null; mediaMonitorWebSocket.onclose = null;
+                try { if (mediaMonitorWebSocket.readyState === WebSocket.OPEN || mediaMonitorWebSocket.readyState === WebSocket.CONNECTING) mediaMonitorWebSocket.close(); } catch (e) {}
+                mediaMonitorWebSocket = null;
+            }
+        }
+        
+        function closeMediaMonitorWindow() {
+            stopAllMediaMonitorWebSockets();
+            cleanupMediaPlayer();
+            currentMonitorCallId = null;
+            currentMonitorStreamType = null;
+            updateMonitorStatus('未连接', '');
+            document.getElementById('media-monitor-window').classList.remove('active');
+            document.querySelectorAll('.monitor-btn.active').forEach(btn => btn.classList.remove('active'));
+        }
+        
+        // 关闭监听窗口
+        document.getElementById('media-monitor-close')?.addEventListener('click', () => {
+            closeMediaMonitorWindow();
+        });
+        
+        let connectionTimeoutId = null;
+        
+        function getMediaMonitorWsBaseUrl() {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsHostname = window.location.hostname === '0.0.0.0' ? 'localhost' : window.location.hostname;
+            const httpPort = window.location.port ? parseInt(window.location.port) : (window.location.protocol === 'https:' ? 443 : 80);
+            const isCloudflareTunnel = window.location.hostname.includes('trycloudflare.com');
+            const wsPort = isCloudflareTunnel ? httpPort : ((httpPort === 80 || httpPort === 443) ? 8889 : (httpPort + 1));
+            return `${wsProtocol}//${wsHostname}:${wsPort}`;
+        }
+        
+        function startMediaMonitorAll(callId, hasAudio, hasVideo) {
+            stopAllMediaMonitorWebSockets();
+            currentMonitorCallId = callId;
+            const streams = [];
+            if (hasAudio) streams.push('audio-a', 'audio-b');
+            if (hasVideo) streams.push('video-a', 'video-b');
+            ['audio-a','audio-b','video-a','video-b'].forEach(st => {
+                mediaMonitorStreamStats[st] = { packetsReceived: 0, packetsSent: 0, totalBytes: 0, packetsDropped: 0 };
+            });
+            mediaMonitorStats.packetsReceived = 0;
+            mediaMonitorStats.packetsSent = 0;
+            mediaMonitorStats.totalBytes = 0;
+            mediaMonitorStats.packetsDropped = 0;
+            updateMonitorStats();
+            document.getElementById('media-monitor-title').textContent = `媒体流监听: ${callId.substring(0, 20)}... (主被叫音视频)`;
+            document.getElementById('media-monitor-window').classList.add('active');
+            updateMonitorStatus('连接中...', '');
+            // 面板初始状态（视频面板的 body 内含 canvas，不能设 textContent 否则会清空画布）
+            ['audio-a','audio-b','video-a','video-b'].forEach(st => {
+                const body = document.getElementById('panel-body-' + st);
+                const info = document.getElementById('info-' + st);
+                if (st.startsWith('audio')) {
+                    if (body) body.textContent = streams.indexOf(st) >= 0 ? '连接中…' : '—';
+                } else {
+                    if (info) info.textContent = streams.indexOf(st) >= 0 ? '连接中…' : '—';
+                }
+            });
+            // 静音复选框绑定
+            ['audio-a','audio-b','video-a','video-b'].forEach(st => {
+                const cb = document.getElementById('mute-' + st);
+                if (cb) {
+                    cb.checked = mediaMonitorMute[st] || false;
+                    cb.onchange = () => {
+                        mediaMonitorMute[st] = cb.checked;
+                        if (st.startsWith('audio')) applyAudioMute(st, cb.checked);
+                        if (st.startsWith('video')) applyVideoMute(st, cb.checked);
+                    };
+                }
+            });
+            initMediaPlayerMultiStream(streams);
+            const baseUrl = getMediaMonitorWsBaseUrl();
+            let connectedCount = 0;
+            streams.forEach(streamType => {
+                const wsUrl = `${baseUrl}/ws/media-stream?call_id=${encodeURIComponent(callId)}&stream_type=${encodeURIComponent(streamType)}`;
+                try {
+                    const ws = new WebSocket(wsUrl);
+                    mediaMonitorWebSockets[streamType] = ws;
+                    ws.onopen = () => {
+                        connectedCount++;
+                        if (streamType.startsWith('audio')) {
+                            const body = document.getElementById('panel-body-' + streamType);
+                            if (body) body.textContent = '播放中';
+                        } else {
+                            const info = document.getElementById('info-' + streamType);
+                            if (info) info.textContent = '解码中…';
+                        }
+                        updateMonitorStatus(connectedCount === streams.length ? '监听中…' : `连接中 (${connectedCount}/${streams.length})…`, 'connected');
+                    };
+                    ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === 'connected') {
+                                if (streamType.startsWith('audio')) {
+                                    const body = document.getElementById('panel-body-' + streamType);
+                                    if (body) body.textContent = '播放中';
+                                } else {
+                                    // 视频：不覆盖已有 MSE 状态（mse_init/mse_fragment 会设置「已就绪」「已解码 n 帧」）
+                                    const info = document.getElementById('info-' + streamType);
+                                    if (info && !info.textContent) info.textContent = '解码中…';
+                                }
+                            } else if (data.type === 'mse_init') {
+                                if (streamType.startsWith('video') && data.data) initMSEForStreamWithBackendInit(streamType, data.data, data.codec);
+                            } else if (data.type === 'mse_fragment') {
+                                if (streamType.startsWith('video') && data.data) appendMSEFragmentBytes(streamType, data.data, !!data.keyframe);
+                            } else if (data.type === 'rtp_packet') {
+                                const s = mediaMonitorStreamStats[streamType] || {};
+                                if (data.packets_received !== undefined) s.packetsReceived = data.packets_received;
+                                if (data.packets_sent !== undefined) s.packetsSent = data.packets_sent;
+                                if (data.total_bytes !== undefined) s.totalBytes = data.total_bytes;
+                                if (data.packets_dropped_send !== undefined) s.packetsDropped = data.packets_dropped_send;
+                                mediaMonitorStreamStats[streamType] = s;
+                                mediaMonitorStats.packetsReceived = Object.values(mediaMonitorStreamStats).reduce((a, x) => a + (x.packetsReceived || 0), 0);
+                                mediaMonitorStats.packetsSent = Object.values(mediaMonitorStreamStats).reduce((a, x) => a + (x.packetsSent || 0), 0);
+                                mediaMonitorStats.totalBytes = Object.values(mediaMonitorStreamStats).reduce((a, x) => a + (x.totalBytes || 0), 0);
+                                mediaMonitorStats.packetsDropped = Object.values(mediaMonitorStreamStats).reduce((a, x) => a + (x.packetsDropped || 0), 0);
+                                updateMonitorStats();
+                                if (data.rtp_payload_b64) {
+                                    handleRtpPayloadForStream(streamType, data.rtp_payload_b64, data.codec, data.payload_type);
+                                }
+                            }
+                        } catch (e) { console.error('[MediaMonitor] message parse:', e); }
+                    };
+                    ws.onerror = () => { updateMonitorStatus('连接错误', 'error'); };
+                    ws.onclose = () => {
+                        if (mediaMonitorWebSockets[streamType] === ws) delete mediaMonitorWebSockets[streamType];
+                    };
+                } catch (e) {
+                    console.error('[MediaMonitor] WebSocket create:', streamType, e);
+                }
+            });
+        }
+        
+        function applyAudioMute(streamType, muted) {
+            if (typeof setAudioGainForStream === 'function') setAudioGainForStream(streamType, muted ? 0 : 1);
+        }
+        function applyVideoMute(streamType, muted) {
+            const wrap = document.getElementById('panel-body-' + streamType);
+            const canvas = document.getElementById('media-monitor-canvas-' + streamType);
+            if (wrap) wrap.style.opacity = muted ? '0.4' : '1';
+            if (canvas) canvas.style.display = muted ? 'none' : 'block';
+        }
+        
+        function startMediaMonitor(callId, streamType) {
+            console.log('[MediaMonitor] startMediaMonitor 调用:', callId, streamType, 
+                '当前目标:', currentMonitorCallId, currentMonitorStreamType,
+                '有连接:', !!mediaMonitorWebSocket);
+            
+            // 如果目标相同且连接正常，直接返回
+            if (currentMonitorCallId === callId && currentMonitorStreamType === streamType && mediaMonitorWebSocket) {
+                const state = mediaMonitorWebSocket.readyState;
+                if (state === WebSocket.OPEN) {
+                    console.log('[MediaMonitor] 目标相同且连接正常，跳过');
+                    return;
+                }
+            }
+            
+            // 彻底重置监听状态：清理播放器、统计、状态，避免切换后未连接
+            console.log('[MediaMonitor] 彻底重置所有状态，准备切换');
+            cleanupMediaPlayer();
+            mediaMonitorStats.packetsReceived = 0;
+            mediaMonitorStats.packetsSent = 0;
+            mediaMonitorStats.totalBytes = 0;
+            mediaMonitorStats.lastPacketSize = 0;
+            mediaMonitorStats.packetsDropped = 0;
+            updateMonitorStats();
+            updateMonitorStatus('连接中...', '');
+            const infoEl = document.getElementById('media-monitor-player-info');
+            if (infoEl) infoEl.textContent = '';
+            
+            // 清除之前的延迟连接
+            if (connectionTimeoutId) {
+                clearTimeout(connectionTimeoutId);
+                connectionTimeoutId = null;
+            }
+            
+            // 完全关闭并清理旧连接
+            if (mediaMonitorWebSocket) {
+                console.log('[MediaMonitor] 关闭旧连接，状态:', mediaMonitorWebSocket.readyState);
+                try {
+                    // 移除所有事件监听器
+                    mediaMonitorWebSocket.onopen = null;
+                    mediaMonitorWebSocket.onmessage = null;
+                    mediaMonitorWebSocket.onerror = null;
+                    mediaMonitorWebSocket.onclose = null;
+                    
+                    // 关闭连接
+                    const state = mediaMonitorWebSocket.readyState;
+                    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+                        mediaMonitorWebSocket.close(1000, 'Switching stream');
+                    }
+                } catch (e) {
+                    console.warn('[MediaMonitor] 关闭WebSocket时出错:', e);
+                }
+                mediaMonitorWebSocket = null;
+            }
+            
+            // 重置所有状态变量
+            currentMonitorCallId = callId;
+            currentMonitorStreamType = streamType;
+            
+            // 等待一段时间，确保旧连接完全关闭、服务端已执行 finally 清理
+            connectionTimeoutId = setTimeout(() => {
+                connectionTimeoutId = null;
+                
+                // 验证目标是否仍然匹配（可能在延迟期间用户切换了）
+                if (currentMonitorCallId !== callId || currentMonitorStreamType !== streamType) {
+                    console.warn('[MediaMonitor] 监控目标已变化，取消连接创建');
+                    return;
+                }
+                
+                // 再次检查并清理，确保没有其他连接
+                if (mediaMonitorWebSocket) {
+                    const state = mediaMonitorWebSocket.readyState;
+                    console.warn('[MediaMonitor] 检测到残留连接，状态:', state, '清理中...');
+                    // 只关闭不匹配当前目标的连接
+                    if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+                        try {
+                            mediaMonitorWebSocket.onopen = null;
+                            mediaMonitorWebSocket.onmessage = null;
+                            mediaMonitorWebSocket.onerror = null;
+                            mediaMonitorWebSocket.onclose = null;
+                            mediaMonitorWebSocket.close(1000, 'Switching stream');
+                        } catch (e) {
+                            console.warn('[MediaMonitor] 关闭残留连接时出错:', e);
+                        }
+                        mediaMonitorWebSocket = null;
+                    } else {
+                        mediaMonitorWebSocket = null;
+                    }
+                    // 再等待一下，确保连接完全关闭
+                    setTimeout(() => {
+                        // 再次验证目标
+                        if (currentMonitorCallId === callId && currentMonitorStreamType === streamType && !mediaMonitorWebSocket) {
+                            startMediaMonitorInternal(callId, streamType);
+                        } else {
+                            console.warn('[MediaMonitor] 延迟期间目标已变化或仍有连接，取消连接创建');
+                        }
+                    }, 150);
+                } else {
+                    startMediaMonitorInternal(callId, streamType);
+                }
+            }, 350);
+        }
+        
+        function startMediaMonitorInternal(callId, streamType) {
+            
+            // 更新窗口标题
+            const streamTypeNames = {
+                'audio-a': '主叫音频',
+                'audio-b': '被叫音频',
+                'video-a': '主叫视频',
+                'video-b': '被叫视频'
+            };
+            document.getElementById('media-monitor-title').textContent = 
+                `媒体流监听: ${callId.substring(0, 20)}... / ${streamTypeNames[streamType] || streamType}`;
+            
+            // 显示窗口
+            document.getElementById('media-monitor-window').classList.add('active');
+            
+            // 重置统计
+            mediaMonitorStats.packetsReceived = 0;
+            mediaMonitorStats.packetsSent = 0;
+            mediaMonitorStats.totalBytes = 0;
+            mediaMonitorStats.lastPacketSize = 0;
+            mediaMonitorStats.packetsDropped = 0;
+            updateMonitorStats();
+            
+            // 连接WebSocket（使用hostname而不是host，避免0.0.0.0问题）
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsHostname = window.location.hostname === '0.0.0.0' ? 'localhost' : window.location.hostname;
+            // 获取当前 HTTP 端口，如果为空或无效则使用默认值
+            const httpPort = window.location.port ? parseInt(window.location.port) : 
+                             (window.location.protocol === 'https:' ? 443 : 80);
+            
+            // 如果通过 Cloudflare 隧道访问（trycloudflare.com），WebSocket 使用相同端口（HTTP 升级）
+            // 否则使用端口 + 1（独立 WebSocket 服务器）
+            const isCloudflareTunnel = window.location.hostname.includes('trycloudflare.com');
+            const wsPort = isCloudflareTunnel ? httpPort : ((httpPort === 80 || httpPort === 443) ? 8889 : (httpPort + 1));
+            
+            const wsUrl = `${wsProtocol}//${wsHostname}:${wsPort}/ws/media-stream?call_id=${encodeURIComponent(callId)}&stream_type=${encodeURIComponent(streamType)}`;
+            
+            console.log('[MediaMonitor] 连接WebSocket:', wsUrl, 'isCloudflareTunnel:', isCloudflareTunnel);
+            
+            // 确保没有残留的连接（就像刷新页面一样，完全清理）
+            if (mediaMonitorWebSocket) {
+                console.warn('[MediaMonitor] 检测到残留连接，强制清理');
+                try {
+                    mediaMonitorWebSocket.onopen = null;
+                    mediaMonitorWebSocket.onmessage = null;
+                    mediaMonitorWebSocket.onerror = null;
+                    mediaMonitorWebSocket.onclose = null;
+                    if (mediaMonitorWebSocket.readyState !== WebSocket.CLOSED && 
+                        mediaMonitorWebSocket.readyState !== WebSocket.CLOSING) {
+                        mediaMonitorWebSocket.close();
+                    }
+                } catch (e) {
+                    console.warn('[MediaMonitor] 清理残留连接时出错:', e);
+                }
+                mediaMonitorWebSocket = null;
+            }
+            
+            // 直接创建连接（就像刷新页面一样，简单直接）
+            try {
+                console.log('[MediaMonitor] 创建新的WebSocket连接:', callId, streamType, 'URL:', wsUrl);
+                mediaMonitorWebSocket = new WebSocket(wsUrl);
+                
+                mediaMonitorWebSocket.onopen = () => {
+                    console.log('[MediaMonitor] WebSocket连接已建立:', callId, streamType, 
+                        '当前监控:', currentMonitorCallId, currentMonitorStreamType,
+                        '连接状态:', mediaMonitorWebSocket.readyState);
+                    // 验证这是当前活动的连接
+                    if (currentMonitorCallId === callId && currentMonitorStreamType === streamType) {
+                        updateMonitorStatus('已连接', 'connected');
+                        console.log('[MediaMonitor] 连接验证通过，保持连接');
+                    } else {
+                        console.warn('[MediaMonitor] 连接建立但callId/streamType不匹配，关闭连接');
+                        console.warn('[MediaMonitor] 期望:', callId, streamType, '实际:', currentMonitorCallId, currentMonitorStreamType);
+                        try {
+                            mediaMonitorWebSocket.close(1000, 'Connection mismatch');
+                        } catch (e) {
+                            console.warn('[MediaMonitor] 关闭不匹配连接时出错:', e);
+                        }
+                        mediaMonitorWebSocket = null;
+                    }
+                };
+                
+                mediaMonitorWebSocket.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        console.log('[MediaMonitor] 收到消息:', callId, streamType, data.type);
+                        if (data.type === 'connected') {
+                            console.log('[MediaMonitor] 连接成功:', callId, streamType, data.message);
+                            updateMonitorStatus('监听中...', 'connected');
+                            // 初始化播放器（如果还没有初始化或已关闭）
+                            if (!audioContext || audioContext.state === 'closed') {
+                                initMediaPlayer(streamType);
+                            } else if (streamType.startsWith('audio') && !isPlayingAudio) {
+                                // 如果播放器已存在但未启动，重新启动
+                                initMediaPlayer(streamType);
+                            }
+                        } else if (data.type === 'mse_init') {
+                            if (currentMonitorStreamType && currentMonitorStreamType.startsWith('video') && data.data) initMSEForStreamWithBackendInit(currentMonitorStreamType, data.data, data.codec);
+                        } else if (data.type === 'mse_fragment') {
+                            if (currentMonitorStreamType && currentMonitorStreamType.startsWith('video') && data.data) appendMSEFragmentBytes(currentMonitorStreamType, data.data, !!data.keyframe);
+                        } else if (data.type === 'rtp_packet') {
+                            // 更新统计信息
+                            if (data.packets_received !== undefined) {
+                                mediaMonitorStats.packetsReceived = data.packets_received;
+                            }
+                            if (data.packets_sent !== undefined) {
+                                mediaMonitorStats.packetsSent = data.packets_sent;
+                            }
+                            if (data.total_bytes !== undefined) {
+                                mediaMonitorStats.totalBytes = data.total_bytes;
+                            }
+                            if (data.packet_size !== undefined) {
+                                mediaMonitorStats.lastPacketSize = data.packet_size;
+                            }
+                            if (data.packets_dropped_send !== undefined) {
+                                mediaMonitorStats.packetsDropped = data.packets_dropped_send;
+                            }
+                            updateMonitorStats();
+                            
+                            // 处理RTP payload用于播放
+                            if (data.rtp_payload_b64) {
+                                handleRtpPayload(data.rtp_payload_b64, currentMonitorStreamType, data.codec, data.payload_type);
+                            }
+                        } else if (data.type === 'heartbeat') {
+                            // 心跳，保持连接
+                        } else if (data.type === 'error') {
+                            updateMonitorStatus('错误: ' + data.message, 'error');
+                            const infoEl = document.getElementById('media-monitor-player-info');
+                            if (infoEl) {
+                                infoEl.textContent = '错误: ' + data.message;
+                            }
+                            // 显示错误后，延迟关闭连接
+                            setTimeout(() => {
+                                if (mediaMonitorWebSocket) {
+                                    mediaMonitorWebSocket.close();
+                                }
+                            }, 3000);
+                        }
+                    } catch (e) {
+                        console.error('[MediaMonitor] 解析消息失败:', e);
+                    }
+                };
+                
+                mediaMonitorWebSocket.onerror = (error) => {
+                    console.error('[MediaMonitor] WebSocket错误:', callId, streamType, error, '连接状态:', mediaMonitorWebSocket?.readyState);
+                    updateMonitorStatus('连接错误', 'error');
+                };
+                
+                const currentWs = mediaMonitorWebSocket; // 保存当前WebSocket引用
+                mediaMonitorWebSocket.onclose = (event) => {
+                    console.log('[MediaMonitor] WebSocket连接已关闭:', callId, streamType, 
+                        'code:', event.code, 'reason:', event.reason, 'wasClean:', event.wasClean,
+                        '当前目标:', currentMonitorCallId, currentMonitorStreamType,
+                        '是当前连接:', mediaMonitorWebSocket === currentWs);
+                    // 只有在当前连接关闭时才更新状态
+                    if (mediaMonitorWebSocket === currentWs) {
+                        // 如果是正常关闭（用户主动关闭），不更新状态
+                        // 如果是异常关闭，显示"已断开"
+                        if (event.code !== 1000 && event.code !== 1001 && !event.wasClean) {
+                            updateMonitorStatus('已断开', 'error');
+                        } else if (currentMonitorCallId === callId && currentMonitorStreamType === streamType) {
+                            // 如果这是当前活动的连接，更新状态
+                            updateMonitorStatus('未连接', '');
+                        }
+                        mediaMonitorWebSocket = null;
+                    }
+                };
+            } catch (e) {
+                console.error('[MediaMonitor] 创建WebSocket失败:', callId, streamType, e);
+                updateMonitorStatus('连接失败: ' + e.message, 'error');
+                mediaMonitorWebSocket = null;
+            }
+        }
+        
+        function stopMediaMonitor() {
+            if (mediaMonitorWebSocket) {
+                mediaMonitorWebSocket.close();
+                mediaMonitorWebSocket = null;
+            }
+            // 不清理播放器，因为可能马上要切换到另一个流
+            // cleanupMediaPlayer(); // 注释掉，让播放器保持状态
+            currentMonitorCallId = null;
+            currentMonitorStreamType = null;
+            updateMonitorStatus('未连接', '');
+        }
+        
+        function updateMonitorStats() {
+            document.getElementById('stat-packets-received').textContent = mediaMonitorStats.packetsReceived.toLocaleString();
+            document.getElementById('stat-packets-sent').textContent = mediaMonitorStats.packetsSent.toLocaleString();
+            document.getElementById('stat-total-bytes').textContent = formatBytes(mediaMonitorStats.totalBytes);
+            const packetSizeEl = document.getElementById('stat-packet-size');
+            if (packetSizeEl) packetSizeEl.textContent = formatBytes(mediaMonitorStats.lastPacketSize);
+            const droppedEl = document.getElementById('stat-packets-dropped');
+            if (droppedEl) droppedEl.textContent = (mediaMonitorStats.packetsDropped || 0).toLocaleString();
+        }
+        
+        function updateMonitorStatus(text, className) {
+            const statusEl = document.getElementById('media-monitor-status');
+            statusEl.textContent = text;
+            statusEl.className = 'media-monitor-status ' + className;
+        }
+        
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+        
+        // 音视频播放器
+        let mediaPlayerAudio = null;
+        let mediaPlayerVideo = null;
+        let audioContext = null;
+        let audioBufferQueue = [];
+        let audioScriptProcessor = null;
+        let audioPlaybackTime = 0;
+        let videoChunks = [];
+        let mediaSource = null;
+        let sourceBuffer = null;
+        let isPlayingAudio = false;
+        // H.264 解码与显示（WebCodecs）
+        let h264SPS = null;
+        let h264PPS = null;
+        let h264FUABuffer = null;  // { nalHeader: number, chunks: Uint8Array[] }
+        let videoDecoder = null;
+        let videoCanvas = null;
+        let videoCtx = null;
+        let videoFrameCount = 0;
+        let videoDecodeQueue = [];
+        // 四路媒体：主叫/被叫 音频/视频
+        let audioBufferQueues = { 'audio-a': [], 'audio-b': [] };
+        let audioGainNodes = {};
+        let audioScriptProcessorsMulti = {};
+        let videoDecodersByStream = {};  // streamType -> VideoDecoder
+        let h264SPSByStream = {};
+        let h264PPSByStream = {};
+        let lastVideoTimeByStream = {};
+        let videoFrameCountByStream = {};
+        let videoStreamDebug = {};  // streamType -> { lastError, lastNal, framesSentToDecoder }
+        
+        function setVideoStreamStatus(streamType, msg, isError) {
+            const infoEl = document.getElementById('info-' + streamType);
+            if (!infoEl) return;
+            if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
+            if (isError) {
+                // 只存简短错误，避免与 getVideoStreamStatusLine 递归拼接导致状态栏爆长
+                const shortMsg = (msg.indexOf(' | ') >= 0) ? msg.split(' | ')[0] : msg;
+                videoStreamDebug[streamType].lastError = shortMsg.length > 120 ? shortMsg.slice(0, 120) + '…' : shortMsg;
+            }
+            infoEl.textContent = msg;
+            infoEl.style.color = isError ? '#f48771' : '#858585';
+        }
+        
+        function getVideoStreamStatusLine(streamType) {
+            const d = videoStreamDebug[streamType] || {};
+            const sps = !!h264SPSByStream[streamType];
+            const pps = !!h264PPSByStream[streamType];
+            const dec = videoDecodersByStream[streamType];
+            const decState = dec ? dec.state : '未创建';
+            const frames = videoFrameCountByStream[streamType] || 0;
+            const sent = d.framesSentToDecoder || 0;
+            const errRaw = d.lastError ? ' 错误: ' + d.lastError : '';
+            const err = errRaw.length > 100 ? errRaw.slice(0, 100) + '…' : errRaw;
+            return `SPS:${sps ? '✓' : '✗'} PPS:${pps ? '✓' : '✗'} 解码器:${decState} 已送帧:${sent} 已解码:${frames}${err}`;
+        }
+        
+        function setAudioGainForStream(streamType, value) {
+            const g = audioGainNodes[streamType];
+            if (g) g.gain.value = value;
+        }
+        
+        function initMediaPlayerMultiStream(streams) {
+            const hasAudio = streams.indexOf('audio-a') >= 0 || streams.indexOf('audio-b') >= 0;
+            const hasVideo = streams.indexOf('video-a') >= 0 || streams.indexOf('video-b') >= 0;
+            if (hasAudio) {
+                try {
+                    if (!audioContext || audioContext.state === 'closed') {
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    if (audioContext.state === 'suspended') audioContext.resume().catch(() => {});
+                    audioBufferQueues['audio-a'] = [];
+                    audioBufferQueues['audio-b'] = [];
+                    const dest = audioContext.destination;
+                    function concatFloat32(a, b) {
+                        const c = new Float32Array(a.length + b.length);
+                        c.set(a); c.set(b, a.length);
+                        return c;
+                    }
+                    ['audio-a', 'audio-b'].forEach(st => {
+                        if (audioScriptProcessorsMulti[st]) {
+                            try { audioScriptProcessorsMulti[st].disconnect(); } catch (e) {}
+                        }
+                        const gain = audioContext.createGain();
+                        gain.gain.value = mediaMonitorMute[st] ? 0 : 1;
+                        gain.connect(dest);
+                        audioGainNodes[st] = gain;
+                        const proc = audioContext.createScriptProcessor(4096, 0, 1);
+                        const q = audioBufferQueues[st];
+                        let buf = new Float32Array(0);
+                        proc.onaudioprocess = function(e) {
+                            const out = e.outputBuffer.getChannelData(0);
+                            const len = out.length;
+                            while (buf.length < len && q.length > 0) buf = concatFloat32(buf, q.shift());
+                            if (buf.length >= len) {
+                                out.set(buf.subarray(0, len));
+                                buf = buf.subarray(len);
+                            } else {
+                                out.fill(0);
+                                if (buf.length > 0) { out.set(buf); buf = new Float32Array(0); }
+                            }
+                        };
+                        proc.connect(gain);
+                        audioScriptProcessorsMulti[st] = proc;
+                    });
+                } catch (e) { console.error('[MediaMonitor] initMediaPlayerMultiStream audio:', e); }
+            }
+            if (hasVideo) {
+                const videoUnsupported = typeof window.VideoDecoder === 'undefined';
+                ['video-a', 'video-b'].forEach(st => {
+                    h264SPSByStream[st] = null;
+                    h264PPSByStream[st] = null;
+                    lastVideoTimeByStream[st] = 0;
+                    videoFrameCountByStream[st] = 0;
+                    videoStreamDebug[st] = {};
+                    if (videoDecodersByStream[st]) {
+                        try { videoDecodersByStream[st].close(); } catch (e) {}
+                        videoDecodersByStream[st] = null;
+                    }
+                    setVideoStreamStatus(st, videoUnsupported
+                        ? '将使用 MSE 回退播放（兼容 Firefox 等）'
+                        : '等待 RTP (SPS/PPS/关键帧)…', false);
+                });
+            }
+        }
+        
+        function initMediaPlayer(streamType) {
+            const playerDiv = document.getElementById('media-monitor-player');
+            const audioEl = document.getElementById('media-monitor-audio');
+            const videoEl = document.getElementById('media-monitor-video');
+            const infoEl = document.getElementById('media-monitor-player-info');
+            
+            playerDiv.style.display = 'block';
+            
+            if (streamType.startsWith('audio')) {
+                // 音频播放：使用Web Audio API
+                audioEl.style.display = 'block';
+                videoEl.style.display = 'none';
+                infoEl.textContent = '音频流：正在接收RTP包，解码中...';
+                
+                try {
+                    // 如果audioContext已关闭或不存在，重新创建
+                    if (!audioContext || audioContext.state === 'closed') {
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    // 如果audioContext被暂停，恢复它
+                    if (audioContext.state === 'suspended') {
+                        audioContext.resume().catch(e => {
+                            console.error('[MediaMonitor] 恢复AudioContext失败:', e);
+                        });
+                    }
+                    
+                    mediaPlayerAudio = audioEl;
+                    // 如果队列已存在，清空它（切换流时）
+                    if (!audioBufferQueue) {
+                        audioBufferQueue = [];
+                    } else {
+                        audioBufferQueue.length = 0; // 清空队列
+                    }
+                    audioPlaybackTime = 0;
+                    
+                    // 如果ScriptProcessorNode已存在，先断开
+                    if (audioScriptProcessor) {
+                        try {
+                            audioScriptProcessor.disconnect();
+                        } catch (e) {}
+                    }
+                    
+                    // 使用ScriptProcessorNode进行连续播放
+                    // 注意：ScriptProcessorNode已废弃，但对于简单场景仍然可用
+                    const bufferSize = 4096;
+                    audioScriptProcessor = audioContext.createScriptProcessor(bufferSize, 0, 1);
+                    
+                    // 使用一个连续的Float32Array缓冲区来累积音频数据
+                    let audioBuffer = new Float32Array(0);
+                    
+                    audioScriptProcessor.onaudioprocess = function(e) {
+                        const output = e.outputBuffer.getChannelData(0);
+                        const outputLength = output.length;
+                        
+                        // 如果缓冲区数据不足，尝试从队列获取更多数据
+                        while (audioBuffer.length < outputLength && audioBufferQueue.length > 0) {
+                            const newSamples = audioBufferQueue.shift();
+                            const combined = new Float32Array(audioBuffer.length + newSamples.length);
+                            combined.set(audioBuffer);
+                            combined.set(newSamples, audioBuffer.length);
+                            audioBuffer = combined;
+                        }
+                        
+                        // 填充输出缓冲区
+                        if (audioBuffer.length >= outputLength) {
+                            // 有足够的数据，复制到输出
+                            output.set(audioBuffer.subarray(0, outputLength));
+                            // 保留剩余数据
+                            audioBuffer = audioBuffer.subarray(outputLength);
+                        } else {
+                            // 数据不足，填充静音
+                            output.fill(0);
+                            // 如果有一些数据，先填充它们
+                            if (audioBuffer.length > 0) {
+                                output.set(audioBuffer);
+                                audioBuffer = new Float32Array(0);
+                            }
+                        }
+                    };
+                    
+                    audioScriptProcessor.connect(audioContext.destination);
+                    isPlayingAudio = true;
+                } catch (e) {
+                    console.error('[MediaMonitor] 初始化音频上下文失败:', e);
+                    infoEl.textContent = '音频播放器初始化失败: ' + e.message;
+                }
+            } else if (streamType.startsWith('video')) {
+                audioEl.style.display = 'none';
+                videoEl.style.display = 'none';
+                const canvasEl = document.getElementById('media-monitor-video-canvas');
+                if (canvasEl) {
+                    canvasEl.style.display = 'block';
+                    canvasEl.width = 640;
+                    canvasEl.height = 480;
+                    videoCanvas = canvasEl;
+                    videoCtx = canvasEl.getContext('2d');
+                }
+                videoFrameCount = 0;
+                h264SPS = null;
+                h264PPS = null;
+                h264FUABuffer = null;
+                if (videoDecoder) {
+                    try { videoDecoder.close(); } catch (e) {}
+                    videoDecoder = null;
+                }
+                if (typeof VideoDecoder === 'undefined') {
+                    infoEl.textContent = '视频流：当前浏览器不支持 WebCodecs，无法解码 H.264 画面（请使用 Chrome/Edge）';
+                } else {
+                    infoEl.textContent = '视频流：等待 SPS/PPS 与关键帧…';
+                }
+            }
+        }
+        
+        function cleanupMediaPlayer() {
+            if (audioScriptProcessor) {
+                try { audioScriptProcessor.disconnect(); } catch (e) {}
+                audioScriptProcessor = null;
+            }
+            ['audio-a','audio-b'].forEach(st => {
+                if (audioScriptProcessorsMulti[st]) {
+                    try { audioScriptProcessorsMulti[st].disconnect(); } catch (e) {}
+                    audioScriptProcessorsMulti[st] = null;
+                }
+                if (audioBufferQueues[st]) audioBufferQueues[st].length = 0;
+            });
+            if (audioContext && audioContext.state !== 'closed') {
+                audioContext.close().catch(() => {});
+            }
+            audioContext = null;
+            audioBufferQueue = [];
+            isPlayingAudio = false;
+            
+            if (mediaSource && mediaSource.readyState === 'open') {
+                try { mediaSource.endOfStream(); } catch (e) {}
+            }
+            mediaSource = null;
+            sourceBuffer = null;
+            videoChunks = [];
+            h264SPS = null;
+            h264PPS = null;
+            h264FUABuffer = null;
+            if (videoDecoder) {
+                try { videoDecoder.close(); } catch (e) {}
+                videoDecoder = null;
+            }
+            ['video-a','video-b'].forEach(st => {
+                if (videoDecodersByStream[st]) {
+                    try { videoDecodersByStream[st].close(); } catch (e) {}
+                    videoDecodersByStream[st] = null;
+                    videoDecoderHasReceivedKeyframeByStream[st] = false;
+                }
+                var mseVideo = mseVideoElByStream[st];
+                var ms = mseMediaSourceByStream[st];
+                mseMediaSourceByStream[st] = null;
+                mseSourceBufferByStream[st] = null;
+                mseVideoElByStream[st] = null;
+                mseAppendQueueByStream[st] = [];
+                mseInvalidErrorShownAtByStream[st] = 0;
+                h264SPSByStream[st] = null;
+                h264PPSByStream[st] = null;
+                if (mseVideo && mseVideo.src) {
+                    try { URL.revokeObjectURL(mseVideo.src); } catch (e) {}
+                    mseVideo.removeAttribute('src');
+                    mseVideo.style.display = 'none';
+                }
+                if (ms && ms.readyState === 'open') {
+                    try { ms.endOfStream(); } catch (e) {}
+                }
+            });
+            if (window.h264FUABufferByStream) window.h264FUABufferByStream = {};
+            const canvasEl = document.getElementById('media-monitor-video-canvas');
+            if (canvasEl) canvasEl.style.display = 'none';
+            videoCanvas = null;
+            videoCtx = null;
+        }
+        
+        // G.711解码表（μ-law和A-law）- 使用标准的ITU-T G.711解码算法
+        const G711_ULAW_TABLE = new Int16Array(256);
+        const G711_ALAW_TABLE = new Int16Array(256);
+        
+        // 初始化μ-law解码表（ITU-T G.711标准）
+        // μ-law解码：反转所有位，提取符号、指数和尾数
+        for (let i = 0; i < 256; i++) {
+            const reversed = (~i) & 0xFF;
+            const sign = (reversed & 0x80) ? -1 : 1;
+            const exponent = (reversed >> 4) & 0x07;
+            const mantissa = (reversed & 0x0F) | 0x10;
+            
+            // 标准μ-law解码公式
+            let value = ((mantissa << (exponent + 3)) - 0x84) << 2;
+            G711_ULAW_TABLE[i] = sign * value;
+        }
+        
+        // 初始化A-law解码表（ITU-T G.711标准）
+        // A-law解码：反转偶数位（0,2,4,6位）
+        for (let i = 0; i < 256; i++) {
+            const reversed = i ^ 0x55;
+            const sign = (reversed & 0x80) ? -1 : 1;
+            const exponent = (reversed >> 4) & 0x07;
+            const mantissa = reversed & 0x0F;
+            
+            let value;
+            if (exponent === 0) {
+                value = (mantissa << 4) + 8;
+            } else {
+                value = ((mantissa << 4) + 0x108) << (exponent - 1);
+            }
+            G711_ALAW_TABLE[i] = sign * value;
+        }
+        
+        // 音频重采样：从8kHz到44.1kHz
+        function resampleAudio8kTo44k(inputData, inputSampleRate, outputSampleRate) {
+            const ratio = outputSampleRate / inputSampleRate;
+            const outputLength = Math.floor(inputData.length * ratio);
+            const outputData = new Float32Array(outputLength);
+            
+            for (let i = 0; i < outputLength; i++) {
+                const srcIndex = i / ratio;
+                const srcIndexFloor = Math.floor(srcIndex);
+                const srcIndexCeil = Math.min(srcIndexFloor + 1, inputData.length - 1);
+                const t = srcIndex - srcIndexFloor;
+                
+                // 线性插值
+                outputData[i] = inputData[srcIndexFloor] * (1 - t) + inputData[srcIndexCeil] * t;
+            }
+            
+            return outputData;
+        }
+        
+        // G.711解码
+        function decodeG711(payload, codec) {
+            const samples = new Int16Array(payload.length);
+            const table = (codec === 'PCMU' || codec === '0') ? G711_ULAW_TABLE : G711_ALAW_TABLE;
+            
+            // 解码每个字节
+            for (let i = 0; i < payload.length; i++) {
+                samples[i] = table[payload[i]];
+            }
+            
+            // 转换为Float32（-1.0到1.0范围），确保值在有效范围内
+            const floatSamples = new Float32Array(samples.length);
+            for (let i = 0; i < samples.length; i++) {
+                // 限制在-32768到32767范围内，然后归一化到-1.0到1.0
+                let sample = Math.max(-32768, Math.min(32767, samples[i]));
+                floatSamples[i] = sample / 32768.0;
+            }
+            
+            return floatSamples;
+        }
+        
+        // 从 SPS+PPS 构建 AVCDecoderConfigurationRecord（avcC），供 WebCodecs 或 fMP4 使用
+        function buildAvcC(sps, pps) {
+            if (!sps || !pps || sps.length < 4 || pps.length < 1) return new Uint8Array(0);
+            const spsLen = sps.length;
+            const ppsLen = pps.length;
+            const buf = new ArrayBuffer(11 + spsLen + ppsLen);
+            const v = new DataView(buf);
+            let o = 0;
+            v.setUint8(o++, 1);
+            v.setUint8(o++, sps[1]);
+            v.setUint8(o++, sps[2]);
+            v.setUint8(o++, sps[3]);
+            v.setUint8(o++, 0xFF);
+            v.setUint8(o++, 0xE1);
+            v.setUint16(o, spsLen, false); o += 2;
+            new Uint8Array(buf).set(sps, o); o += spsLen;
+            v.setUint8(o++, 1);
+            v.setUint16(o, ppsLen, false); o += 2;
+            new Uint8Array(buf).set(pps, o);
+            return new Uint8Array(buf);
+        }
+        
+        // ---------- MSE 回退：无 WebCodecs 时用 Media Source Extensions 播放 H.264（兼容 Firefox 等） ----------
+        let mseMediaSourceByStream = {};
+        let mseSourceBufferByStream = {};
+        let mseVideoElByStream = {};
+        let mseAppendPendingByStream = {};
+        let mseAppendQueueByStream = {};
+        let msePendingNalsByStream = {};  // MSE 未就绪时暂存 NAL，避免丢失首帧/关键帧
+        let mseBackendPendingFragmentsByStream = {};  // 后台 fMP4：SourceBuffer 未就绪时暂存 fragment
+        let mseSequenceByStream = {};
+        let mseDtsByStream = {};
+        let mseInvalidErrorShownAtByStream = {};
+        let mseDidPlayByStream = {};
+        let mseHasAppendedKeyframeByStream = {};  // 未 append 关键帧前不 append P 帧，避免浏览器报错导致反复重建 MediaSource
+        let videoDecoderHasReceivedKeyframeByStream = {};  // WebCodecs：未送关键帧前不送 P 帧，避免 "Key frame is required" / bitstream buffer 报错
+        let mseInitLoggedByStream = {};
+        let mseSourceOpenLoggedByStream = {};
+        let mseSPSLoggedByStream = {};
+        let msePPSLoggedByStream = {};
+        
+        function writeU32BE(arr, offset, val) {
+            arr[offset]= (val >>> 24) & 0xff;
+            arr[offset+1]=(val >>> 16) & 0xff;
+            arr[offset+2]=(val >>> 8) & 0xff;
+            arr[offset+3]= val & 0xff;
+        }
+        function writeBox(arr, offset, type, payload) {
+            const len = 8 + (payload ? payload.length : 0);
+            if (offset + len > arr.length) {
+                throw new Error('writeBox overflow: type=' + type + ' offset=' + offset + ' len=' + len + ' arr.length=' + arr.length);
+            }
+            writeU32BE(arr, offset, len);
+            arr[offset+4]=type.charCodeAt(0); arr[offset+5]=type.charCodeAt(1);
+            arr[offset+6]=type.charCodeAt(2); arr[offset+7]=type.charCodeAt(3);
+            if (payload) arr.set(payload, offset + 8);
+            return offset + len;
+        }
+        function buildMp4InitSegment(sps, pps) {
+            if (!sps || !pps || sps.length < 4 || pps.length < 1) {
+                if (typeof console !== 'undefined' && console.warn) console.warn('[MSE-init] buildMp4InitSegment: 无效 SPS/PPS', 'sps.len=', sps && sps.length, 'pps.len=', pps && pps.length);
+                return new Uint8Array(0);
+            }
+            if (sps.length < 7 || pps.length < 4) {
+                if (typeof console !== 'undefined' && console.warn) console.warn('[MSE-init] SPS/PPS 过短，等待完整参数 sps.len=', sps.length, 'pps.len=', pps.length);
+                return new Uint8Array(0);
+            }
+            const avcC = buildAvcC(sps, pps);
+            if (!avcC || avcC.length === 0) return new Uint8Array(0);
+            const codec = 'avc1.' + [sps[1],sps[2],sps[3]].map(function(x){return x.toString(16).padStart(2,'0');}).join('');
+            const avcCBox = new Uint8Array(8 + avcC.length);
+            writeU32BE(avcCBox, 0, 8 + avcC.length);
+            avcCBox[4]=0x61; avcCBox[5]=0x76; avcCBox[6]=0x63; avcCBox[7]=0x43;
+            avcCBox.set(avcC, 8);
+            const avc1Payload = new Uint8Array(86 + avcCBox.length);
+            avc1Payload.set(new Uint8Array([
+                0,0,0,0,0,0,0,1, 0,0,0,0,0,0,0,0,
+                0,0,0,0, 0x02,0x80, 0x01,0xe0, 0,0,0,0,0,0,0,0,
+                0,0,0,0, 0,0,0,0, 0,0,0,0,
+                0x00,0x48,0x00,0x00, 0x00,0x48,0x00,0x00, 0,0,0,0,
+                0x00,0x06,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+                0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+                0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00
+            ]), 0);
+            avc1Payload.set(avcCBox, 86);
+            const stsdPayload = new Uint8Array(8 + 8 + avc1Payload.length);
+            stsdPayload[0]=0; stsdPayload[1]=0; stsdPayload[2]=0; stsdPayload[3]=0;
+            writeU32BE(stsdPayload, 4, 1);
+            stsdPayload.set(avc1Payload, 8);
+            const stsdBoxLen = 8 + stsdPayload.length;
+            var sttsPayload = new Uint8Array([0,0,0,0, 0,0,0,0, 0,0,0,0]);
+            var stscPayload = new Uint8Array([0,0,0,0, 0,0,0,0, 0,0,0,0]);
+            var stszPayload = new Uint8Array([0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0]);
+            var stcoPayload = new Uint8Array([0,0,0,0, 0,0,0,0]);
+            const stbl = new Uint8Array(8 + stsdBoxLen + (8+sttsPayload.length) + (8+stscPayload.length) + (8+stszPayload.length) + (8+stcoPayload.length));
+            let off = 0;
+            off = writeBox(stbl, off, 'stsd', stsdPayload);
+            off = writeBox(stbl, off, 'stts', sttsPayload);
+            off = writeBox(stbl, off, 'stsc', stscPayload);
+            off = writeBox(stbl, off, 'stsz', stszPayload);
+            off = writeBox(stbl, off, 'stco', stcoPayload);
+            const drefPayload = new Uint8Array([0,0,0,0, 0,0,0,1, 0,0,0,0x0c, 0x75,0x72,0x6c,0x20, 0,0,0,1]);
+            const drefBox = new Uint8Array(8 + drefPayload.length);
+            writeBox(drefBox, 0, 'dref', drefPayload);
+            const dinf = new Uint8Array(8 + drefBox.length);
+            writeBox(dinf, 0, 'dinf', drefBox);
+            const minf = new Uint8Array(20 + dinf.length + 8 + stbl.length);
+            off = 0;
+            off = writeBox(minf, off, 'vmhd', new Uint8Array([0,0,0,1, 0,0,0,0, 0,0,0,0]));
+            minf.set(dinf, off); off += dinf.length;
+            writeU32BE(minf, off, stbl.length); minf[off+4]=0x73; minf[off+5]=0x74; minf[off+6]=0x62; minf[off+7]=0x6c; off += 8;
+            minf.set(stbl, off);
+            const hdlrPayload = new Uint8Array([0,0,0,0, 0,0,0,0, 0x76,0x69,0x64,0x65, 0,0,0,0,0,0,0,0,0,0,0,0, 0x56,0x69,0x64,0x65,0x6f,0x48,0x61,0x6e,0x64,0x6c,0x65,0x72,0x00]);
+            const mdia = new Uint8Array(8 + 32 + (8 + hdlrPayload.length) + (8 + minf.length));
+            off = 0;
+            const mdhd = new Uint8Array(32);
+            mdhd[0]=0; mdhd[1]=0; mdhd[2]=0; mdhd[3]=0;
+            writeU32BE(mdhd,4, 0); writeU32BE(mdhd,8, 0); writeU32BE(mdhd,12, 90000); writeU32BE(mdhd,16, 0);
+            mdhd[20]=0x55; mdhd[21]=0xc4; writeU32BE(mdhd,22, 0);
+            off = writeBox(mdia, off, 'mdhd', mdhd);
+            off = writeBox(mdia, off, 'hdlr', hdlrPayload);
+            off = writeBox(mdia, off, 'minf', minf);
+            const trak = new Uint8Array(8 + 92 + 8 + mdia.length);
+            off = 0;
+            const tkhd = new Uint8Array(92);
+            tkhd[0]=0; tkhd[4]=0; tkhd[5]=0; tkhd[6]=0x03;
+            writeU32BE(tkhd,12, 1); writeU32BE(tkhd,20, 0); writeU32BE(tkhd,28, 1);
+            writeU32BE(tkhd,36, 0); writeU32BE(tkhd,40, 0); writeU32BE(tkhd,44, 0);
+            writeU32BE(tkhd,48, 0x00010000); writeU32BE(tkhd,52, 0); writeU32BE(tkhd,56, 0);
+            writeU32BE(tkhd,60, 0); writeU32BE(tkhd,64, 0x00010000); writeU32BE(tkhd,68, 0);
+            writeU32BE(tkhd,72, 0x0140); writeU32BE(tkhd,76, 0x00e0); writeU32BE(tkhd,80, 0);
+            off = writeBox(trak, off, 'tkhd', tkhd);
+            off = writeBox(trak, off, 'mdia', mdia);
+            const mvex = new Uint8Array(8 + 8 + 32);
+            writeBox(mvex, 0, 'trex', new Uint8Array([0,0,0,0, 0,0,0,1, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0]));
+            const mvhd = new Uint8Array(108);
+            mvhd[0]=0; writeU32BE(mvhd,4, 0); writeU32BE(mvhd,8, 0); writeU32BE(mvhd,12, 90000);
+            writeU32BE(mvhd,16, 0); writeU32BE(mvhd,20, 0x10000); writeU32BE(mvhd,24, 0x100);
+            writeU32BE(mvhd,28, 0); writeU32BE(mvhd,32, 2); writeU32BE(mvhd,36, 0);
+            writeU32BE(mvhd,40, 0); writeU32BE(mvhd,44, 0); writeU32BE(mvhd,48, 0);
+            writeU32BE(mvhd,52, 0x00010000); writeU32BE(mvhd,56, 0); writeU32BE(mvhd,60, 0);
+            writeU32BE(mvhd,64, 0); writeU32BE(mvhd,68, 0x00010000); writeU32BE(mvhd,72, 0);
+            writeU32BE(mvhd,76, 0); writeU32BE(mvhd,80, 0x40); writeU32BE(mvhd,84, 0); writeU32BE(mvhd,88, 0xe0);
+            const moov = new Uint8Array(8 + (8 + 108) + mvex.length + (8 + trak.length));
+            off = 0;
+            off = writeBox(moov, off, 'mvhd', mvhd);
+            off = writeBox(moov, off, 'mvex', mvex);
+            off = writeBox(moov, off, 'trak', trak);
+            const ftypPayload = new Uint8Array([0x69,0x73,0x6f,0x6d, 0,0,0,1, 0x69,0x73,0x6f,0x6d, 0x69,0x73,0x6f,0x35, 0x6d,0x70,0x34,0x31]);
+            const ftyp = new Uint8Array(8 + ftypPayload.length);
+            writeBox(ftyp, 0, 'ftyp', ftypPayload);
+            const out = new Uint8Array(ftyp.length + 8 + moov.length);
+            out.set(ftyp, 0);
+            writeBox(out, ftyp.length, 'moov', moov);
+            return out;
+        }
+        function buildMp4Fragment(nalBytes, dts, isKeyframe) {
+            const len = nalBytes.length;
+            const sampleSize = 4 + len;
+            const mdatLen = 8 + sampleSize;
+            const mdat = new Uint8Array(mdatLen);
+            writeU32BE(mdat, 0, mdatLen);
+            mdat[4]=0x6d; mdat[5]=0x64; mdat[6]=0x61; mdat[7]=0x74;
+            writeU32BE(mdat, 8, len);
+            mdat.set(nalBytes, 12);
+            const sampleDuration = 3000;
+            const trun = new Uint8Array(8 + 4 + 4 + 4 + 4 + 4 + 4);
+            writeU32BE(trun, 0, 8 + 4 + 4 + 4 + 4 + 4 + 4);
+            trun[4]=0x74; trun[5]=0x72; trun[6]=0x75; trun[7]=0x6e;
+            trun[8]=0; trun[9]=0; trun[10]=0x0f; trun[11]=0x01;
+            writeU32BE(trun, 12, 1);
+            writeU32BE(trun, 16, 0);
+            writeU32BE(trun, 20, isKeyframe ? 0x02000000 : 0);
+            writeU32BE(trun, 24, sampleDuration);
+            writeU32BE(trun, 28, sampleSize);
+            const tfhd = new Uint8Array(8 + 16);
+            writeU32BE(tfhd, 0, 8 + 16);
+            tfhd[4]=0x74; tfhd[5]=0x66; tfhd[6]=0x68; tfhd[7]=0x64;
+            tfhd[8]=0; tfhd[9]=0; tfhd[10]=0; tfhd[11]=0x2e;
+            writeU32BE(tfhd, 12, 1);
+            writeU32BE(tfhd, 16, 1);
+            const tfdt = new Uint8Array(8 + 8);
+            writeU32BE(tfdt, 0, 8 + 8);
+            tfdt[4]=0x74; tfdt[5]=0x66; tfdt[6]=0x64; tfdt[7]=0x74;
+            tfdt[8]=0; tfdt[9]=0; tfdt[10]=0; tfdt[11]=0x01;
+            writeU32BE(tfdt, 12, Math.round(dts));
+            // writeBox 每次写入 8(头) + payload.length，故 traf 总长 = 三盒之和
+            const traf = new Uint8Array((8 + tfhd.length) + (8 + tfdt.length) + (8 + trun.length));
+            off = 0;
+            off = writeBox(traf, off, 'tfhd', tfhd);
+            off = writeBox(traf, off, 'tfdt', tfdt);
+            off = writeBox(traf, off, 'trun', trun);
+            const mfhd = new Uint8Array(8 + 4);
+            writeU32BE(mfhd, 0, 12);
+            mfhd[4]=0x6d; mfhd[5]=0x66; mfhd[6]=0x68; mfhd[7]=0x64;
+            writeU32BE(mfhd, 8, 0);
+            // moof = box_header(8) + mfhd_box(8+4) + traf_box(8+traf.length)，避免 writeBox 越界
+            const moof = new Uint8Array(8 + (8 + mfhd.length) + (8 + traf.length));
+            let moofOff = writeBox(moof, 0, 'mfhd', mfhd);
+            moofOff = writeBox(moof, moofOff, 'traf', traf);
+            // trun data_offset：从段首到 mdat 内首字节（mdat 头 8 字节后），= moof.length + 8
+            const trunStartInMoof = 8 + (8 + mfhd.length) + 8 + tfhd.length + 8 + tfdt.length + 8;
+            writeU32BE(moof, trunStartInMoof + 16, moof.length + 8);
+            const out = new Uint8Array(moof.length + mdat.length);
+            out.set(moof, 0);
+            out.set(mdat, moof.length);
+            return out;
+        }
+        function initMSEForStream(streamType) {
+            if (mseSourceBufferByStream[streamType]) return;
+            var existing = mseMediaSourceByStream[streamType];
+            if (existing) {
+                if (existing.readyState === 'open' || existing.readyState === 'ended') return;
+                if (existing.readyState === 'closed') return;
+                mseMediaSourceByStream[streamType] = null;
+            }
+            const sps = h264SPSByStream[streamType];
+            const pps = h264PPSByStream[streamType];
+            if (!sps || !pps) return;
+            const codec = 'avc1.' + [sps[1],sps[2],sps[3]].map(function(x){return x.toString(16).padStart(2,'0');}).join('');
+            const wrap = document.getElementById('panel-body-' + streamType);
+            const canvasEl = document.getElementById('media-monitor-canvas-' + streamType);
+            let videoEl = document.getElementById('media-monitor-mse-video-' + streamType);
+            if (!videoEl && wrap) {
+                videoEl = document.createElement('video');
+                videoEl.id = 'media-monitor-mse-video-' + streamType;
+                videoEl.className = 'media-monitor-canvas';
+                videoEl.setAttribute('playsinline', '');
+                videoEl.setAttribute('muted', '');
+                videoEl.style.maxWidth = '100%'; videoEl.style.maxHeight = '180px'; videoEl.style.background = '#1e1e1e';
+                wrap.insertBefore(videoEl, wrap.firstChild);
+            }
+            if (!videoEl) return;
+            if (canvasEl) canvasEl.style.display = 'none';
+            videoEl.style.display = 'block';
+            const ms = new MediaSource();
+            mseMediaSourceByStream[streamType] = ms;
+            mseHasAppendedKeyframeByStream[streamType] = false;
+            mseVideoElByStream[streamType] = videoEl;
+            mseDidPlayByStream[streamType] = false;
+            mseSequenceByStream[streamType] = 0;
+            mseDtsByStream[streamType] = 0;
+            mseAppendPendingByStream[streamType] = false;
+            const url = URL.createObjectURL(ms);
+            videoEl.src = url;
+            ms.addEventListener('sourceopen', function() {
+                try {
+                    if (ms.readyState !== 'open' || mseMediaSourceByStream[streamType] !== ms) return;
+                    if (mseSourceBufferByStream[streamType]) return;
+                    if (!mseSourceOpenLoggedByStream[streamType]) { mseSourceOpenLoggedByStream[streamType] = true; console.debug('[MSE-init] sourceopen', streamType, 'codec=', codec); }
+                    const sb = ms.addSourceBuffer('video/mp4; codecs="' + codec + '"');
+                    if (mseMediaSourceByStream[streamType] !== ms) return;
+                    mseSourceBufferByStream[streamType] = sb;
+                    sb.mode = 'segments';
+                    const init = buildMp4InitSegment(sps, pps);
+                    if (!init || init.length === 0) {
+                        setVideoStreamStatus(streamType, 'MSE 等待完整 SPS/PPS（当前过短）', true);
+                        return;
+                    }
+                    sb.appendBuffer(new Uint8Array(init));
+                    setVideoStreamStatus(streamType, 'MSE 已就绪 (' + codec + ')，等待关键帧', false);
+                    sb.addEventListener('updateend', function onInitEnd() {
+                        sb.removeEventListener('updateend', onInitEnd);
+                        var pending = msePendingNalsByStream[streamType];
+                        if (!mseAppendQueueByStream[streamType]) mseAppendQueueByStream[streamType] = [];
+                        if (pending && pending.length) {
+                            for (var i = 0; i < pending.length; i++) mseAppendQueueByStream[streamType].push({ nal: pending[i].nal, key: pending[i].isKeyframe });
+                            msePendingNalsByStream[streamType] = [];
+                            var q = mseAppendQueueByStream[streamType];
+                            var keyIdx = -1;
+                            for (var k = 0; k < q.length; k++) { if (q[k].key) { keyIdx = k; break; } }
+                            if (keyIdx > 0) {
+                                var keyItem = q[keyIdx];
+                                for (var j = keyIdx; j > 0; j--) q[j] = q[j-1];
+                                q[0] = keyItem;
+                            }
+                            var first = q.shift();
+                            if (typeof console !== 'undefined' && console.log) console.log('[MSE-init] flush pending', streamType, 'count=', pending.length, 'keyframeIdx=', keyIdx, 'firstKey=', !!first && first.key);
+                            if (first && first.key) {
+                                appendMSEFragment(streamType, first.nal, first.key);
+                            } else if (first) {
+                                q.unshift(first);
+                                if (typeof console !== 'undefined' && console.warn) console.warn('[MSE-init] 无关键帧，等待关键帧后再播', streamType);
+                            } else if (typeof console !== 'undefined' && console.warn) console.warn('[MSE-init] init updateend 无待播 NAL', streamType);
+                        }
+                    });
+                } catch (e) {
+                    var msg = (e && (e.message || e.messageDetail || String(e))) || '未知';
+                    console.error('[MSE-init] SourceBuffer 失败:', streamType, 'codec=', codec, 'sps.len=', (sps&&sps.length), 'pps.len=', (pps&&pps.length), 'error=', msg, e);
+                    if (e && e.stack) console.error('[MSE-init] stack:', e.stack);
+                    setVideoStreamStatus(streamType, 'MSE 添加 SourceBuffer 失败: ' + msg, true);
+                }
+            });
+        }
+        function appendMSEFragment(streamType, nalWithoutStartCode, isKeyframe) {
+            const sb = mseSourceBufferByStream[streamType];
+            const ms = mseMediaSourceByStream[streamType];
+            if (!sb || !ms || ms.readyState !== 'open') {
+                if (sb || ms) {
+                    mseSourceBufferByStream[streamType] = null;
+                    if (ms && (ms.readyState === 'closed' || ms.readyState === 'ended')) mseMediaSourceByStream[streamType] = null;
+                }
+                return;
+            }
+            if (!mseAppendQueueByStream[streamType]) mseAppendQueueByStream[streamType] = [];
+            if (sb.updating) {
+                mseAppendQueueByStream[streamType].push({ nal: nalWithoutStartCode, key: isKeyframe });
+                return;
+            }
+            const dts = mseDtsByStream[streamType] || 0;
+            mseDtsByStream[streamType] = dts + 3000;
+            mseSequenceByStream[streamType] = (mseSequenceByStream[streamType] || 0) + 1;
+            const frag = buildMp4Fragment(nalWithoutStartCode, dts, isKeyframe);
+            try {
+                sb.appendBuffer(new Uint8Array(frag));
+                if (isKeyframe) mseHasAppendedKeyframeByStream[streamType] = true;
+                if (isKeyframe) {
+                    var v = mseVideoElByStream[streamType];
+                    if (v && !mseDidPlayByStream[streamType]) { mseDidPlayByStream[streamType] = true; v.play().catch(function(){}); }
+                }
+            } catch (e) {
+                var msg = (e && (e.message || e.messageDetail || String(e))) || '未知';
+                console.error('[MSE-frag] appendBuffer 失败:', streamType, 'error=', msg, 'frag.len=', frag.length, 'nal.len=', nalWithoutStartCode.length, 'isKeyframe=', isKeyframe);
+                if (e && e.stack) console.error('[MSE-frag] stack:', e.stack);
+                mseSourceBufferByStream[streamType] = null;
+                if (ms.readyState !== 'open') mseMediaSourceByStream[streamType] = null;
+                var last = mseInvalidErrorShownAtByStream[streamType] || 0;
+                if (Date.now() - last > 5000) {
+                    mseInvalidErrorShownAtByStream[streamType] = Date.now();
+                    setVideoStreamStatus(streamType, 'MSE 已关闭或失效，需重新收关键帧: ' + msg, true);
+                }
+                return;
+            }
+            videoFrameCountByStream[streamType] = (videoFrameCountByStream[streamType] || 0) + 1;
+            const n = videoFrameCountByStream[streamType] || 0;
+            if (n <= 3 || n % 15 === 0) setVideoStreamStatus(streamType, 'MSE 已解码 ' + n + ' 帧', false);
+            sb.addEventListener('updateend', function onEnd() {
+                sb.removeEventListener('updateend', onEnd);
+                const q = mseAppendQueueByStream[streamType];
+                if (q && q.length) {
+                    const next = q.shift();
+                    appendMSEFragment(streamType, next.nal, next.key);
+                }
+            }, { once: true });
+        }
+        /** 后端直接下发 fMP4 init：创建 MSE 并 append 后台打包的 init，无需前端解析 SPS/PPS */
+        function initMSEForStreamWithBackendInit(streamType, initBase64, codecFromBackend) {
+            const initBytes = Uint8Array.from(atob(initBase64), function(c){ return c.charCodeAt(0); });
+            if (!initBytes || initBytes.length === 0) return;
+            if (mseSourceBufferByStream[streamType]) {
+                try { mseSourceBufferByStream[streamType].appendBuffer(initBytes); } catch (e) { console.warn('[MSE-backend] 重复 init 忽略', e); }
+                return;
+            }
+            var existing = mseMediaSourceByStream[streamType];
+            if (existing && (existing.readyState === 'open' || existing.readyState === 'ended')) return;
+            if (existing && existing.readyState === 'closed') mseMediaSourceByStream[streamType] = null;
+            const codec = (codecFromBackend && /^avc1\.[0-9a-fA-F]{6}$/.test(codecFromBackend)) ? codecFromBackend : 'avc1.42001e';
+            const wrap = document.getElementById('panel-body-' + streamType);
+            const canvasEl = document.getElementById('media-monitor-canvas-' + streamType);
+            let videoEl = document.getElementById('media-monitor-mse-video-' + streamType);
+            if (!videoEl && wrap) {
+                videoEl = document.createElement('video');
+                videoEl.id = 'media-monitor-mse-video-' + streamType;
+                videoEl.className = 'media-monitor-canvas';
+                videoEl.setAttribute('playsinline', '');
+                videoEl.setAttribute('muted', '');
+                videoEl.style.maxWidth = '100%'; videoEl.style.maxHeight = '180px'; videoEl.style.background = '#1e1e1e';
+                wrap.insertBefore(videoEl, wrap.firstChild);
+            }
+            if (!videoEl) return;
+            if (canvasEl) canvasEl.style.display = 'none';
+            videoEl.style.display = 'block';
+            const ms = new MediaSource();
+            const url = URL.createObjectURL(ms);
+            videoEl.src = url;
+            mseMediaSourceByStream[streamType] = ms;
+            mseVideoElByStream[streamType] = videoEl;
+            mseDidPlayByStream[streamType] = false;
+            mseSequenceByStream[streamType] = 0;
+            mseDtsByStream[streamType] = 0;
+            ms.addEventListener('sourceopen', function() {
+                try {
+                    if (ms.readyState !== 'open' || mseMediaSourceByStream[streamType] !== ms) return;
+                    if (mseSourceBufferByStream[streamType]) return;
+                    if (!mseSourceOpenLoggedByStream[streamType]) { mseSourceOpenLoggedByStream[streamType] = true; console.debug('[MSE-init] sourceopen (backend)', streamType); }
+                    const sb = ms.addSourceBuffer('video/mp4; codecs="' + codec + '"');
+                    if (mseMediaSourceByStream[streamType] !== ms) return;
+                    mseSourceBufferByStream[streamType] = sb;
+                    sb.mode = 'segments';
+                    sb.appendBuffer(initBytes);
+                    setVideoStreamStatus(streamType, 'MSE 已就绪 (后台 fMP4)，等待关键帧', false);
+                    var videoElForPlay = videoEl;
+                    setTimeout(function() {
+                        if (videoElForPlay && !mseDidPlayByStream[streamType] && mseSourceBufferByStream[streamType]) {
+                            mseDidPlayByStream[streamType] = true;
+                            videoElForPlay.play().catch(function(){});
+                        }
+                    }, 1500);
+                    sb.addEventListener('updateend', function onInitEnd() {
+                        sb.removeEventListener('updateend', onInitEnd);
+                        var pending = mseBackendPendingFragmentsByStream[streamType];
+                        var q = mseAppendQueueByStream[streamType];
+                        if (!q) q = mseAppendQueueByStream[streamType] = [];
+                        if (pending && pending.length) {
+                            if (typeof console !== 'undefined' && console.log) console.log('[MSE-backend] flush pending', streamType, 'count=', pending.length);
+                            mseBackendPendingFragmentsByStream[streamType] = [];
+                            for (var i = pending.length - 1; i >= 0; i--) q.unshift({ bytes: pending[i].bytes, key: pending[i].key });
+                        }
+                        if (q.length) {
+                            var keyIdx = -1;
+                            for (var k = 0; k < q.length; k++) { if (q[k].key) { keyIdx = k; break; } }
+                            if (keyIdx > 0) {
+                                var keyItem = q[keyIdx];
+                                for (var j = keyIdx; j > 0; j--) q[j] = q[j-1];
+                                q[0] = keyItem;
+                            }
+                            var first = q.shift();
+                            if (first) appendMSEFragmentBytesRaw(streamType, first.bytes, first.key);
+                        } else if (typeof console !== 'undefined' && console.warn) console.warn('[MSE-backend] init updateend 无待播 fragment', streamType);
+                    }, { once: true });
+                } catch (e) {
+                    var msg = (e && (e.message || e.messageDetail || String(e))) || '未知';
+                    console.error('[MSE-backend] init append 失败:', streamType, msg);
+                    setVideoStreamStatus(streamType, 'MSE init 失败: ' + msg, true);
+                }
+            });
+        }
+        /** 后端下发的 fMP4 fragment：直接 append，关键帧时触发播放 */
+        function appendMSEFragmentBytes(streamType, fragmentBase64, isKeyframe) {
+            const frag = Uint8Array.from(atob(fragmentBase64), function(c){ return c.charCodeAt(0); });
+            if (!frag || frag.length === 0) return;
+            appendMSEFragmentBytesRaw(streamType, frag, isKeyframe);
+        }
+        function appendMSEFragmentBytesRaw(streamType, frag, isKeyframe) {
+            const sb = mseSourceBufferByStream[streamType];
+            const ms = mseMediaSourceByStream[streamType];
+            if (!ms || ms.readyState !== 'open') return;
+            if (!sb) {
+                if (!mseBackendPendingFragmentsByStream[streamType]) mseBackendPendingFragmentsByStream[streamType] = [];
+                mseBackendPendingFragmentsByStream[streamType].push({ bytes: frag, key: isKeyframe });
+                if (mseBackendPendingFragmentsByStream[streamType].length > 500) mseBackendPendingFragmentsByStream[streamType].shift();
+                return;
+            }
+            if (sb.updating) {
+                if (!mseAppendQueueByStream[streamType]) mseAppendQueueByStream[streamType] = [];
+                mseAppendQueueByStream[streamType].push({ bytes: frag, key: isKeyframe });
+                return;
+            }
+            try {
+                if (typeof console !== 'undefined' && console.log && (videoFrameCountByStream[streamType] || 0) < 2) console.log('[MSE-frag] append', streamType, 'len=', frag.length);
+                sb.appendBuffer(frag);
+                videoFrameCountByStream[streamType] = (videoFrameCountByStream[streamType] || 0) + 1;
+                var n = videoFrameCountByStream[streamType] || 0;
+                if (n <= 3 || n % 15 === 0) setVideoStreamStatus(streamType, 'MSE 已解码 ' + n + ' 帧', false);
+                var v = mseVideoElByStream[streamType];
+                if (v && !mseDidPlayByStream[streamType]) {
+                    mseDidPlayByStream[streamType] = true;
+                    v.play().catch(function(){});
+                }
+            } catch (e) {
+                console.error('[MSE-frag] appendBuffer 失败:', streamType, 'len=' + (frag && frag.length), e && e.name, e && e.message);
+                setVideoStreamStatus(streamType, 'MSE append 失败: ' + (e && (e.name || e.message) || e), true);
+                sb.addEventListener('updateend', function onEnd() {
+                    sb.removeEventListener('updateend', onEnd);
+                    var q = mseAppendQueueByStream[streamType];
+                    if (q && q.length) { var next = q.shift(); if (next) appendMSEFragmentBytesRaw(streamType, next.bytes, next.key); }
+                }, { once: true });
+                return;
+            }
+            sb.addEventListener('updateend', function onEnd() {
+                sb.removeEventListener('updateend', onEnd);
+                var q = mseAppendQueueByStream[streamType];
+                if (q && q.length) {
+                    var next = q.shift();
+                    if (next && next.bytes) appendMSEFragmentBytesRaw(streamType, next.bytes, next.key);
+                    else if (next && next.nal) appendMSEFragment(streamType, next.nal, next.key);
+                }
+            }, { once: true });
+        }
+        
+        function initVideoDecoderIfReady() {
+            // 如果解码器已存在且状态正常，不重复初始化
+            if (videoDecoder && videoDecoder.state === 'configured') return;
+            // 如果解码器存在但状态异常，重置它
+            if (videoDecoder && videoDecoder.state !== 'configured') {
+                console.warn('[MediaMonitor] 解码器状态异常，重置:', videoDecoder.state);
+                try {
+                    if (videoDecoder.state === 'configured') videoDecoder.reset();
+                } catch (e) {}
+                videoDecoder = null;
+            }
+            if (!h264SPS || !h264PPS || !window.VideoDecoder) {
+                if (!window.VideoDecoder) {
+                    console.warn('[MediaMonitor] VideoDecoder API 不可用');
+                }
+                return;
+            }
+            try {
+                const description = buildAvcC(h264SPS, h264PPS);
+                console.log('[MediaMonitor] 初始化 H.264 解码器，SPS长度:', h264SPS.length, 'PPS长度:', h264PPS.length);
+                videoDecoder = new VideoDecoder({
+                    output: (frame) => {
+                        try {
+                            if (videoCtx && videoCanvas) {
+                                // 动态调整 canvas 尺寸以匹配视频帧
+                                if (videoCanvas.width !== frame.displayWidth || videoCanvas.height !== frame.displayHeight) {
+                                    videoCanvas.width = frame.displayWidth || 640;
+                                    videoCanvas.height = frame.displayHeight || 480;
+                                    console.log('[MediaMonitor] Canvas 尺寸已更新:', videoCanvas.width, 'x', videoCanvas.height);
+                                }
+                                videoCtx.drawImage(frame, 0, 0, videoCanvas.width, videoCanvas.height);
+                                videoFrameCount++;
+                                const infoEl = document.getElementById('media-monitor-player-info');
+                                if (infoEl && videoFrameCount % 30 === 0) {
+                                    infoEl.textContent = `视频流：已解码 ${videoFrameCount} 帧 (${frame.displayWidth}x${frame.displayHeight})`;
+                                }
+                            }
+                            frame.close();
+                        } catch (e) {
+                            console.error('[MediaMonitor] 绘制帧失败:', e);
+                            frame.close();
+                        }
+                    },
+                    error: (e) => {
+                        console.error('[MediaMonitor] VideoDecoder 解码错误:', e);
+                        const infoEl = document.getElementById('media-monitor-player-info');
+                        if (infoEl) infoEl.textContent = `视频流：解码错误 - ${e.message || e}`;
+                        // 解码错误时重置解码器，等待重新初始化
+                        videoDecoder = null;
+                    }
+                });
+                const profile = h264SPS[1];
+                const level = h264SPS[3];
+                const codecStr = `avc1.${profile.toString(16).padStart(2, '0')}${h264SPS[2].toString(16).padStart(2, '0')}${level.toString(16).padStart(2, '0')}`;
+                console.log('[MediaMonitor] 配置解码器，codec:', codecStr);
+                videoDecoder.configure({
+                    codec: codecStr,
+                    codedWidth: 640,  // 初始尺寸，实际会从帧中获取
+                    codedHeight: 480,
+                    description: description
+                });
+                // 配置是异步的，检查状态
+                const checkState = () => {
+                    if (videoDecoder) {
+                        console.log('[MediaMonitor] 解码器状态:', videoDecoder.state);
+                        const infoEl = document.getElementById('media-monitor-player-info');
+                        if (videoDecoder.state === 'configured') {
+                            if (infoEl) infoEl.textContent = `视频流：解码器已就绪 (${codecStr})，等待关键帧…`;
+                            console.log('[MediaMonitor] H.264 解码器已就绪:', codecStr);
+                        } else if (videoDecoder.state === 'closed') {
+                            if (infoEl) infoEl.textContent = `视频流：解码器已关闭`;
+                            videoDecoder = null;
+                        }
+                    }
+                };
+                // 延迟检查状态（配置是异步的）
+                setTimeout(checkState, 100);
+                const infoEl = document.getElementById('media-monitor-player-info');
+                if (infoEl) infoEl.textContent = `视频流：正在初始化解码器 (${codecStr})…`;
+            } catch (e) {
+                console.error('[MediaMonitor] VideoDecoder 初始化失败:', e);
+                const infoEl = document.getElementById('media-monitor-player-info');
+                if (infoEl) infoEl.textContent = `视频流：解码器初始化失败 - ${e.message || e}`;
+                videoDecoder = null;
+            }
+        }
+        
+        function decodeAndDrawH264(nalWithStartCode, timestampMs) {
+            if (!videoDecoder) {
+                console.warn('[MediaMonitor] 解码器未初始化');
+                return;
+            }
+            if (videoDecoder.state !== 'configured') {
+                console.warn('[MediaMonitor] 解码器状态不是 configured:', videoDecoder.state);
+                // 如果状态是 closed，尝试重新初始化
+                if (videoDecoder.state === 'closed') {
+                    videoDecoder = null;
+                    initVideoDecoderIfReady();
+                }
+                return;
+            }
+            const nalType = nalWithStartCode[4] !== undefined ? (nalWithStartCode[4] & 0x1F) : (nalWithStartCode[3] & 0x1F);
+            if (nalType !== 1 && nalType !== 5) {
+                console.warn('[MediaMonitor] 忽略非帧 NAL 类型:', nalType);
+                return;
+            }
+            try {
+                // WebCodecs EncodedVideoChunk 的 timestamp 是微秒
+                const timestampUs = typeof timestampMs === 'number' ? timestampMs * 1000 : Date.now() * 1000;
+                const chunk = new EncodedVideoChunk({
+                    type: nalType === 5 ? 'key' : 'delta',
+                    timestamp: timestampUs,
+                    duration: 0,
+                    data: nalWithStartCode
+                });
+                videoDecoder.decode(chunk);
+                if (nalType === 5) {
+                    console.log('[MediaMonitor] 已发送 IDR 帧到解码器');
+                }
+            } catch (e) {
+                console.error('[MediaMonitor] 解码失败:', e, 'NAL类型:', nalType, '数据长度:', nalWithStartCode.length);
+                const infoEl = document.getElementById('media-monitor-player-info');
+                if (infoEl) infoEl.textContent = `视频流：解码失败 - ${e.message || e}`;
+            }
+        }
+        
+        // H.264 NAL单元提取（支持两种格式）
+        // 1) 起始码格式：0x00 0x00 0x01 或 0x00 0x00 0x00 0x01
+        // 2) RTP 格式：无起始码，Single NAL 时首字节为 NAL 头(type=低5位)；FU-A 时首字节类型28，真实类型在 payload[1]&0x1F
+        function extractH264NALUnits(payload) {
+            const nals = [];
+            let i = 0;
+            
+            while (i < payload.length) {
+                let startCodeLen = 0;
+                if (i + 3 < payload.length && 
+                    payload[i] === 0x00 && payload[i + 1] === 0x00 && 
+                    payload[i + 2] === 0x00 && payload[i + 3] === 0x01) {
+                    startCodeLen = 4;
+                } else if (i + 2 < payload.length && 
+                           payload[i] === 0x00 && payload[i + 1] === 0x00 && payload[i + 2] === 0x01) {
+                    startCodeLen = 3;
+                }
+                
+                if (startCodeLen > 0) {
+                    i += startCodeLen;
+                    const start = i;
+                    while (i < payload.length) {
+                        if (i + 3 < payload.length && 
+                            payload[i] === 0x00 && payload[i + 1] === 0x00 && 
+                            payload[i + 2] === 0x00 && payload[i + 3] === 0x01) break;
+                        if (i + 2 < payload.length && 
+                            payload[i] === 0x00 && payload[i + 1] === 0x00 && payload[i + 2] === 0x01) break;
+                        i++;
+                    }
+                    if (i > start) nals.push(payload.slice(start, i));
+                    continue;
+                }
+                
+                // RTP 单包：无起始码，整包为一个 NAL 或 FU-A 片（常见于 RTP 打包，无 0x00 0x00 0x01）
+                if (payload.length - i >= 1) {
+                    const first = payload[i] & 0x1F;
+                    if (first >= 1 && first <= 23) {
+                        nals.push(payload.slice(i));
+                        break;
+                    }
+                    if ((first === 28 || first === 29) && payload.length - i >= 2) {
+                        const realType = payload[i + 1] & 0x1F;
+                        nals.push(new Uint8Array([realType]));
+                        break;
+                    }
+                    // 兜底：任意非起始码首字节视为 Single NAL 类型
+                    nals.push(payload.slice(i));
+                    break;
+                }
+                i++;
+            }
+            
+            return nals;
+        }
+        
+        let audioBufferIndex = 0;
+        let lastVideoTime = 0;  // 视频时间戳（微秒）
+        
+        function handleRtpPayload(payloadB64, streamType, codec, payloadType) {
+            try {
+                const payload = Uint8Array.from(atob(payloadB64), c => c.charCodeAt(0));
+                
+                if (streamType.startsWith('audio')) {
+                    // 音频处理：G.711 (PCMU/PCMA) 解码
+                    if (audioContext && audioContext.state === 'running') {
+                        const infoEl = document.getElementById('media-monitor-player-info');
+                        
+                        // 检查编解码类型
+                        if (codec === 'PCMU' || codec === 'PCMA' || payloadType === 0 || payloadType === 8) {
+                            try {
+                                // 确定编解码类型（优先使用payloadType，因为更准确）
+                                let actualCodec = codec;
+                                if (!actualCodec || actualCodec === 'UNKNOWN') {
+                                    actualCodec = (payloadType === 0) ? 'PCMU' : 'PCMA';
+                                }
+                                
+                                // 解码G.711到PCM
+                                const pcmSamples = decodeG711(payload, actualCodec);
+                                
+                                // 重采样：G.711是8kHz，浏览器通常需要44.1kHz或48kHz
+                                const targetSampleRate = audioContext.sampleRate;
+                                const resampledSamples = resampleAudio8kTo44k(pcmSamples, 8000, targetSampleRate);
+                                
+                                // 将解码后的音频数据加入队列，由ScriptProcessorNode连续播放
+                                if (isPlayingAudio && audioScriptProcessor) {
+                                    audioBufferQueue.push(resampledSamples);
+                                    
+                                    // 限制队列大小，避免内存溢出（保持约1秒的缓冲）
+                                    const maxQueueSize = Math.ceil(targetSampleRate / 8000 * 50); // 约1秒的缓冲
+                                    if (audioBufferQueue.length > maxQueueSize) {
+                                        // 丢弃最老的数据，保持流畅播放
+                                        const removeCount = audioBufferQueue.length - maxQueueSize;
+                                        for (let i = 0; i < removeCount; i++) {
+                                            audioBufferQueue.shift();
+                                        }
+                                    }
+                                    
+                                    // 更新状态信息（减少更新频率）
+                                    if (audioBufferQueue.length % 10 === 0 || audioBufferQueue.length === 1) {
+                                        infoEl.textContent = `音频流：正在播放 (${actualCodec}, ${payload.length}字节, 队列:${audioBufferQueue.length})`;
+                                    }
+                                } else {
+                                    infoEl.textContent = `音频流：播放器未就绪`;
+                                }
+                            } catch (e) {
+                                console.error('[MediaMonitor] 音频解码失败:', e);
+                                infoEl.textContent = `音频流：解码错误 - ${e.message}`;
+                            }
+                        } else {
+                            infoEl.textContent = `音频流：不支持的编解码 ${codec || 'UNKNOWN'} (payload type: ${payloadType})`;
+                        }
+                    }
+                } else if (streamType.startsWith('video')) {
+                    const infoEl = document.getElementById('media-monitor-player-info');
+                    if (codec !== 'H264' && payloadType !== 96) {
+                        infoEl.textContent = `视频流：不支持的编解码 ${codec || 'UNKNOWN'} (payload type: ${payloadType})`;
+                    } else {
+                        try {
+                            const START_CODE = new Uint8Array([0, 0, 0, 1]);
+                            const pushNAL = (nalBytes, nalType) => {
+                                if (nalType === 7) {
+                                    h264SPS = nalBytes;
+                                    const infoEl = document.getElementById('media-monitor-player-info');
+                                    if (infoEl) infoEl.textContent = `视频流：已收到 SPS | PPS:${!!h264PPS} | 已解码 ${videoFrameCount} 帧`;
+                                    initVideoDecoderIfReady();
+                                } else if (nalType === 8) {
+                                    h264PPS = nalBytes;
+                                    const infoEl = document.getElementById('media-monitor-player-info');
+                                    if (infoEl) infoEl.textContent = `视频流：已收到 PPS | SPS:${!!h264SPS} | 已解码 ${videoFrameCount} 帧`;
+                                    initVideoDecoderIfReady();
+                                } else if (nalType === 1 || nalType === 5) {
+                                    // 确保解码器已初始化
+                                    if (!videoDecoder || videoDecoder.state !== 'configured') {
+                                        initVideoDecoderIfReady();
+                                        const infoEl = document.getElementById('media-monitor-player-info');
+                                        if (infoEl) {
+                                            const decoderReady = videoDecoder && videoDecoder.state === 'configured';
+                                            infoEl.textContent = `视频流：收到 ${nalType === 5 ? 'IDR' : '非IDR'} 帧 | SPS:${!!h264SPS} PPS:${!!h264PPS} | 解码器:${decoderReady ? '就绪' : '未就绪'}`;
+                                        }
+                                        // 即使解码器未就绪，也尝试解码（可能配置正在进行中）
+                                    }
+                                    const withStart = new Uint8Array(START_CODE.length + nalBytes.length);
+                                    withStart.set(START_CODE, 0);
+                                    withStart.set(nalBytes, START_CODE.length);
+                                    // 时间戳：WebCodecs 需要微秒，假设 30fps，每帧约 33333 微秒
+                                    const frameIntervalUs = 1000000 / 30;  // 30fps = 33333 微秒/帧
+                                    const ts = (lastVideoTime || 0) + frameIntervalUs;
+                                    lastVideoTime = ts;
+                                    decodeAndDrawH264(withStart, ts / 1000);  // 转换为毫秒传给函数，函数内部再转微秒
+                                    const infoEl = document.getElementById('media-monitor-player-info');
+                                    if (videoDecoder && videoDecoder.state === 'configured') {
+                                        if (infoEl && videoFrameCount % 10 === 0) {
+                                            infoEl.textContent = `视频流：已解码 ${videoFrameCount} 帧 (类型${nalType === 5 ? 'IDR' : '非IDR'})`;
+                                        }
+                                    }
+                                }
+                            };
+                            if (payload.length < 2) return;
+                            const b0 = payload[0] & 0x1F;
+                            if (b0 >= 1 && b0 <= 23) {
+                                if (b0 === 7 || b0 === 8 || b0 === 1 || b0 === 5) {
+                                    pushNAL(payload, b0);
+                                }
+                                if (b0 !== 7 && b0 !== 8) {
+                                    const hasSPS = !!h264SPS;
+                                    const hasPPS = !!h264PPS;
+                                    const decoderReady = videoDecoder && videoDecoder.state === 'configured';
+                                    const decoderState = videoDecoder ? videoDecoder.state : '未初始化';
+                                    if (!decoderReady && (b0 === 1 || b0 === 5)) {
+                                        console.log(`[MediaMonitor] 收到 ${b0 === 5 ? 'IDR' : '非IDR'} 帧，解码器状态: ${decoderState}, SPS:${hasSPS}, PPS:${hasPPS}`);
+                                        infoEl.textContent = `视频流：已接收 NAL 类型${b0} | SPS:${hasSPS} PPS:${hasPPS} | 解码器:${decoderState}`;
+                                        // 如果 SPS/PPS 都有了但解码器未就绪，尝试重新初始化
+                                        if (hasSPS && hasPPS && !decoderReady) {
+                                            console.log('[MediaMonitor] SPS/PPS 已就绪，尝试初始化解码器');
+                                            initVideoDecoderIfReady();
+                                        }
+                                    } else if (b0 !== 1 && b0 !== 5) {
+                                        infoEl.textContent = `视频流：已接收 NAL 类型${b0} | SPS:${hasSPS} PPS:${hasPPS} | 已解码 ${videoFrameCount} 帧`;
+                                    }
+                                }
+                            } else if ((b0 === 28 || b0 === 29) && payload.length >= 3) {
+                                const fuHeader = payload[1];
+                                const realType = fuHeader & 0x1F;
+                                const s = (fuHeader & 0x80) !== 0;
+                                const e = (fuHeader & 0x40) !== 0;
+                                const nalHeader = (payload[0] & 0xE0) | realType;
+                                const fragment = payload.slice(2);
+                                if (s) {
+                                    h264FUABuffer = { nalHeader: nalHeader, chunks: [fragment] };
+                                } else if (h264FUABuffer) {
+                                    h264FUABuffer.chunks.push(fragment);
+                                }
+                                if (e && h264FUABuffer) {
+                                    let len = 0;
+                                    for (const c of h264FUABuffer.chunks) len += c.length;
+                                    const full = new Uint8Array(1 + len);
+                                    full[0] = h264FUABuffer.nalHeader;
+                                    let off = 1;
+                                    for (const c of h264FUABuffer.chunks) {
+                                        full.set(c, off);
+                                        off += c.length;
+                                    }
+                                    pushNAL(full, realType);
+                                    h264FUABuffer = null;
+                                    if (realType !== 7 && realType !== 8) {
+                                        const decoderReady = videoDecoder && videoDecoder.state === 'configured';
+                                        if (!decoderReady && (realType === 1 || realType === 5)) {
+                                            infoEl.textContent = `视频流：FU-A 类型${realType} | SPS:${!!h264SPS} PPS:${!!h264PPS} | 等待解码器就绪`;
+                                        }
+                                    }
+                                } else if (h264FUABuffer) {
+                                    infoEl.textContent = `视频流：FU-A 重组中 (类型${realType}) | SPS:${!!h264SPS} PPS:${!!h264PPS}`;
+                                }
+                            } else {
+                                infoEl.textContent = `视频流：已接收 ${payload.length} 字节 | SPS:${!!h264SPS} PPS:${!!h264PPS} | 已解码 ${videoFrameCount} 帧`;
+                            }
+                        } catch (e) {
+                            console.error('[MediaMonitor] 视频处理失败:', e);
+                            infoEl.textContent = `视频流：处理错误 - ${e.message}`;
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('[MediaMonitor] 处理RTP payload失败:', e);
+            }
+        }
+        
+        function initVideoDecoderIfReadyForStream(streamType) {
+            const sps = h264SPSByStream[streamType];
+            const pps = h264PPSByStream[streamType];
+            let dec = videoDecodersByStream[streamType];
+            if (dec && dec.state === 'configured') return;
+            if (dec) { try { if (dec.state === 'configured') dec.reset(); } catch (e) {} dec = null; videoDecodersByStream[streamType] = null; videoDecoderHasReceivedKeyframeByStream[streamType] = false; }
+            if (!sps || !pps) return;
+            if (!window.VideoDecoder) {
+                if (!mseInitLoggedByStream[streamType]) { mseInitLoggedByStream[streamType] = true; console.debug('[MSE-debug] 使用 MSE 回退', streamType); }
+                setVideoStreamStatus(streamType, '使用 MSE 回退（若无法显示请用 Chrome/Edge）', false);
+                if (!msePendingNalsByStream[streamType]) msePendingNalsByStream[streamType] = [];
+                initMSEForStream(streamType);
+                return;
+            }
+            try {
+                const description = buildAvcC(sps, pps);
+                const canvasEl = document.getElementById('media-monitor-canvas-' + streamType);
+                const ctx = canvasEl ? canvasEl.getContext('2d') : null;
+                dec = new VideoDecoder({
+                    output: (frame) => {
+                        try {
+                            if (ctx && canvasEl) {
+                                if (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight) {
+                                    canvasEl.width = frame.displayWidth || 320;
+                                    canvasEl.height = frame.displayHeight || 240;
+                                }
+                                ctx.drawImage(frame, 0, 0, canvasEl.width, canvasEl.height);
+                                videoFrameCountByStream[streamType] = (videoFrameCountByStream[streamType] || 0) + 1;
+                                const n = videoFrameCountByStream[streamType] || 0;
+                                if (n <= 3 || n % 15 === 0) setVideoStreamStatus(streamType, '已解码 ' + n + ' 帧 | ' + getVideoStreamStatusLine(streamType), false);
+                            }
+                            frame.close();
+                        } catch (e) {
+                            frame.close();
+                            setVideoStreamStatus(streamType, '绘制帧失败: ' + (e.message || e), true);
+                        }
+                    },
+                    error: (e) => {
+                        const msg = (e && (e.message || e.messageDetail || String(e))) || '未知';
+                        console.warn('[MediaMonitor]', streamType, 'decode error:', e);
+                        videoDecodersByStream[streamType] = null;
+                        videoDecoderHasReceivedKeyframeByStream[streamType] = false;
+                        setVideoStreamStatus(streamType, '解码器报错: ' + msg + ' | ' + getVideoStreamStatusLine(streamType), true);
+                    }
+                });
+                const profile = sps[1];
+                const level = sps[3];
+                const codecStr = 'avc1.' + profile.toString(16).padStart(2,'0') + sps[2].toString(16).padStart(2,'0') + level.toString(16).padStart(2,'0');
+                dec.configure({ codec: codecStr, codedWidth: 320, codedHeight: 240, description: description });
+                videoDecodersByStream[streamType] = dec;
+                videoDecoderHasReceivedKeyframeByStream[streamType] = false;
+                setVideoStreamStatus(streamType, '解码器就绪 (' + codecStr + ') 等待关键帧 | ' + getVideoStreamStatusLine(streamType), false);
+            } catch (e) {
+                const msg = (e && e.message) ? e.message : String(e);
+                console.warn('[MediaMonitor] init decoder', streamType, e);
+                setVideoStreamStatus(streamType, '初始化解码器失败: ' + msg + ' | ' + getVideoStreamStatusLine(streamType), true);
+            }
+        }
+        
+        function decodeAndDrawH264ForStream(streamType, nalWithStartCode, timestampMs) {
+            const dec = videoDecodersByStream[streamType];
+            if (!dec || dec.state !== 'configured') {
+                if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
+                videoStreamDebug[streamType].lastError = '解码器未就绪(state=' + (dec ? dec.state : 'null') + ')';
+                return;
+            }
+            const nalType = nalWithStartCode[4] !== undefined ? (nalWithStartCode[4] & 0x1F) : (nalWithStartCode[3] & 0x1F);
+            if (nalType !== 1 && nalType !== 5) return;
+            // 未送关键帧前不送 P 帧，避免 "Key frame is required" / "Unable to determine size of bitstream buffer"
+            const hasKey = !!videoDecoderHasReceivedKeyframeByStream[streamType];
+            if (nalType === 1 && !hasKey) return;
+            // Chrome VideoDecoder(avc1) 期望 AVCC（4 字节大端长度 + NAL），此处将 Annex B（0,0,0,1 + NAL）转为 AVCC
+            const nalLen = nalWithStartCode.length - 4;
+            const avcc = new Uint8Array(4 + nalLen);
+            const view = new DataView(avcc.buffer);
+            view.setUint32(0, nalLen, false);
+            avcc.set(nalWithStartCode.subarray(4), 4);
+            try {
+                const timestampUs = (typeof timestampMs === 'number' ? timestampMs : 0) * 1000;
+                dec.decode(new EncodedVideoChunk({ type: nalType === 5 ? 'key' : 'delta', timestamp: timestampUs, duration: 0, data: avcc }));
+                if (nalType === 5) videoDecoderHasReceivedKeyframeByStream[streamType] = true;
+                if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
+                videoStreamDebug[streamType].framesSentToDecoder = (videoStreamDebug[streamType].framesSentToDecoder || 0) + 1;
+                videoStreamDebug[streamType].lastNal = nalType === 5 ? 'IDR' : '非IDR';
+            } catch (e) {
+                const msg = (e && e.message) ? e.message : String(e);
+                setVideoStreamStatus(streamType, 'decode() 异常: ' + msg + ' | ' + getVideoStreamStatusLine(streamType), true);
+            }
+        }
+        
+        function handleRtpPayloadForStream(streamType, payloadB64, codec, payloadType) {
+            try {
+                const payload = Uint8Array.from(atob(payloadB64), c => c.charCodeAt(0));
+                if (streamType.startsWith('audio')) {
+                    if (!audioContext || audioContext.state !== 'running') return;
+                    if (codec !== 'PCMU' && codec !== 'PCMA' && payloadType !== 0 && payloadType !== 8) return;
+                    const actualCodec = (payloadType === 0) ? 'PCMU' : 'PCMA';
+                    const pcmSamples = decodeG711(payload, actualCodec);
+                    const targetSampleRate = audioContext.sampleRate;
+                    const resampledSamples = resampleAudio8kTo44k(pcmSamples, 8000, targetSampleRate);
+                    const q = audioBufferQueues[streamType];
+                    if (q) {
+                        q.push(resampledSamples);
+                        const maxQueueSize = Math.ceil(targetSampleRate / 8000 * 12);  // ~0.24s 缓冲，降低延迟
+                        if (q.length > maxQueueSize) { for (let i = 0; i < q.length - maxQueueSize; i++) q.shift(); }
+                    }
+                } else if (streamType.startsWith('video')) {
+                    if (codec !== 'H264' || (payloadType !== undefined && payloadType !== 96)) {
+                        setVideoStreamStatus(streamType, '非 H264 编解码: ' + (codec || '') + ' pt=' + payloadType + ' | ' + getVideoStreamStatusLine(streamType), true);
+                        return;
+                    }
+                    const START_CODE = new Uint8Array([0, 0, 0, 1]);
+                    const st = streamType;
+                    if (payload.length < 2) {
+                        setVideoStreamStatus(streamType, 'RTP 载荷过短(' + payload.length + ') | ' + getVideoStreamStatusLine(st), true);
+                        return;
+                    }
+                    const b0 = payload[0] & 0x1F;
+                    if (b0 >= 1 && b0 <= 23) {
+                        if (b0 === 7) {
+                            if (!h264SPSByStream[st] || payload.length > h264SPSByStream[st].length) h264SPSByStream[st] = payload.slice(0);
+                            if (!mseSPSLoggedByStream[st]) { mseSPSLoggedByStream[st] = true; console.debug('[MSE-debug] SPS 收到', st, 'len=', payload.length); }
+                            setVideoStreamStatus(st, '已收 SPS (' + payload.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                            initVideoDecoderIfReadyForStream(st);
+                        } else if (b0 === 8) {
+                            if (!h264PPSByStream[st] || payload.length > h264PPSByStream[st].length) h264PPSByStream[st] = payload.slice(0);
+                            if (!msePPSLoggedByStream[st]) { msePPSLoggedByStream[st] = true; console.debug('[MSE-debug] PPS 收到', st, 'len=', payload.length); }
+                            setVideoStreamStatus(st, '已收 PPS (' + payload.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                            initVideoDecoderIfReadyForStream(st);
+                        } else if (b0 === 1 || b0 === 5) {
+                            initVideoDecoderIfReadyForStream(st);
+                            if (mseSourceBufferByStream[st]) {
+                                var needKey = !mseHasAppendedKeyframeByStream[st];
+                                if (needKey && (b0 !== 5)) {
+                                    if (!mseAppendQueueByStream[st]) mseAppendQueueByStream[st] = [];
+                                    mseAppendQueueByStream[st].push({ nal: payload, key: false });
+                                    if (mseAppendQueueByStream[st].length > 120) mseAppendQueueByStream[st].shift();
+                                } else {
+                                    appendMSEFragment(st, payload, b0 === 5);
+                                }
+                            } else if (videoDecodersByStream[st]) {
+                                const withStart = new Uint8Array(START_CODE.length + payload.length);
+                                withStart.set(START_CODE, 0); withStart.set(payload, START_CODE.length);
+                                const frameIntervalUs = 1000000 / 30;
+                                const ts = (lastVideoTimeByStream[st] || 0) + frameIntervalUs;
+                                lastVideoTimeByStream[st] = ts;
+                                decodeAndDrawH264ForStream(st, withStart, ts / 1000);
+                            } else {
+                                if (!msePendingNalsByStream[st]) msePendingNalsByStream[st] = [];
+                                var q = msePendingNalsByStream[st];
+                                q.push({ nal: payload, isKeyframe: b0 === 5 }); if (q.length > 60) q.shift();
+                            }
+                        } else {
+                            if (!videoStreamDebug[st]) videoStreamDebug[st] = {};
+                            videoStreamDebug[st].lastNal = 'type=' + b0;
+                        }
+                    } else if ((b0 === 28 || b0 === 29) && payload.length >= 3) {
+                        const fuHeader = payload[1];
+                        const realType = fuHeader & 0x1F;
+                        const s = (fuHeader & 0x80) !== 0;
+                        const e = (fuHeader & 0x40) !== 0;
+                        const nalHeader = (payload[0] & 0xE0) | realType;
+                        const fragment = payload.slice(2);
+                        if (!window.h264FUABufferByStream) window.h264FUABufferByStream = {};
+                        let buf = window.h264FUABufferByStream[st];
+                        if (s) buf = { nalHeader: nalHeader, chunks: [fragment] };
+                        else if (buf) buf.chunks.push(fragment);
+                        if (e && buf) {
+                            let len = 0; for (const c of buf.chunks) len += c.length;
+                            const full = new Uint8Array(1 + len); full[0] = buf.nalHeader;
+                            let off = 1; for (const c of buf.chunks) { full.set(c, off); off += c.length; }
+                            if (realType === 7) {
+                                if (!h264SPSByStream[st] || full.length > h264SPSByStream[st].length) h264SPSByStream[st] = full;
+                                if (!mseSPSLoggedByStream[st]) { mseSPSLoggedByStream[st] = true; console.debug('[MSE-debug] SPS 收到(FU-A)', st, 'len=', full.length); }
+                                setVideoStreamStatus(st, '已收 SPS (FU-A ' + full.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                initVideoDecoderIfReadyForStream(st);
+                            } else if (realType === 8) {
+                                if (!h264PPSByStream[st] || full.length > h264PPSByStream[st].length) h264PPSByStream[st] = full;
+                                if (!msePPSLoggedByStream[st]) { msePPSLoggedByStream[st] = true; console.debug('[MSE-debug] PPS 收到(FU-A)', st, 'len=', full.length); }
+                                setVideoStreamStatus(st, '已收 PPS (FU-A ' + full.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                initVideoDecoderIfReadyForStream(st);
+                            } else if (realType === 1 || realType === 5) {
+                                initVideoDecoderIfReadyForStream(st);
+                                if (mseSourceBufferByStream[st]) {
+                                    var needKey = !mseHasAppendedKeyframeByStream[st];
+                                    if (needKey && (realType !== 5)) {
+                                        if (!mseAppendQueueByStream[st]) mseAppendQueueByStream[st] = [];
+                                        mseAppendQueueByStream[st].push({ nal: full, key: false });
+                                        if (mseAppendQueueByStream[st].length > 120) mseAppendQueueByStream[st].shift();
+                                    } else {
+                                        appendMSEFragment(st, full, realType === 5);
+                                    }
+                                } else if (videoDecodersByStream[st]) {
+                                    const withStart = new Uint8Array(4 + full.length);
+                                    withStart.set([0,0,0,1], 0); withStart.set(full, 4);
+                                    const ts = (lastVideoTimeByStream[st] || 0) + 1000000/30;
+                                    lastVideoTimeByStream[st] = ts;
+                                    decodeAndDrawH264ForStream(st, withStart, ts/1000);
+                                } else {
+                                    if (!msePendingNalsByStream[st]) msePendingNalsByStream[st] = [];
+                                    var q = msePendingNalsByStream[st];
+                                    q.push({ nal: full, isKeyframe: realType === 5 }); if (q.length > 60) q.shift();
+                                }
+                            }
+                            buf = null;
+                        }
+                        window.h264FUABufferByStream[st] = buf;
+                    } else {
+                        setVideoStreamStatus(st, '未知 NAL 首字节 type=' + b0 + ' len=' + payload.length + ' | ' + getVideoStreamStatusLine(st), true);
+                    }
+                }
+            } catch (e) {
+                console.error('[MediaMonitor] handleRtpPayloadForStream', streamType, e);
+                setVideoStreamStatus(streamType, '处理异常: ' + (e.message || e) + ' | ' + getVideoStreamStatusLine(streamType), true);
+            }
+        }
+        
         // SIP消息跟踪功能
         let sipMessagesWebSocket = null;
         let sipMessagesList = [];
         let columnFilters = {};
         let selectedMessageId = null;
         let sipMessagesPaused = false; // 跟踪是否暂停
+        let sipMessagesShowRetransmissions = false; // 是否显示重传消息（默认不显示）
         let sipMessagesPollIntervalId = null; // 轮询定时器，补全 WebSocket 延迟/漏推的消息（如 re-INVITE 200 的 ACK FWD）
         let sipMessagesUserScrolled = false; // 跟踪用户是否手动滚动过
         let sipMessagesAutoScrollTimeout = null; // 自动滚动定时器，用于防抖
@@ -3011,6 +5198,16 @@
             refreshBtn.addEventListener('click', () => {
                 loadSipMessages();
             });
+            
+            // 显示重传消息复选框
+            const showRetransmissionsCheckbox = document.getElementById('sip-messages-show-retransmissions');
+            if (showRetransmissionsCheckbox) {
+                showRetransmissionsCheckbox.addEventListener('change', (e) => {
+                    sipMessagesShowRetransmissions = e.target.checked;
+                    console.log('[SIPMessages] 显示重传消息:', sipMessagesShowRetransmissions);
+                    updateSipMessagesDisplay();
+                });
+            }
             
             // 暂停/恢复跟踪按钮
             pauseBtn.addEventListener('click', () => {
@@ -3296,10 +5493,15 @@
                 console.log('[SIPMessages] 更新显示，列表总数:', sipMessagesList.length, 'ACK FWD数量:', ackFwdCount, '最大ID:', maxId, '数组最后一条ID:', lastMsg.id);
             }
             
-            // 应用列过滤
+            // 应用默认过滤：默认不显示重传消息
             let filteredMessages = sipMessagesList;
+            if (!sipMessagesShowRetransmissions) {
+                filteredMessages = filteredMessages.filter(msg => !msg.is_retransmission);
+            }
+            
+            // 应用列过滤
             if (Object.keys(columnFilters).length > 0) {
-                filteredMessages = sipMessagesList.filter(msg => {
+                filteredMessages = filteredMessages.filter(msg => {
                     for (const [column, filterValue] of Object.entries(columnFilters)) {
                         let msgValue = '';
                         // 处理虚拟列：UDP地址和SIP地址

@@ -83,10 +83,10 @@ class SIPClient:
     
     def __init__(self, username: str, password: str, server_ip: str,
                  server_port: int = 5060, local_ip: str = None, local_port: int = 10000,
-                 sdp_ip: str = None, sip_domain: str = None):
+                 sdp_ip: str = None, sip_domain: str = None, contact_ip: str = None):
         """
         初始化 SIP 客户端
-
+        
         Args:
             username: SIP 用户名
             password: SIP 密码
@@ -96,6 +96,7 @@ class SIPClient:
             local_port: 本地端口（默认 10000）
             sdp_ip: SDP 中使用的 IP 地址（用于 NAT 场景，默认为 server_ip）
             sip_domain: Request-URI/To/From 中的域（AOR 域）。不传则用 server_ip。内嵌时用 SERVER_IP 以便与 REG_BINDINGS 一致。
+            contact_ip: Via/Contact 头中使用的 IP 地址（如果为 None，则使用 local_ip）
         """
         self.username = username
         self.password = password
@@ -110,8 +111,10 @@ class SIPClient:
             self.local_ip = local_ip
         else:
             self.local_ip = self._get_local_ip()
-        # Via/Contact 中使用的地址：必须是服务器能访问到的 IP，不能是 0.0.0.0
-        if not self.local_ip or self.local_ip in ("", "0.0.0.0"):
+        # Via/Contact 中使用的地址：如果指定了contact_ip则使用，否则使用local_ip
+        if contact_ip:
+            self.contact_ip = contact_ip
+        elif not self.local_ip or self.local_ip in ("", "0.0.0.0"):
             self.contact_ip = "127.0.0.1"
         else:
             self.contact_ip = self.local_ip
@@ -1903,13 +1906,17 @@ class AutoDialerClient:
         """
         self.server_globals = server_globals or {}
         self.config = self._load_config(config_file)
-        # 内嵌在 IMS 进程时：连接用 127.0.0.1，AOR 域用 SERVER_IP，以便 INVITE 查找 REG_BINDINGS 时能命中 sip:1001@SERVER_IP
+        # 内嵌在 IMS 进程时：socket连接用 127.0.0.1，但Via/Contact头用SERVER_IP，AOR 域用 SERVER_IP
+        # 这样服务器能把 INVITE 发回本机，同时信令地址显示为SERVER_IP（与服务器一致）
         if self.server_globals.get("SERVER_IP") is not None:
-            self.config["server_ip"] = "127.0.0.1"
-            self.config["local_ip"] = "127.0.0.1"
-            self.config["sip_domain"] = self.server_globals["SERVER_IP"]
+            server_ip = self.server_globals["SERVER_IP"]
+            self.config["server_ip"] = "127.0.0.1"  # socket连接用127.0.0.1
+            self.config["local_ip"] = "127.0.0.1"  # socket绑定用127.0.0.1
+            self.config["sip_domain"] = server_ip  # AOR域用SERVER_IP
+            # Via/Contact头地址：使用SERVER_IP（与服务器一致）
+            self.config["contact_ip"] = server_ip
             if "sdp_ip" not in self.config or not self.config["sdp_ip"]:
-                self.config["sdp_ip"] = self.server_globals.get("SERVER_IP")  # SDP 仍用对外宣告的 IP
+                self.config["sdp_ip"] = server_ip  # SDP 用对外宣告的 IP
         self.client: Optional[SIPClient] = None
         self.tasks: List[CallTask] = []
         self.stats = {
@@ -1971,6 +1978,7 @@ class AutoDialerClient:
             local_port=local_port,
             sdp_ip=self.config.get("sdp_ip") or server_ip,
             sip_domain=self.config.get("sip_domain"),
+            contact_ip=self.config.get("contact_ip"),  # 传递contact_ip配置
         )
         
         # 注册
