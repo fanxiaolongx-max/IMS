@@ -5159,7 +5159,7 @@
                                 ctx.drawImage(frame, 0, 0, canvasEl.width, canvasEl.height);
                                 videoFrameCountByStream[streamType] = (videoFrameCountByStream[streamType] || 0) + 1;
                                 const n = videoFrameCountByStream[streamType] || 0;
-                                if (n <= 3 || n % 15 === 0) setVideoStreamStatus(streamType, '已解码 ' + n + ' 帧 | ' + getVideoStreamStatusLine(streamType), false);
+                                if (n <= 3 || n % 15 === 0) setVideoStreamStatus(streamType, '已解码 ' + n + ' 帧 (H.264) | ' + getVideoStreamStatusLine(streamType), false);
                             }
                             frame.close();
                         } catch (e) {
@@ -5210,10 +5210,11 @@
             avcc.set(nalWithStartCode.subarray(4), 4);
             try {
                 const timestampUs = (typeof timestampMs === 'number' ? timestampMs : 0) * 1000;
-                dec.decode(new EncodedVideoChunk({ type: nalType === 5 ? 'key' : 'delta', timestamp: timestampUs, duration: 33333, data: avcc }));
+                const decodePromise = dec.decode(new EncodedVideoChunk({ type: nalType === 5 ? 'key' : 'delta', timestamp: timestampUs, duration: 33333, data: avcc }));
+                if (decodePromise && typeof decodePromise.catch === 'function') decodePromise.catch(function() {});
                 if (nalType === 5) {
                     videoDecoderHasReceivedKeyframeByStream[streamType] = true;
-                    setTimeout(function() { try { if (dec && dec.state === 'configured') dec.flush(); } catch (e) {} }, 0);
+                    // 不在此处 flush()：flush 后解码器会要求下一帧必须是关键帧，导致后续 P 帧报错 "A key frame is required after configure() or flush()"
                 }
                 if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
                 videoStreamDebug[streamType].framesSentToDecoder = (videoStreamDebug[streamType].framesSentToDecoder || 0) + 1;
@@ -5468,7 +5469,7 @@
                                 initVideoDecoderIfReadyForStream(st);
                             }
                         } else if (b0 === 1 || b0 === 5) {
-                            initVideoDecoderIfReadyForStream(st);
+                            // 仅在 SPS/PPS 更新时 init，不在每帧 slice 前 init，避免每帧 close 解码器导致 AbortError 和卡顿
                             if (mseSourceBufferByStream[st]) {
                                 var needKey = !mseHasAppendedKeyframeByStream[st];
                                 if (needKey && (b0 !== 5)) {
@@ -5524,7 +5525,6 @@
                                     initVideoDecoderIfReadyForStream(st);
                                 }
                             } else if (realType === 1 || realType === 5) {
-                                initVideoDecoderIfReadyForStream(st);
                                 if (mseSourceBufferByStream[st]) {
                                     var needKey = !mseHasAppendedKeyframeByStream[st];
                                     if (needKey && (realType !== 5)) {
