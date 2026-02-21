@@ -218,7 +218,9 @@ class SDPProcessor:
                 'video_port': int,     # m=video 行中的端口
                 'video_payloads': List[str],  # 视频支持的payload类型
                 'video_connection_ip': str,  # 视频媒体级别的c=行（如果有）
-                'codec_info': Dict[str, str]  # payload -> codec
+                'codec_info': Dict[str, str]  # payload -> codec（兼容旧逻辑，为 audio+video 合并）
+            'audio_codec_info': Dict[str, str]  # 仅音频 payload -> codec
+            'video_codec_info': Dict[str, str]  # 仅视频 payload -> codec
             }
         """
         if not sdp_body:
@@ -234,7 +236,9 @@ class SDPProcessor:
             'video_payloads': [],
             'video_connection_ip': None,
             'video_direction': 'sendrecv',  # 默认值：sendrecv, sendonly, recvonly, inactive
-            'codec_info': {}
+            'codec_info': {},
+            'audio_codec_info': {},
+            'video_codec_info': {},
         }
         
         lines = sdp_body.split('\r\n') if '\r\n' in sdp_body else sdp_body.split('\n')
@@ -292,6 +296,10 @@ class SDPProcessor:
                     payload = match.group(1)
                     codec_info = match.group(2)
                     result['codec_info'][payload] = codec_info
+                    if current_media == 'audio':
+                        result['audio_codec_info'][payload] = codec_info
+                    elif current_media == 'video':
+                        result['video_codec_info'][payload] = codec_info
             
             # 解析媒体方向属性 (a=sendrecv, a=sendonly, a=recvonly, a=inactive)
             # 这些属性通常出现在 m= 行之后，作用域是当前媒体

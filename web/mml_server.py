@@ -3241,8 +3241,14 @@ if WEBSOCKET_AVAILABLE:
                                     if sdp_body:
                                         from sipcore.media_relay import SDPProcessor
                                         media_info = SDPProcessor.extract_media_info(sdp_body)
-                                        if media_info and 'codec_info' in media_info:
-                                            codec_map = media_info['codec_info']
+                                        if media_info:
+                                            # 按媒体类型取 codec，避免音频 pt 96 被视频 H265 覆盖
+                                            if stream_type.startswith('audio') and media_info.get('audio_codec_info'):
+                                                codec_map = media_info['audio_codec_info']
+                                            elif stream_type.startswith('video') and media_info.get('video_codec_info'):
+                                                codec_map = media_info['video_codec_info']
+                                            elif media_info.get('codec_info'):
+                                                codec_map = media_info['codec_info']
                                 
                                 # 同步回调函数（在转发器线程中执行）
                                 # 从独立媒体流通道读取（后台自动复制，前台只读取，互不干扰，切换流畅）
@@ -3270,12 +3276,14 @@ if WEBSOCKET_AVAILABLE:
                                             if '/' in codec_map[payload_type_str] else codec_map[payload_type_str])
                                     else:
                                         codec_name = static_payloads.get(payload_type, 'UNKNOWN') if payload_type is not None else 'UNKNOWN'
+                                    rtp_ts = (int(rtp_data[4]) << 24 | int(rtp_data[5]) << 16 | int(rtp_data[6]) << 8 | int(rtp_data[7])) if len(rtp_data) >= 8 else None
                                     s = {
                                         "type": "rtp_packet", "call_id": call_id, "stream_type": stream_type,
                                         "packet_size": len(rtp_data), "payload_size": len(rtp_payload) if rtp_payload else 0,
                                         "payload_type": payload_type, "codec": codec_name,
                                         "source_addr": f"{source_addr[0]}:{source_addr[1]}",
                                         "local_port": local_port, "timestamp": timestamp,
+                                        "rtp_timestamp": rtp_ts,
                                         "packets_received": forwarder.packets_received,
                                         "packets_sent": forwarder.packets_sent,
                                         "packets_dropped_send": getattr(forwarder, 'packets_dropped_send', 0),

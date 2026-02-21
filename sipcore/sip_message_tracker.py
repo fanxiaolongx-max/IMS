@@ -51,6 +51,8 @@ class SIPMessageRecord:
     src_port_nat: int = 0  # 源端口（NAT 前，Contact 头或 SDP 中的端口）
     dst_ip_nat: str = ""  # 目标 IP（NAT 前，Contact 头或 SDP 中的地址）
     dst_port_nat: int = 0  # 目标端口（NAT 前，Contact 头或 SDP 中的端口）
+    audio_codecs: str = ""  # 音频编解码+PT，如 "PCMU/0, PCMA/8"
+    video_codecs: str = ""  # 视频编解码+PT，如 "H264/96"
 
 
 class SIPMessageTracker:
@@ -174,6 +176,8 @@ class SIPMessageTracker:
                 
                 # SDP 媒体地址与端口（c=IN IP4 + m=audio/video 端口）
                 sdp_info = self._extract_sdp_info(msg) if has_sdp else ""
+                # 音频/视频编解码与 payload type（从 a=rtpmap 解析）
+                audio_codecs, video_codecs = self._extract_sdp_codecs(msg.body) if has_sdp and msg.body else ("", "")
                 
                 # 完整消息内容
                 if full_message_bytes:
@@ -287,6 +291,8 @@ class SIPMessageTracker:
                     src_port_nat=src_port_nat or 0,
                     dst_ip_nat=dst_ip_nat or "",
                     dst_port_nat=dst_port_nat or 0,
+                    audio_codecs=audio_codecs,
+                    video_codecs=video_codecs,
                 )
                 
                 self.records.append(record)
@@ -461,6 +467,38 @@ class SIPMessageTracker:
             return ",".join(str(p) for p in ports)
         return f"{conn_ip} " + ",".join(str(p) for p in ports)
     
+    def _extract_sdp_codecs(self, body) -> Tuple[str, str]:
+        """从 SDP 消息体中解析 a=rtpmap，返回 (音频编解码列表, 视频编解码列表)，如 ("PCMU/0, PCMA/8", "H264/96")"""
+        audio_list: List[str] = []
+        video_list: List[str] = []
+        try:
+            text = body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else str(body)
+        except Exception:
+            return ("", "")
+        lines = text.replace("\r\n", "\n").split("\n")
+        current_media: Optional[str] = None  # "audio" or "video"
+        for line in lines:
+            line = line.strip()
+            if line.startswith("m=audio"):
+                current_media = "audio"
+            elif line.startswith("m=video"):
+                current_media = "video"
+            elif line.startswith("m="):
+                current_media = None
+            elif line.startswith("a=rtpmap:") and current_media:
+                # 格式: a=rtpmap:96 H264/90000 或 a=rtpmap:0 PCMU/8000
+                match = re.match(r"a=rtpmap:(\d+)\s+(\S+)", line)
+                if match:
+                    pt = match.group(1)
+                    codec_slash = match.group(2)  # 如 H264/90000, PCMU/8000
+                    codec = codec_slash.split("/")[0].strip() if "/" in codec_slash else codec_slash
+                    entry = f"{codec}/{pt}"
+                    if current_media == "audio" and entry not in audio_list:
+                        audio_list.append(entry)
+                    elif current_media == "video" and entry not in video_list:
+                        video_list.append(entry)
+        return (", ".join(audio_list), ", ".join(video_list))
+    
     def get_records(
         self,
         limit: int = 1000,
@@ -504,10 +542,11 @@ class SIPMessageTracker:
         records.sort(key=lambda r: (-r.timestamp, -r.id))
         records = records[offset:offset + limit]
         
-        # 转换为字典
+        # 转换为字典（兼容旧记录缺少 audio_codecs/video_codecs）
+        import dataclasses as dc
         result = []
         for r in records:
-            d = asdict(r)
+            d = {f.name: getattr(r, f.name, "" if f.name in ("audio_codecs", "video_codecs") else None) for f in dc.fields(r)}
             d['time_str'] = datetime.fromtimestamp(r.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             result.append(d)
         
@@ -515,10 +554,11 @@ class SIPMessageTracker:
     
     def get_message_by_id(self, msg_id: int) -> Optional[Dict]:
         """根据 ID 获取消息"""
+        import dataclasses as dc
         with self._lock:
             for record in self.records:
                 if record.id == msg_id:
-                    d = asdict(record)
+                    d = {f.name: getattr(record, f.name, "" if f.name in ("audio_codecs", "video_codecs") else None) for f in dc.fields(record)}
                     d['time_str'] = datetime.fromtimestamp(record.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                     return d
         return None

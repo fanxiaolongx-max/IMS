@@ -1572,6 +1572,20 @@
                                         </div>
                                         <div class="resize-handle"></div>
                                     </th>
+                                    <th data-column="audio_codecs">
+                                        <div class="table-header">
+                                            <span>音频编解码</span>
+                                            <input type="text" class="column-filter" data-column="audio_codecs" placeholder="过滤音频...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
+                                    <th data-column="video_codecs">
+                                        <div class="table-header">
+                                            <span>视频编解码</span>
+                                            <input type="text" class="column-filter" data-column="video_codecs" placeholder="过滤视频...">
+                                        </div>
+                                        <div class="resize-handle"></div>
+                                    </th>
                                     <th data-column="sdp_info">
                                         <div class="table-header">
                                             <span>SDP信息</span>
@@ -3267,9 +3281,22 @@
             mediaMonitorStats.totalBytes = 0;
             mediaMonitorStats.packetsDropped = 0;
             updateMonitorStats();
-            document.getElementById('media-monitor-title').textContent = `媒体流监听: ${callId.substring(0, 20)}... (主被叫音视频)`;
+            const titleSuffix = hasAudio && hasVideo ? '主被叫音视频' : (hasVideo ? '主被叫视频' : '主被叫音频');
+            document.getElementById('media-monitor-title').textContent = `媒体流监听: ${callId.substring(0, 20)}... (${titleSuffix})`;
             document.getElementById('media-monitor-window').classList.add('active');
             updateMonitorStatus('连接中...', '');
+            // 仅在有视频时显示视频面板；切换呼叫时始终清空画布，避免上一通画面串到本通
+            ['video-a', 'video-b'].forEach(st => {
+                const panel = document.getElementById('panel-' + st);
+                const canvas = document.getElementById('media-monitor-canvas-' + st);
+                const info = document.getElementById('info-' + st);
+                if (panel) panel.style.display = hasVideo ? '' : 'none';
+                if (canvas) {
+                    const ctx = canvas.getContext('2d');
+                    if (ctx) { ctx.fillStyle = '#1a1a1a'; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+                }
+                if (info && !hasVideo) info.textContent = '';
+            });
             // 面板初始状态（视频面板的 body 内含 canvas，不能设 textContent 否则会清空画布）
             ['audio-a','audio-b','video-a','video-b'].forEach(st => {
                 const body = document.getElementById('panel-body-' + st);
@@ -3295,12 +3322,14 @@
             initMediaPlayerMultiStream(streams);
             const baseUrl = getMediaMonitorWsBaseUrl();
             let connectedCount = 0;
+            const monitoringCallId = callId;  // 本轮监听的 call_id，用于丢弃切换呼叫后的延迟包
             streams.forEach(streamType => {
                 const wsUrl = `${baseUrl}/ws/media-stream?call_id=${encodeURIComponent(callId)}&stream_type=${encodeURIComponent(streamType)}`;
                 try {
                     const ws = new WebSocket(wsUrl);
                     mediaMonitorWebSockets[streamType] = ws;
                     ws.onopen = () => {
+                        if (currentMonitorCallId !== monitoringCallId) return;
                         connectedCount++;
                         if (streamType.startsWith('audio')) {
                             const body = document.getElementById('panel-body-' + streamType);
@@ -3312,8 +3341,11 @@
                         updateMonitorStatus(connectedCount === streams.length ? '监听中…' : `连接中 (${connectedCount}/${streams.length})…`, 'connected');
                     };
                     ws.onmessage = (event) => {
+                        if (currentMonitorCallId !== monitoringCallId) return;  // 已切换到另一通呼叫，丢弃本连接延迟包，防止画面串路
                         try {
                             const data = JSON.parse(event.data);
+                            const msgCallId = data.call_id;
+                            if (msgCallId && currentMonitorCallId !== msgCallId) return;  // 报文 call_id 与当前监听不一致则丢弃，防止多路串画面
                             if (data.type === 'connected') {
                                 if (streamType.startsWith('audio')) {
                                     const body = document.getElementById('panel-body-' + streamType);
@@ -3340,7 +3372,7 @@
                                 mediaMonitorStats.packetsDropped = Object.values(mediaMonitorStreamStats).reduce((a, x) => a + (x.packetsDropped || 0), 0);
                                 updateMonitorStats();
                                 if (data.rtp_payload_b64) {
-                                    handleRtpPayloadForStream(streamType, data.rtp_payload_b64, data.codec, data.payload_type);
+                                    handleRtpPayloadForStream(streamType, data.rtp_payload_b64, data.codec, data.payload_type, data.rtp_timestamp);
                                 }
                             }
                         } catch (e) { console.error('[MediaMonitor] message parse:', e); }
@@ -3706,8 +3738,19 @@
         let videoDecodersByStream = {};  // streamType -> VideoDecoder
         let h264SPSByStream = {};
         let h264PPSByStream = {};
+        let h265VPSByStream = {};
+        let hevcAnnexBByStream = {};  // 为 true 时该流使用 Annex B 输入、不传 description（避免 hvcC 解析失败）
+        let h265SPSByStream = {};
+        let h265PPSByStream = {};
+        let videoCodecKindByStream = {};  // 'h264' | 'h265'，由首包 codec 决定
         let lastVideoTimeByStream = {};
         let videoFrameCountByStream = {};
+        function h264ParamSetEquals(a, b) {
+            if (!a && !b) return true;
+            if (!a || !b || a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+            return true;
+        }
         let videoStreamDebug = {};  // streamType -> { lastError, lastNal, framesSentToDecoder }
         const MAX_VIDEO_STATUS_LINES = 6;
         let videoStatusHistoryByStream = {};  // streamType -> [最近几条状态文案]，用于多行显示
@@ -3719,6 +3762,8 @@
             if (isError) {
                 const shortMsg = (msg.indexOf(' | ') >= 0) ? msg.split(' | ')[0] : msg;
                 videoStreamDebug[streamType].lastError = shortMsg.length > 120 ? shortMsg.slice(0, 120) + '…' : shortMsg;
+            } else {
+                videoStreamDebug[streamType].lastError = '';  // 非错误时清除旧错误，避免“解码器报错”等残留
             }
             if (!videoStatusHistoryByStream[streamType]) videoStatusHistoryByStream[streamType] = [];
             const hist = videoStatusHistoryByStream[streamType];
@@ -3732,14 +3777,21 @@
         
         function getVideoStreamStatusLine(streamType) {
             const d = videoStreamDebug[streamType] || {};
-            const sps = !!h264SPSByStream[streamType];
-            const pps = !!h264PPSByStream[streamType];
             const dec = videoDecodersByStream[streamType];
             const decState = dec ? dec.state : '未创建';
             const frames = videoFrameCountByStream[streamType] || 0;
             const sent = d.framesSentToDecoder || 0;
             const errRaw = d.lastError ? ' 错误: ' + d.lastError : '';
             const err = errRaw.length > 100 ? errRaw.slice(0, 100) + '…' : errRaw;
+            const isH265 = videoCodecKindByStream[streamType] === 'h265';
+            if (isH265) {
+                const vps = !!h265VPSByStream[streamType];
+                const sps = !!h265SPSByStream[streamType];
+                const pps = !!h265PPSByStream[streamType];
+                return `VPS:${vps ? '✓' : '✗'} SPS:${sps ? '✓' : '✗'} PPS:${pps ? '✓' : '✗'} 解码器:${decState} 已送帧:${sent} 已解码:${frames}${err}`;
+            }
+            const sps = !!h264SPSByStream[streamType];
+            const pps = !!h264PPSByStream[streamType];
             return `SPS:${sps ? '✓' : '✗'} PPS:${pps ? '✓' : '✗'} 解码器:${decState} 已送帧:${sent} 已解码:${frames}${err}`;
         }
         
@@ -3756,9 +3808,13 @@
                     if (!audioContext || audioContext.state === 'closed') {
                         audioContext = new (window.AudioContext || window.webkitAudioContext)();
                     }
-                    if (audioContext.state === 'suspended') audioContext.resume().catch(() => {});
+                    if (audioContext.state !== 'running') audioContext.resume().catch(() => {});
                     audioBufferQueues['audio-a'] = [];
                     audioBufferQueues['audio-b'] = [];
+                    ['audio-a', 'audio-b'].forEach(st => {
+                        if (audioOpusDecodersByStream[st]) { try { audioOpusDecodersByStream[st].close(); } catch (e) {} audioOpusDecodersByStream[st] = null; }
+                        lastOpusTimestampByStream[st] = 0;
+                    });
                     const dest = audioContext.destination;
                     function concatFloat32(a, b) {
                         const c = new Float32Array(a.length + b.length);
@@ -3798,6 +3854,13 @@
                 ['video-a', 'video-b'].forEach(st => {
                     h264SPSByStream[st] = null;
                     h264PPSByStream[st] = null;
+                    h265VPSByStream[st] = null;
+                    h265SPSByStream[st] = null;
+                    h265PPSByStream[st] = null;
+                    videoCodecKindByStream[st] = null;
+                    hevcAnnexBByStream[st] = false;
+                    videoDecoderHasReceivedKeyframeByStream[st] = false;
+                    if (window.h265FUBufferByStream) window.h265FUBufferByStream[st] = null;
                     lastVideoTimeByStream[st] = 0;
                     videoFrameCountByStream[st] = 0;
                     videoStreamDebug[st] = {};
@@ -3977,6 +4040,12 @@
                 mseInvalidErrorShownAtByStream[st] = 0;
                 h264SPSByStream[st] = null;
                 h264PPSByStream[st] = null;
+                h265VPSByStream[st] = null;
+                h265SPSByStream[st] = null;
+                h265PPSByStream[st] = null;
+                videoCodecKindByStream[st] = null;
+                hevcAnnexBByStream[st] = false;
+                if (window.h265FUBufferByStream) window.h265FUBufferByStream[st] = null;
                 videoStatusHistoryByStream[st] = [];
                 var infoEl = document.getElementById('info-' + st);
                 if (infoEl) infoEl.textContent = '';
@@ -4101,19 +4170,31 @@
                             if (!q) { audioData.close(); return; }
                             const rate = audioData.sampleRate;
                             const format = audioData.format || 'f32-planar';
-                            const size = audioData.allocationSize({ planeIndex: 0 });
-                            const buf = new ArrayBuffer(size);
-                            audioData.copyTo(buf, { planeIndex: 0 });
-                            audioData.close();
+                            const channels = audioData.numberOfChannels || 1;
                             let floatSamples;
-                            if (format === 's16-planar') {
-                                const s16 = new Int16Array(buf);
-                                const n = s16.length;
-                                floatSamples = new Float32Array(n);
-                                for (let i = 0; i < n; i++) floatSamples[i] = s16[i] / 32768;
+                            if (channels === 1) {
+                                const size = audioData.allocationSize({ planeIndex: 0 });
+                                const buf = new ArrayBuffer(size);
+                                audioData.copyTo(buf, { planeIndex: 0 });
+                                if (format === 's16-planar') {
+                                    const s16 = new Int16Array(buf);
+                                    floatSamples = new Float32Array(s16.length);
+                                    for (let i = 0; i < s16.length; i++) floatSamples[i] = s16[i] / 32768;
+                                } else floatSamples = new Float32Array(buf);
                             } else {
-                                floatSamples = new Float32Array(buf);
+                                const size0 = audioData.allocationSize({ planeIndex: 0 });
+                                const size1 = audioData.allocationSize({ planeIndex: 1 });
+                                const buf0 = new ArrayBuffer(size0);
+                                const buf1 = new ArrayBuffer(size1);
+                                audioData.copyTo(buf0, { planeIndex: 0 });
+                                audioData.copyTo(buf1, { planeIndex: 1 });
+                                const f0 = format === 's16-planar' ? Float32Array.from(new Int16Array(buf0), x => x / 32768) : new Float32Array(buf0);
+                                const f1 = format === 's16-planar' ? Float32Array.from(new Int16Array(buf1), x => x / 32768) : new Float32Array(buf1);
+                                const n = Math.min(f0.length, f1.length);
+                                floatSamples = new Float32Array(n);
+                                for (let i = 0; i < n; i++) floatSamples[i] = (f0[i] + f1[i]) * 0.5;
                             }
+                            audioData.close();
                             const out = (rate !== targetRate) ? resampleAudioGeneric(floatSamples, rate, targetRate) : floatSamples;
                             q.push(out);
                             const maxQueueSize = Math.ceil(targetRate / 8000 * 12);
@@ -4151,6 +4232,35 @@
             v.setUint8(o++, 1);
             v.setUint16(o, ppsLen, false); o += 2;
             new Uint8Array(buf).set(pps, o);
+            return new Uint8Array(buf);
+        }
+        
+        // 从 VPS+SPS+PPS 构建 HEVCDecoderConfigurationRecord（hvcC），供 WebCodecs HEVC 使用
+        function buildHvcC(vps, sps, pps) {
+            if (!vps || !sps || !pps || vps.length < 2 || sps.length < 2 || pps.length < 2) return new Uint8Array(0);
+            const vpsLen = vps.length, spsLen = sps.length, ppsLen = pps.length;
+            const headerLen = 22;
+            const arraysLen = 3 * (1 + 2 + 2) + vpsLen + spsLen + ppsLen;
+            const buf = new ArrayBuffer(headerLen + 1 + arraysLen);
+            const v = new DataView(buf);
+            let o = 0;
+            v.setUint8(o++, 1);
+            v.setUint8(o++, 0x01);
+            v.setUint32(o, 0, false); o += 4;
+            v.setUint8(o++, 0); v.setUint8(o++, 0); v.setUint8(o++, 0); v.setUint8(o++, 0); v.setUint8(o++, 0); v.setUint8(o++, 0);
+            v.setUint8(o++, 0x5D);
+            v.setUint16(o, 0xF000, false); o += 2;
+            v.setUint8(o++, 0); v.setUint8(o++, 1); v.setUint8(o++, 0);
+            v.setUint16(o, 0, false); o += 2;
+            v.setUint8(o++, 0x03);
+            v.setUint8(o++, 3);
+            const arr = (type, nal) => {
+                v.setUint8(o++, 0x80 | type);
+                v.setUint16(o, 1, false); o += 2;
+                v.setUint16(o, nal.length, false); o += 2;
+                new Uint8Array(buf).set(nal, o); o += nal.length;
+            };
+            arr(32, vps); arr(33, sps); arr(34, pps);
             return new Uint8Array(buf);
         }
         
@@ -4617,10 +4727,8 @@
             if (videoDecoder && videoDecoder.state === 'configured') return;
             // 如果解码器存在但状态异常，重置它
             if (videoDecoder && videoDecoder.state !== 'configured') {
-                console.warn('[MediaMonitor] 解码器状态异常，重置:', videoDecoder.state);
-                try {
-                    if (videoDecoder.state === 'configured') videoDecoder.reset();
-                } catch (e) {}
+                console.warn('[MediaMonitor] 解码器状态异常，关闭:', videoDecoder.state);
+                try { videoDecoder.close().catch(function() {}); } catch (e) {}
                 videoDecoder = null;
             }
             if (!h264SPS || !h264PPS || !window.VideoDecoder) {
@@ -4970,12 +5078,64 @@
             }
         }
         
+        function initHevcDecoderForStream(streamType) {
+            const vps = h265VPSByStream[streamType];
+            const sps = h265SPSByStream[streamType];
+            const pps = h265PPSByStream[streamType];
+            let dec = videoDecodersByStream[streamType];
+            if (dec && dec.state === 'configured') return;
+            if (dec) { try { dec.close().catch(function() {}); } catch (e) {} dec = null; videoDecodersByStream[streamType] = null; videoDecoderHasReceivedKeyframeByStream[streamType] = false; }
+            if (!vps || !sps || !pps) return;
+            if (!window.VideoDecoder) {
+                setVideoStreamStatus(streamType, 'H.265 需要 WebCodecs (Chrome/Edge/Safari)', false);
+                return;
+            }
+            const canvasEl = document.getElementById('media-monitor-canvas-' + streamType);
+            const ctx = canvasEl ? canvasEl.getContext('2d') : null;
+            dec = new VideoDecoder({
+                output: (frame) => {
+                    try {
+                        if (ctx && canvasEl) {
+                            if (canvasEl.width !== frame.displayWidth || canvasEl.height !== frame.displayHeight) {
+                                canvasEl.width = frame.displayWidth || 320;
+                                canvasEl.height = frame.displayHeight || 240;
+                            }
+                            ctx.drawImage(frame, 0, 0, canvasEl.width, canvasEl.height);
+                            videoFrameCountByStream[streamType] = (videoFrameCountByStream[streamType] || 0) + 1;
+                            const n = videoFrameCountByStream[streamType] || 0;
+                            if (n <= 3 || n % 15 === 0) setVideoStreamStatus(streamType, '已解码 ' + n + ' 帧 (H.265) | ' + getVideoStreamStatusLine(streamType), false);
+                        }
+                        frame.close();
+                    } catch (e) { frame.close(); setVideoStreamStatus(streamType, '绘制帧失败: ' + (e.message || e), true); }
+                },
+                error: (e) => {
+                    const msg = (e && (e.message || e.messageDetail || String(e))) || '未知';
+                    console.warn('[MediaMonitor] HEVC', streamType, 'decode error:', e);
+                    videoDecodersByStream[streamType] = null;
+                    videoDecoderHasReceivedKeyframeByStream[streamType] = false;
+                    setVideoStreamStatus(streamType, 'H.265 解码器报错: ' + msg + ' | ' + getVideoStreamStatusLine(streamType), true);
+                }
+            });
+            // 使用 Annex B 输入、不传 description，避免部分浏览器 "Failed to parse hvcC"
+            hevcAnnexBByStream[streamType] = true;
+            try {
+                dec.configure({ codec: 'hvc1.1.6.L93.0', codedWidth: 320, codedHeight: 240 });
+            } catch (e) {
+                const msg = (e && e.message) ? e.message : String(e);
+                setVideoStreamStatus(streamType, 'H.265 初始化解码器失败: ' + msg + ' | ' + getVideoStreamStatusLine(streamType), true);
+                return;
+            }
+            videoDecodersByStream[streamType] = dec;
+            videoDecoderHasReceivedKeyframeByStream[streamType] = false;
+            setVideoStreamStatus(streamType, 'H.265 解码器就绪（Annex B），等待关键帧 | ' + getVideoStreamStatusLine(streamType), false);
+        }
+        
         function initVideoDecoderIfReadyForStream(streamType) {
             const sps = h264SPSByStream[streamType];
             const pps = h264PPSByStream[streamType];
             let dec = videoDecodersByStream[streamType];
-            if (dec && dec.state === 'configured') return;
-            if (dec) { try { if (dec.state === 'configured') dec.reset(); } catch (e) {} dec = null; videoDecodersByStream[streamType] = null; videoDecoderHasReceivedKeyframeByStream[streamType] = false; }
+            // 收到新 SPS/PPS（如 re-INVITE 后主叫打开视频）时须用新参数重建解码器；用 close() 并吞掉 Promise 拒绝，避免 AbortError
+            if (dec) { try { dec.close().catch(function() {}); } catch (e) {} dec = null; videoDecodersByStream[streamType] = null; videoDecoderHasReceivedKeyframeByStream[streamType] = false; }
             if (!sps || !pps) return;
             if (!window.VideoDecoder) {
                 if (!mseInitLoggedByStream[streamType]) { mseInitLoggedByStream[streamType] = true; console.debug('[MSE-debug] 使用 MSE 回退', streamType); }
@@ -5041,16 +5201,20 @@
             // 未送关键帧前不送 P 帧，避免 "Key frame is required" / "Unable to determine size of bitstream buffer"
             const hasKey = !!videoDecoderHasReceivedKeyframeByStream[streamType];
             if (nalType === 1 && !hasKey) return;
-            // Chrome VideoDecoder(avc1) 期望 AVCC（4 字节大端长度 + NAL），此处将 Annex B（0,0,0,1 + NAL）转为 AVCC
             const nalLen = nalWithStartCode.length - 4;
+            if (nalLen < 5) return;  // 过短的 NAL 不送解码器（至少需 NAL 头+少量 slice 数据）
+            // Chrome VideoDecoder(avc1) 期望 AVCC（4 字节大端长度 + NAL），此处将 Annex B（0,0,0,1 + NAL）转为 AVCC
             const avcc = new Uint8Array(4 + nalLen);
             const view = new DataView(avcc.buffer);
             view.setUint32(0, nalLen, false);
             avcc.set(nalWithStartCode.subarray(4), 4);
             try {
                 const timestampUs = (typeof timestampMs === 'number' ? timestampMs : 0) * 1000;
-                dec.decode(new EncodedVideoChunk({ type: nalType === 5 ? 'key' : 'delta', timestamp: timestampUs, duration: 0, data: avcc }));
-                if (nalType === 5) videoDecoderHasReceivedKeyframeByStream[streamType] = true;
+                dec.decode(new EncodedVideoChunk({ type: nalType === 5 ? 'key' : 'delta', timestamp: timestampUs, duration: 33333, data: avcc }));
+                if (nalType === 5) {
+                    videoDecoderHasReceivedKeyframeByStream[streamType] = true;
+                    setTimeout(function() { try { if (dec && dec.state === 'configured') dec.flush(); } catch (e) {} }, 0);
+                }
                 if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
                 videoStreamDebug[streamType].framesSentToDecoder = (videoStreamDebug[streamType].framesSentToDecoder || 0) + 1;
                 videoStreamDebug[streamType].lastNal = nalType === 5 ? 'IDR' : '非IDR';
@@ -5060,42 +5224,132 @@
             }
         }
         
-        function handleRtpPayloadForStream(streamType, payloadB64, codec, payloadType) {
+        function decodeAndDrawH265ForStreamAnnexBMulti(streamType, annexBBuffer, timestampMs) {
+            const dec = videoDecodersByStream[streamType];
+            if (!dec || dec.state !== 'configured') return;
+            if (!hevcAnnexBByStream[streamType]) return;
+            const chunkBuf = annexBBuffer.byteLength === annexBBuffer.buffer.byteLength ? annexBBuffer.buffer : annexBBuffer.buffer.slice(annexBBuffer.byteOffset, annexBBuffer.byteOffset + annexBBuffer.byteLength);
+            try {
+                const timestampUs = (typeof timestampMs === 'number' ? timestampMs : 0) * 1000;
+                dec.decode(new EncodedVideoChunk({ type: 'key', timestamp: timestampUs, duration: 0, data: chunkBuf }));
+                videoDecoderHasReceivedKeyframeByStream[streamType] = true;
+                if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
+                videoStreamDebug[streamType].framesSentToDecoder = (videoStreamDebug[streamType].framesSentToDecoder || 0) + 1;
+                videoStreamDebug[streamType].lastNal = 'IDR(整帧)';
+            } catch (e) {
+                const msg = (e && e.message) ? e.message : String(e);
+                setVideoStreamStatus(streamType, 'H.265 整帧 decode() 异常: ' + msg + ' | ' + getVideoStreamStatusLine(streamType), true);
+            }
+        }
+        
+        function decodeAndDrawH265ForStream(streamType, nalWithStartCode, timestampMs) {
+            const dec = videoDecodersByStream[streamType];
+            if (!dec || dec.state !== 'configured') {
+                if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
+                videoStreamDebug[streamType].lastError = '解码器未就绪(state=' + (dec ? dec.state : 'null') + ')';
+                return;
+            }
+            const nalHeaderLen = 4;
+            const nalType = (nalWithStartCode[nalHeaderLen] >> 1) & 0x3F;
+            const isKey = (nalType === 19 || nalType === 20);
+            const isSlice = (nalType >= 0 && nalType <= 9) || (nalType >= 16 && nalType <= 21);
+            if (!isSlice) return;
+            const hasKey = !!videoDecoderHasReceivedKeyframeByStream[streamType];
+            if (!isKey && !hasKey) return;
+            const useAnnexB = !!hevcAnnexBByStream[streamType];
+            let chunkBuf;
+            if (useAnnexB) {
+                chunkBuf = nalWithStartCode.byteLength === nalWithStartCode.buffer.byteLength ? nalWithStartCode.buffer : nalWithStartCode.buffer.slice(nalWithStartCode.byteOffset, nalWithStartCode.byteOffset + nalWithStartCode.byteLength);
+            } else {
+                const nalLen = nalWithStartCode.length - nalHeaderLen;
+                const hevcChunk = new Uint8Array(4 + nalLen);
+                const view = new DataView(hevcChunk.buffer);
+                view.setUint32(0, nalLen, false);
+                hevcChunk.set(nalWithStartCode.subarray(nalHeaderLen), 4);
+                chunkBuf = hevcChunk.byteLength === hevcChunk.buffer.byteLength ? hevcChunk.buffer : hevcChunk.buffer.slice(hevcChunk.byteOffset, hevcChunk.byteOffset + hevcChunk.byteLength);
+            }
+            try {
+                const timestampUs = (typeof timestampMs === 'number' ? timestampMs : 0) * 1000;
+                dec.decode(new EncodedVideoChunk({ type: isKey ? 'key' : 'delta', timestamp: timestampUs, duration: 0, data: chunkBuf }));
+                if (isKey) videoDecoderHasReceivedKeyframeByStream[streamType] = true;
+                if (!videoStreamDebug[streamType]) videoStreamDebug[streamType] = {};
+                videoStreamDebug[streamType].framesSentToDecoder = (videoStreamDebug[streamType].framesSentToDecoder || 0) + 1;
+                videoStreamDebug[streamType].lastNal = isKey ? 'IDR' : '非IDR';
+            } catch (e) {
+                const msg = (e && e.message) ? e.message : String(e);
+                setVideoStreamStatus(streamType, 'H.265 decode() 异常: ' + msg + ' | ' + getVideoStreamStatusLine(streamType), true);
+            }
+        }
+        
+        function handleRtpPayloadForStream(streamType, payloadB64, codec, payloadType, rtpTimestamp) {
             try {
                 const payload = Uint8Array.from(atob(payloadB64), c => c.charCodeAt(0));
                 if (streamType.startsWith('audio')) {
-                    if (!audioContext || audioContext.state !== 'running') return;
-                    const codecNorm = codec ? String(codec).toLowerCase() : '';
-                    if (codecNorm === 'opus') {
+                    if (!audioContext) return;
+                    if (audioContext.state !== 'running') {
+                        audioContext.resume().catch(() => {});
+                        if (audioContext.state !== 'running') {
+                            const panelBody = document.getElementById('panel-body-' + streamType);
+                            if (panelBody && panelBody.textContent !== '点击此处以播放音频') {
+                                panelBody.textContent = '点击此处以播放音频';
+                                panelBody.style.cursor = 'pointer';
+                                panelBody.title = '浏览器需用户操作后才能播放音频，点击后即可';
+                                const once = () => {
+                                    if (audioContext && audioContext.state !== 'running') audioContext.resume().then(() => { if (panelBody) panelBody.textContent = '播放中'; }).catch(() => {});
+                                    panelBody.removeEventListener('click', once);
+                                };
+                                panelBody.addEventListener('click', once);
+                            }
+                        }
+                    }
+                    // 无论 context 是否 running 都继续解码并入队，以便用户点击后能播
+                    // 仅根据 RTP payload type 与载荷内容判断音频编解码，不依赖后端 codec
+                    let codecForAudio = null;
+                    if (payloadType === 0) codecForAudio = 'PCMU';
+                    else if (payloadType === 8) codecForAudio = 'PCMA';
+                    else if (payloadType >= 96 && payloadType <= 127 && payload.length >= 1 && payload.length <= 1500) {
+                        // 动态 PT：按 TOC 判断为 Opus，或 PT 96 且长度合理则尝试 Opus（避免漏判）
+                        const toc = payload[0];
+                        if (((toc >> 2) & 0x07) <= 4 || payloadType === 96) codecForAudio = 'opus';
+                    }
+                    if (!codecForAudio) {
+                        if (payloadType === 1 || payloadType === 101 || payloadType === 97) return;  // 1016/telephone-event，静默跳过
+                        const panelBody = document.getElementById('panel-body-' + streamType);
+                        if (panelBody && !panelBody.textContent.match(/播放中|暂无法播放/)) panelBody.textContent = '等待音频流…';
+                        return;
+                    }
+                    const codecNormUse = codecForAudio.toLowerCase();
+                    if (codecNormUse === 'opus') {
                         if (!ensureOpusDecoderForStream(streamType)) {
                             const panelBody = document.getElementById('panel-body-' + streamType);
                             if (panelBody) panelBody.textContent = 'Opus 需要浏览器支持 WebCodecs (Chrome/Edge)';
                             return;
                         }
                         const dec = audioOpusDecodersByStream[streamType];
-                        if (dec && dec.state === 'configured' && payload.length > 0) {
+                        if (dec && dec.state === 'configured' && payload.length >= 2) {
                             let ts = lastOpusTimestampByStream[streamType];
                             if (ts == null) ts = 0;
                             try {
                                 const buf = payload.byteLength === payload.buffer.byteLength ? payload.buffer : payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
                                 dec.decode(new EncodedAudioChunk({
-                                    type: 'delta',
+                                    type: 'key',
                                     timestamp: ts,
                                     duration: 20000,
                                     data: buf
                                 }));
                                 lastOpusTimestampByStream[streamType] = ts + 20000;
-                            } catch (e) { console.warn('[MediaMonitor] Opus decode queue', streamType, e); }
+                            } catch (e) {
+                                if (e && e.name === 'DataError') {
+                                    try { dec.close(); } catch (_) {}
+                                    audioOpusDecodersByStream[streamType] = null;
+                                }
+                                console.warn('[MediaMonitor] Opus decode queue', streamType, e);
+                            }
                         }
                         return;
                     }
-                    if (codec !== 'PCMU' && codec !== 'PCMA' && payloadType !== 0 && payloadType !== 8) {
-                        const codecLabel = codec || ('pt=' + payloadType);
-                        const panelBody = document.getElementById('panel-body-' + streamType);
-                        if (panelBody) panelBody.textContent = '当前仅支持 G.711 (PCMU/PCMA) 与 Opus，该流为 ' + codecLabel + '，暂无法播放';
-                        return;
-                    }
-                    const actualCodec = (payloadType === 0) ? 'PCMU' : 'PCMA';
+                    // G.711（已由 payload type 0/8 或上面识别）
+                    const actualCodec = codecForAudio;
                     const pcmSamples = decodeG711(payload, actualCodec);
                     const targetSampleRate = audioContext.sampleRate;
                     const resampledSamples = resampleAudio8kTo44k(pcmSamples, 8000, targetSampleRate);
@@ -5106,17 +5360,93 @@
                         if (q.length > maxQueueSize) { for (let i = 0; i < q.length - maxQueueSize; i++) q.shift(); }
                     }
                 } else if (streamType.startsWith('video')) {
-                    const videoCodec = codec ? String(codec).toUpperCase() : '';
-                    const isH264 = videoCodec === 'H264';
+                    const st = streamType;
                     const isAudioPt = payloadType === 0 || payloadType === 8;  // PCMU/PCMA，避免误当视频
-                    if (!isH264 || isAudioPt) {
-                        const codecLabel = (videoCodec.indexOf('H265') >= 0 || videoCodec.indexOf('HEVC') >= 0)
-                            ? 'H.265/HEVC' : (codec || ('pt=' + payloadType));
-                        setVideoStreamStatus(streamType, '当前仅支持 H.264 监看，该流为 ' + codecLabel + '，暂无法解码 | ' + getVideoStreamStatusLine(streamType), true);
+                    if (isAudioPt) return;
+                    // 优先使用 SDP 协商结果判断 H.264/H.265（后端从 a=rtpmap 解析），避免载荷误判（如 H.264 首字节被当成 H.265）
+                    const codecStr = (codec && typeof codec === 'string') ? codec.trim().toUpperCase() : '';
+                    const ambiguousCodec = !codecStr || codecStr === '1016' || codecStr === 'UNKNOWN';
+                    if (!ambiguousCodec) {
+                        if (codecStr.indexOf('H264') >= 0 || codecStr.indexOf('AVC') >= 0) videoCodecKindByStream[st] = 'h264';
+                        else if (codecStr.indexOf('H265') >= 0 || codecStr.indexOf('HEVC') >= 0 || codecStr.indexOf('HVC') >= 0) videoCodecKindByStream[st] = 'h265';
+                    }
+                    // SDP 无明确结果时再按 RTP 载荷判断，且只认明确的 NAL 类型，避免 H.264 被误判为 H.265（如 type 0 或首字节 0x40）
+                    if (!videoCodecKindByStream[st] && payload.length >= 2) {
+                        const h265Type = (payload[0] >> 1) & 0x3F;   // H.265 2 字节 NAL 头
+                        const h264Type = payload[0] & 0x1F;          // H.264 1 字节 NAL 头
+                        const isUnambiguousH265 = (h265Type === 32 || h265Type === 33 || h265Type === 34 || h265Type === 49 || h265Type === 19 || h265Type === 20);
+                        const isUnambiguousH264 = (h264Type === 7 || h264Type === 8 || h264Type === 1 || h264Type === 5 || h264Type === 28 || h264Type === 29);
+                        if (isUnambiguousH265) videoCodecKindByStream[st] = 'h265';
+                        else if (isUnambiguousH264) videoCodecKindByStream[st] = 'h264';
+                    }
+                    if (!videoCodecKindByStream[st]) return;  // 未从载荷识别出类型，跳过本包，不报错
+                    const isHevc = videoCodecKindByStream[st] === 'h265';
+                    
+                    if (isHevc) {
+                        if (payload.length < 2) { setVideoStreamStatus(streamType, 'RTP 载荷过短(' + payload.length + ') | ' + getVideoStreamStatusLine(st), true); return; }
+                        const nalTypeH265 = (payload[0] >> 1) & 0x3F;
+                        const START_CODE = new Uint8Array([0, 0, 0, 1]);
+                        const pushHevcNal = (nalBytes, type) => {
+                            if (type === 32) {
+                                if (!h265VPSByStream[st] || nalBytes.length > h265VPSByStream[st].length) h265VPSByStream[st] = nalBytes.slice(0);
+                                setVideoStreamStatus(st, '已收 VPS (H.265 ' + nalBytes.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                initHevcDecoderForStream(st);
+                            } else if (type === 33) {
+                                if (!h265SPSByStream[st] || nalBytes.length > h265SPSByStream[st].length) h265SPSByStream[st] = nalBytes.slice(0);
+                                setVideoStreamStatus(st, '已收 SPS (H.265 ' + nalBytes.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                initHevcDecoderForStream(st);
+                            } else if (type === 34) {
+                                if (!h265PPSByStream[st] || nalBytes.length > h265PPSByStream[st].length) h265PPSByStream[st] = nalBytes.slice(0);
+                                setVideoStreamStatus(st, '已收 PPS (H.265 ' + nalBytes.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                initHevcDecoderForStream(st);
+                            } else if ((type >= 0 && type <= 9) || (type >= 16 && type <= 21)) {
+                                initHevcDecoderForStream(st);
+                                if (videoDecodersByStream[st]) {
+                                    const isKey = (type === 19 || type === 20);
+                                    const vps = h265VPSByStream[st], sps = h265SPSByStream[st], pps = h265PPSByStream[st];
+                                    const hasKey = !!videoDecoderHasReceivedKeyframeByStream[st];
+                                    if (isKey && !hasKey && (!vps || !sps || !pps)) return;  // 未收齐 VPS/SPS/PPS 前不送首帧，避免 "key frame is required"
+                                    const frameIntervalUs = 1000000 / 30;
+                                    const tsUs = (rtpTimestamp != null && rtpTimestamp !== undefined) ? Math.round((rtpTimestamp >>> 0) * 1000000 / 90000) : ((lastVideoTimeByStream[st] || 0) + frameIntervalUs);
+                                    lastVideoTimeByStream[st] = tsUs;
+                                    if (isKey && !hasKey && vps && sps && pps) {
+                                        const sc = START_CODE;
+                                        const total = sc.length * 4 + vps.length + sps.length + pps.length + nalBytes.length;
+                                        const combined = new Uint8Array(total);
+                                        let o = 0; combined.set(sc, o); o += sc.length; combined.set(vps, o); o += vps.length;
+                                        combined.set(sc, o); o += sc.length; combined.set(sps, o); o += sps.length;
+                                        combined.set(sc, o); o += sc.length; combined.set(pps, o); o += pps.length;
+                                        combined.set(sc, o); o += sc.length; combined.set(nalBytes, o);
+                                        decodeAndDrawH265ForStreamAnnexBMulti(st, combined, tsUs / 1000);
+                                    } else {
+                                        const withStart = new Uint8Array(4 + nalBytes.length);
+                                        withStart.set(START_CODE, 0); withStart.set(nalBytes, 4);
+                                        decodeAndDrawH265ForStream(st, withStart, tsUs / 1000);
+                                    }
+                                }
+                            }
+                        };
+                        if (nalTypeH265 === 49 && payload.length >= 3) {
+                            const fuHeader = payload[2];
+                            const realType = fuHeader & 0x3F;
+                            const s = (fuHeader & 0x80) !== 0, e = (fuHeader & 0x40) !== 0;
+                            if (!window.h265FUBufferByStream) window.h265FUBufferByStream = {};
+                            let buf = window.h265FUBufferByStream[st];
+                            if (s) buf = { nalHeader: [(payload[0] & 0x81) | (realType << 1), payload[1]], chunks: [payload.subarray(3)] };
+                            else if (buf) buf.chunks.push(payload.subarray(3));
+                            if (e && buf) {
+                                let len = 0; for (const c of buf.chunks) len += c.length;
+                                const full = new Uint8Array(2 + len); full[0] = buf.nalHeader[0]; full[1] = buf.nalHeader[1]; let off = 2; for (const c of buf.chunks) { full.set(c, off); off += c.length; }
+                                pushHevcNal(full, realType);
+                            }
+                            window.h265FUBufferByStream[st] = (e && buf) ? null : buf;
+                        } else {
+                            pushHevcNal(payload, nalTypeH265);
+                        }
                         return;
                     }
+                    
                     const START_CODE = new Uint8Array([0, 0, 0, 1]);
-                    const st = streamType;
                     if (payload.length < 2) {
                         setVideoStreamStatus(streamType, 'RTP 载荷过短(' + payload.length + ') | ' + getVideoStreamStatusLine(st), true);
                         return;
@@ -5124,15 +5454,19 @@
                     const b0 = payload[0] & 0x1F;
                     if (b0 >= 1 && b0 <= 23) {
                         if (b0 === 7) {
-                            if (!h264SPSByStream[st] || payload.length > h264SPSByStream[st].length) h264SPSByStream[st] = payload.slice(0);
-                            if (!mseSPSLoggedByStream[st]) { mseSPSLoggedByStream[st] = true; console.debug('[MSE-debug] SPS 收到', st, 'len=', payload.length); }
-                            setVideoStreamStatus(st, '已收 SPS (' + payload.length + 'B) | ' + getVideoStreamStatusLine(st), false);
-                            initVideoDecoderIfReadyForStream(st);
+                            if (!h264ParamSetEquals(h264SPSByStream[st], payload)) {
+                                h264SPSByStream[st] = payload.slice(0);
+                                if (!mseSPSLoggedByStream[st]) { mseSPSLoggedByStream[st] = true; console.debug('[MSE-debug] SPS 收到', st, 'len=', payload.length); }
+                                setVideoStreamStatus(st, '已收 SPS (' + payload.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                initVideoDecoderIfReadyForStream(st);
+                            }
                         } else if (b0 === 8) {
-                            if (!h264PPSByStream[st] || payload.length > h264PPSByStream[st].length) h264PPSByStream[st] = payload.slice(0);
-                            if (!msePPSLoggedByStream[st]) { msePPSLoggedByStream[st] = true; console.debug('[MSE-debug] PPS 收到', st, 'len=', payload.length); }
-                            setVideoStreamStatus(st, '已收 PPS (' + payload.length + 'B) | ' + getVideoStreamStatusLine(st), false);
-                            initVideoDecoderIfReadyForStream(st);
+                            if (!h264ParamSetEquals(h264PPSByStream[st], payload)) {
+                                h264PPSByStream[st] = payload.slice(0);
+                                if (!msePPSLoggedByStream[st]) { msePPSLoggedByStream[st] = true; console.debug('[MSE-debug] PPS 收到', st, 'len=', payload.length); }
+                                setVideoStreamStatus(st, '已收 PPS (' + payload.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                initVideoDecoderIfReadyForStream(st);
+                            }
                         } else if (b0 === 1 || b0 === 5) {
                             initVideoDecoderIfReadyForStream(st);
                             if (mseSourceBufferByStream[st]) {
@@ -5148,9 +5482,9 @@
                                 const withStart = new Uint8Array(START_CODE.length + payload.length);
                                 withStart.set(START_CODE, 0); withStart.set(payload, START_CODE.length);
                                 const frameIntervalUs = 1000000 / 30;
-                                const ts = (lastVideoTimeByStream[st] || 0) + frameIntervalUs;
-                                lastVideoTimeByStream[st] = ts;
-                                decodeAndDrawH264ForStream(st, withStart, ts / 1000);
+                                const tsUs = (rtpTimestamp != null && rtpTimestamp !== undefined) ? Math.round((rtpTimestamp >>> 0) * 1000000 / 90000) : ((lastVideoTimeByStream[st] || 0) + frameIntervalUs);
+                                lastVideoTimeByStream[st] = tsUs;
+                                decodeAndDrawH264ForStream(st, withStart, tsUs / 1000);
                             } else {
                                 if (!msePendingNalsByStream[st]) msePendingNalsByStream[st] = [];
                                 var q = msePendingNalsByStream[st];
@@ -5176,15 +5510,19 @@
                             const full = new Uint8Array(1 + len); full[0] = buf.nalHeader;
                             let off = 1; for (const c of buf.chunks) { full.set(c, off); off += c.length; }
                             if (realType === 7) {
-                                if (!h264SPSByStream[st] || full.length > h264SPSByStream[st].length) h264SPSByStream[st] = full;
-                                if (!mseSPSLoggedByStream[st]) { mseSPSLoggedByStream[st] = true; console.debug('[MSE-debug] SPS 收到(FU-A)', st, 'len=', full.length); }
-                                setVideoStreamStatus(st, '已收 SPS (FU-A ' + full.length + 'B) | ' + getVideoStreamStatusLine(st), false);
-                                initVideoDecoderIfReadyForStream(st);
+                                if (!h264ParamSetEquals(h264SPSByStream[st], full)) {
+                                    h264SPSByStream[st] = full;
+                                    if (!mseSPSLoggedByStream[st]) { mseSPSLoggedByStream[st] = true; console.debug('[MSE-debug] SPS 收到(FU-A)', st, 'len=', full.length); }
+                                    setVideoStreamStatus(st, '已收 SPS (FU-A ' + full.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                    initVideoDecoderIfReadyForStream(st);
+                                }
                             } else if (realType === 8) {
-                                if (!h264PPSByStream[st] || full.length > h264PPSByStream[st].length) h264PPSByStream[st] = full;
-                                if (!msePPSLoggedByStream[st]) { msePPSLoggedByStream[st] = true; console.debug('[MSE-debug] PPS 收到(FU-A)', st, 'len=', full.length); }
-                                setVideoStreamStatus(st, '已收 PPS (FU-A ' + full.length + 'B) | ' + getVideoStreamStatusLine(st), false);
-                                initVideoDecoderIfReadyForStream(st);
+                                if (!h264ParamSetEquals(h264PPSByStream[st], full)) {
+                                    h264PPSByStream[st] = full;
+                                    if (!msePPSLoggedByStream[st]) { msePPSLoggedByStream[st] = true; console.debug('[MSE-debug] PPS 收到(FU-A)', st, 'len=', full.length); }
+                                    setVideoStreamStatus(st, '已收 PPS (FU-A ' + full.length + 'B) | ' + getVideoStreamStatusLine(st), false);
+                                    initVideoDecoderIfReadyForStream(st);
+                                }
                             } else if (realType === 1 || realType === 5) {
                                 initVideoDecoderIfReadyForStream(st);
                                 if (mseSourceBufferByStream[st]) {
@@ -5199,9 +5537,10 @@
                                 } else if (videoDecodersByStream[st]) {
                                     const withStart = new Uint8Array(4 + full.length);
                                     withStart.set([0,0,0,1], 0); withStart.set(full, 4);
-                                    const ts = (lastVideoTimeByStream[st] || 0) + 1000000/30;
-                                    lastVideoTimeByStream[st] = ts;
-                                    decodeAndDrawH264ForStream(st, withStart, ts/1000);
+                                    const frameIntervalUs = 1000000 / 30;
+                                    const tsUs = (rtpTimestamp != null && rtpTimestamp !== undefined) ? Math.round((rtpTimestamp >>> 0) * 1000000 / 90000) : ((lastVideoTimeByStream[st] || 0) + frameIntervalUs);
+                                    lastVideoTimeByStream[st] = tsUs;
+                                    decodeAndDrawH264ForStream(st, withStart, tsUs / 1000);
                                 } else {
                                     if (!msePendingNalsByStream[st]) msePendingNalsByStream[st] = [];
                                     var q = msePendingNalsByStream[st];
@@ -5211,6 +5550,13 @@
                             buf = null;
                         }
                         window.h264FUABufferByStream[st] = buf;
+                    } else if (b0 === 0 && payload.length >= 2) {
+                        // H.264 首字节 type=0 时不要误判为 H.265，仅当明确为 H.265 参数集/关键帧时才设
+                        const nalTypeH265 = (payload[0] >> 1) & 0x3F;
+                        const unambiguousH265 = (nalTypeH265 === 32 || nalTypeH265 === 33 || nalTypeH265 === 34 || nalTypeH265 === 49 || nalTypeH265 === 19 || nalTypeH265 === 20);
+                        if (unambiguousH265 && videoCodecKindByStream[st] !== 'h264') videoCodecKindByStream[st] = 'h265';
+                    } else if (b0 === 0 || (b0 >= 24 && b0 <= 31)) {
+                        // H.264 保留/未使用 NAL 类型（0, 24-31），静默跳过，不报错
                     } else {
                         setVideoStreamStatus(st, '未知 NAL 首字节 type=' + b0 + ' len=' + payload.length + ' | ' + getVideoStreamStatusLine(st), true);
                     }
@@ -5670,11 +6016,11 @@
             tbody.innerHTML = '';
             
             if (filteredMessages.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="10" style="text-align: center; color: #858585; padding: 20px;">暂无消息</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="12" style="text-align: center; color: #858585; padding: 20px;">暂无消息</td></tr>';
                 // 即使没有消息，也添加空白行保持布局一致
                 const spacerRow = document.createElement('tr');
                 spacerRow.className = 'sip-messages-spacer-row';
-                spacerRow.innerHTML = '<td colspan="10"></td>';
+                spacerRow.innerHTML = '<td colspan="12"></td>';
                 tbody.appendChild(spacerRow);
                 return;
             }
@@ -5714,6 +6060,8 @@
                     <td title="UDP IP层地址">${escapeHtml(msg.src_ip || '')}:${escapeHtml(String(msg.src_port || ''))} → ${escapeHtml(msg.dst_ip || '')}:${escapeHtml(String(msg.dst_port || ''))}</td>
                     <td title="SIP协议层地址">${escapeHtml(msg.src_ip_nat || msg.src_ip || '')}${(msg.src_ip_nat || msg.src_ip) && (msg.src_port_nat || msg.src_port) ? ':' + escapeHtml(String(msg.src_port_nat || msg.src_port || '')) : ''} → ${escapeHtml(msg.dst_ip_nat || msg.dst_ip || '')}${(msg.dst_ip_nat || msg.dst_ip) && (msg.dst_port_nat || msg.dst_port) ? ':' + escapeHtml(String(msg.dst_port_nat || msg.dst_port || '')) : ''}</td>
                     <td title="${escapeHtml(msg.call_id || '')}">${escapeHtml((msg.call_id || '').substring(0, 20))}${(msg.call_id || '').length > 20 ? '...' : ''}</td>
+                    <td title="${escapeHtml(msg.audio_codecs || '')}">${escapeHtml(msg.audio_codecs || '')}</td>
+                    <td title="${escapeHtml(msg.video_codecs || '')}">${escapeHtml(msg.video_codecs || '')}</td>
                     <td title="${escapeHtml(msg.sdp_info || '')}">${escapeHtml(msg.sdp_info || '')}</td>
                 `;
                 
@@ -5735,7 +6083,7 @@
             // 在表格底部添加一个空白行，确保最后一条消息完全可见
             const spacerRow = document.createElement('tr');
             spacerRow.className = 'sip-messages-spacer-row';
-            spacerRow.innerHTML = '<td colspan="10"></td>';
+            spacerRow.innerHTML = '<td colspan="12"></td>';
             tbody.appendChild(spacerRow);
             
             // 默认自动滚动到底部（显示最新消息），但只在用户没有手动滚动时才滚动
